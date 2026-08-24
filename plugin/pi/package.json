@@ -1,0 +1,10 @@
+{
+  "name": "a2a-pi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "a2a channel and tools for Pi — pushes agent-to-agent messages into an idle session",
+  "type": "module",
+  "dependencies": {
+    "typebox": "^0.34.0"
+  }
+}

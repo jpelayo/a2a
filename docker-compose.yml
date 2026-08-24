@@ -1,0 +1,150 @@
+# Bring up: `docker compose up -d --build`
+# Mint a token:
+#   docker compose exec a2a-mcp python3 /app/a2a-mcp.py token create --user alice
+#
+# Storage is MariaDB. The broker no longer opens a database FILE, and that is
+# the point of the arrangement: one process owns the storage and everything
+# else — CLI, TUI, a second container — talks to it over a protocol. The
+# previous shape let a file swapped under a running broker fork the database in
+# silence, with the server and the CLI each convinced they were right.
+#
+# Nothing to configure before the first run: the database password is generated
+# per host by the a2a-secret service below, so there is no credential in this
+# file and no file to edit. .env only exists to override a default.
+#
+# Networks:
+#   default   created by this compose, and the only place mariadb is reachable.
+#   proxy     pre-existing external network shared with the edge proxy
+#             (nginx-proxy-manager / openresty). Attaching a2a-mcp here lets
+#             the proxy reach it by service name `a2a-mcp:9999`.
+
+services:
+  # Writes a random database password into a volume, once, on the first run of
+  # a host. Runs to completion before anything else starts.
+  #
+  # This exists so that setup is still one command AND there is no credential
+  # in this repository. A default password in compose would be a secret
+  # published in source control that every deployment shares; a required one
+  # would be a file to edit before the first run. This is neither: the
+  # password is generated where it is used, never leaves the volume, and
+  # differs per host.
+  a2a-secret:
+    image: alpine:3
+    container_name: a2a-secret
+    command: >
+      sh -c 'test -s /secret/db_password ||
+             (head -c 24 /dev/urandom | base64 | tr -d "\n=+/" > /secret/db_password);
+             chmod 400 /secret/db_password'
+    volumes:
+      - a2a-secret:/secret
+    restart: "no"
+
+  mariadb:
+    image: mariadb:11.4
+    container_name: a2a-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${A2A_DB_NAME:-a2a}
+      MARIADB_USER: ${A2A_DB_USER:-a2a}
+      # Read from the file a2a-secret generated. The mariadb image supports
+      # the _FILE convention for exactly this.
+      MARIADB_PASSWORD_FILE: /run/secret/db_password
+      # No fixed root password anywhere: MariaDB generates one at first boot
+      # and prints it once to its own log. Nothing needs it — the a2a user
+      # owns the a2a database, backups included.
+      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+    depends_on:
+      a2a-secret:
+        condition: service_completed_successfully
+    volumes:
+      - a2a-mariadb:/var/lib/mysql
+      - a2a-secret:/run/secret:ro
+      - ./a2a_mcp/my.cnf:/etc/mysql/conf.d/a2a.cnf:ro
+    # No `ports:` on purpose — the broker reaches it by service name on the
+    # internal network, so the database is not exposed on the host at all.
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # A hard ceiling above the tuned footprint (~100 MB), so a spike degrades
+    # rather than getting OOM-killed.
+    mem_limit: 256m
+    cpus: "0.5"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  a2a-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: a2a-mcp:latest
+    container_name: a2a-mcp
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      a2a-secret:
+        condition: service_completed_successfully
+    environment:
+      A2A_HOST: 0.0.0.0
+      A2A_PORT: "9999"
+      A2A_DB_HOST: mariadb
+      A2A_DB_PORT: "3306"
+      A2A_DB_NAME: ${A2A_DB_NAME:-a2a}
+      A2A_DB_USER: ${A2A_DB_USER:-a2a}
+      A2A_DB_PASSWORD_FILE: /run/secret/db_password
+      # Everything the broker logs goes to a table, so this is the volume
+      # knob: DEBUG puts a row on every message delivered.
+      A2A_LOG_LEVEL: ${A2A_LOG_LEVEL:-INFO}
+      A2A_LOG_RETENTION: ${A2A_LOG_RETENTION:-30d}
+      # Baked into every installer this broker serves. Unset by default: the
+      # broker then uses the host that asked for the installer, so nothing in
+      # this repo names anybody's server. Set it in .env when you run behind a
+      # reverse proxy — the scheme must be the one clients can reach, since an
+      # http:// base makes the edge redirect to https and that scheme change
+      # strips the Authorization header, 401ing a perfectly good token.
+      A2A_PUBLIC_URL: ${A2A_PUBLIC_URL:-}
+      A2A_ADMIN_TOKEN: ${A2A_ADMIN_TOKEN:-}
+      A2A_AUTH_DISABLED: ${A2A_AUTH_DISABLED:-0}
+    volumes:
+      - a2a-secret:/run/secret:ro
+    networks:
+      - default
+      - proxy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  # External for the same reason as the database volume, and with sharper
+  # consequences: if compose were allowed to create this one, any name that
+  # failed to resolve would yield an EMPTY volume, a freshly generated
+  # password, and a database that now rejects it. Belongs to the host, and
+  # must be backed up and deleted together with a2a-mariadb.
+  a2a-secret:
+    external: true
+    name: a2a-secret
+
+  a2a-mariadb:
+    # Pinned and external for the same reason a2a-secret is: left to
+    # create it, compose makes an EMPTY volume whenever the name does not
+    # resolve, and the broker comes up perfectly healthy with no stations, no
+    # agents and no messages — a working server that has quietly lost
+    # everything. This way that case is "volume not found" before anything
+    # starts. One command on a new host:
+    #
+    #     docker volume create a2a-mariadb
+    #     docker volume create a2a-secret
+    #
+    external: true
+    name: a2a-mariadb
+
+networks:
+  proxy:
+    external: true
+    name: proxy

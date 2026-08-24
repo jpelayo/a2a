@@ -1,0 +1,10 @@
+# The image ships plugin SOURCE only — the broker builds the client artifacts
+# at request time. Built zips must never ride along: they are exactly the
+# stale copies this design exists to eliminate.
+a2a.zip
+plugin/*.zip
+**/__pycache__
+**/.DS_Store
+*.db
+*.db-wal
+*.db-shm

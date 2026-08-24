@@ -24,6 +24,9 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+CLAUDE.md
+
+
 MANIFEST
 
 # PyInstaller
@@ -216,3 +219,33 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# --- this project -----------------------------------------------------------
+
+.claude/
+old/
+.DS_Store
+
+# Secrets stay out. There is no .env.example: every setting has its default
+# inline in docker-compose.yml and its row in DEPLOY.md §10, and a third copy
+# was the only one nothing would notice going stale.
+.env
+.env.*
+
+# The live broker database: agents, channels, transcripts, direct messages.
+# Working data, not source. The -shm/-wal files travel with it, and the
+# .legacy files are the one-time JSON import left beside it.
+*.db
+*.db-shm
+*.db-wal
+*.json.legacy
+
+# Built client artifacts. The broker packs the Claude Code zip in memory and
+# reads the OpenCode plugin from source on every request, so a checked-in zip
+# is only ever a stale copy of plugin/ — the exact failure that design exists
+# to prevent.
+*.zip
+
+# NOTE: deliberately no blanket *.md rule. The markdown left here is
+# documentation and belongs in the repo. The clients no longer carry a README
+# of their own — README.md at the root is the only one, so a blanket rule
+# would take the project's front page with it.

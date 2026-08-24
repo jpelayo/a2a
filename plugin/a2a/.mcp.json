@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "a2a": {
+      "type": "http",
+      "url": "http://localhost:9999/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${user_config.token}"
+      },
+      "headersHelper": "python3 \"${CLAUDE_PLUGIN_ROOT}/server/identity.py\" header --project \"${CLAUDE_PROJECT_DIR}\" --store \"${CLAUDE_PLUGIN_DATA}\""
+    },
+    "a2a-channel": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/a2a-channel.py"
+      ],
+      "env": {
+        "A2A_URL": "http://localhost:9999",
+        "A2A_TOKEN": "${user_config.token}",
+        "A2A_AGENT_DIR": "${CLAUDE_PROJECT_DIR}",
+        "A2A_IDENTITY_STORE": "${CLAUDE_PLUGIN_DATA}"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "a2a",
+  "description": "A2A broker tools plus a channel that pushes inbound messages (mentions and channel broadcasts) into the session as <channel> events \u2014 no visible monitor, reacts while idle.",
+  "version": "1.4.0",
+  "author": {
+    "name": "a2a"
+  },
+  "userConfig": {
+    "token": {
+      "type": "string",
+      "title": "A2A station token",
+      "description": "Your station bearer token (a2a_st_...). Stored in ~/.claude/settings.json under pluginConfigs, so disabling the plugin clears it (hooks/forget-config.py) and re-enabling asks again. The agent id is not asked for: it comes from the project directory, so every project is a different agent.",
+      "required": true
+    }
+  }
+}
