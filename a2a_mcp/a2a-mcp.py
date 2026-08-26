@@ -113,7 +113,7 @@ from starlette.routing import Mount, Route
 # capped, and posts carry `to`/`addressed`. A client compares its baked
 # version against /healthz's `clients` and says so once when it is behind, so
 # leaving this at 0.1.0 would let every stale install stay quiet.
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Storage is MariaDB (A2A_DB_HOST and friends, defined with the pool below).
 # A2A_DB_FILE survives as one thing only: where `migrate` starts looking for a

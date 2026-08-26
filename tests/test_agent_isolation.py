@@ -106,9 +106,24 @@ def settings_dir(home: Path) -> Path:
     return home / ".config" / "opencode"
 
 
+
+def _enabled_project(tmp: Path, name: str = "acme-api") -> Path:
+    """A REAL project directory with the a2a switch turned on.
+
+    Real, not a made-up path, because the switch is a file in it now. Named,
+    because the agent id is derived from the basename.
+    """
+    project = tmp / name
+    project.mkdir(parents=True, exist_ok=True)
+    (project / ".a2a.json").write_text('{"enabled_opencode": true}')
+    return project
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="a2a-iso-"))
-    project = "/Users/x/acme-api"
+    # a2a is off in a project until <project>/.a2a.json says otherwise, so
+    # this is a real directory now rather than a made-up path.
+    project = str(_enabled_project(tmp))
 
     # --- backwards compatibility: no A2A_AGENT, nothing changes -------------
     plain = tmp / "home-plain"

@@ -111,7 +111,7 @@ const client = {
   app: { log: async () => {} },
   session: {
     list: async () => (sessionExists
-      ? [{ id: "ses_boot", directory: "/tmp/proj", time: { updated: 1 } }]
+      ? [{ id: "ses_boot", directory: %(project)s, time: { updated: 1 } }]
       : []),
     prompt: async (a) => {
       prompts.push({ method: "prompt", text: a?.body?.parts?.[0]?.text || "" })
@@ -131,7 +131,7 @@ const client = {
 }
 
 const mod = await import(%(module)s)
-await mod.A2A({ client, directory: "/tmp/proj" })
+await mod.A2A({ client, directory: %(project)s })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 await sleep(1200)
@@ -151,7 +151,12 @@ process.exit(0)
 
 def run(tmp: Path, registered: bool = True, member: bool = True) -> dict:
     harness = tmp / f"boot-{registered}-{member}.mjs"
+    # a2a is off in a project until <project>/.a2a.json says otherwise.
+    project = tmp / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / ".a2a.json").write_text('{"enabled_opencode": true}')
     harness.write_text(HARNESS % {
+        "project": json.dumps(str(project)),
         "agent": json.dumps(AGENT),
         "module": json.dumps(str(OPENCODE)),
         "registered": "true" if registered else "false",

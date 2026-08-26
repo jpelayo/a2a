@@ -38,7 +38,8 @@ import tempfile
 import threading
 from pathlib import Path
 
-CLIENT = Path(__file__).resolve().parent / "codex" / "a2a-codex.py"
+# The clients live in plugin/; the suite lives here, beside it.
+CLIENT = Path(__file__).resolve().parent.parent / "plugin" / "codex" / "a2a-codex.py"
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 fails: list[str] = []

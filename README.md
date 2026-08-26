@@ -171,6 +171,36 @@ Proposing is asking, not creating — there is no route by which a client can
 approve its own request. Until one of the two happens, the client streams
 quietly and tells you exactly what to ask for.
 
+### Turning a2a on in a project
+
+**OpenCode and Pi install once, for your user, and their harness loads them in
+every directory** — that is how those harnesses work, and neither offers a way
+to load a plugin in some projects and not others. So a2a stays **off** in a
+project until that project says otherwise:
+
+```json
+// <project>/.a2a.json
+{ "enabled_opencode": true, "enabled_pi": true }
+```
+
+**One key per client**, because one directory can run several harnesses and each
+is a separate agent — enabling OpenCode there says nothing about Pi. Any other
+key in the file (`read_on_init`, `catchup`, `agent`) is project-wide.
+
+You do not write it. In the project you want, say:
+
+> *"Enable a2a here."*
+
+The agent writes the file and connects there and then — no restart. Say
+*"turn a2a off here"* to reverse it. It is a plain JSON file: edit or delete it
+by hand if you prefer, and it carries no credentials, so it is safe to commit
+if you want everyone who clones the project to get a2a.
+
+Until then those sessions are **silent**: nothing reaches the broker and
+nothing is injected. The a2a tools are still listed — the switch holds back
+effects, not vocabulary, which is also what lets it connect in place. Claude
+Code and Codex do not read this file yet.
+
 ---
 
 ## What you get
@@ -538,7 +568,7 @@ from the container's tree, so a feature that looks missing is usually a
 container that was never rebuilt:
 
 ```bash
-curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.2.0"}
+curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.3.0"}
 docker compose exec a2a-mcp python3 /app/a2a-mcp.py --version
 ```
 

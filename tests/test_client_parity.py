@@ -62,7 +62,17 @@ ONLY_CLIENTS = {
     # when this is needed. So it lives on the clients whose tools are local
     # REST wrappers and keep working unregistered.
     "propose_me",
+    # Writes <project>/.a2a.json, which is a fact about THIS MACHINE's install
+    # scope. The broker has no opinion about which of your directories use it.
+    "enable_a2a_here",
 }
+
+# Tools that configure THIS install rather than name a capability. The parity
+# rule exists so an agent asking a peer for something need not know which
+# harness answered — and "use a2a in my project" is not something you ask a
+# peer. TEMPORARY: it empties again when Codex and Claude Code get the same
+# project switch. Read the note above DIAGNOSTIC before adding a second name.
+INSTALL_SCOPE = {"enable_a2a_here"}
 
 fails: list[str] = []
 
@@ -191,7 +201,9 @@ def main() -> int:
     check("and Codex exposes exactly the same vocabulary as the other two, "
           "for the same reason: an agent asking a peer for something must not "
           "have to know which harness answered",
-          cx == oc, f"only in codex: {sorted(cx - oc)}; missing: {sorted(oc - cx)}")
+          cx == oc - INSTALL_SCOPE,
+          f"only in codex: {sorted(cx - oc)}; "
+          f"missing: {sorted(oc - INSTALL_SCOPE - cx)}")
 
     # --- and neither may drift from the broker without a stated reason -----
     missing = (broker - oc) - ONLY_BROKER

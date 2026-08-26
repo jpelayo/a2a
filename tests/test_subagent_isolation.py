@@ -154,7 +154,9 @@ def drive() -> dict:
     harness.write_text(HARNESS % {
         "home": json.dumps(str(tmp)),
         "module": json.dumps(str(OPENCODE)),
-        "project": json.dumps("/Users/x/acme-api"),
+        # a2a is off in a project until <project>/.a2a.json says
+        # otherwise, so the fixture opts in first.
+        "project": json.dumps(str(_enabled_project(tmp))),
         "agent": json.dumps(AGENT),
         "root": json.dumps(ROOT),
         "child": json.dumps(CHILD),
@@ -167,6 +169,19 @@ def drive() -> dict:
     print(res.stdout[-2000:])
     print(res.stderr[-2000:], file=sys.stderr)
     raise SystemExit("harness produced no result")
+
+
+
+def _enabled_project(tmp: Path, name: str = "acme-api") -> Path:
+    """A REAL project directory with the a2a switch turned on.
+
+    Real, not a made-up path, because the switch is a file in it now. Named,
+    because the agent id is derived from the basename.
+    """
+    project = tmp / name
+    project.mkdir(parents=True, exist_ok=True)
+    (project / ".a2a.json").write_text('{"enabled_opencode": true}')
+    return project
 
 
 def main() -> int:

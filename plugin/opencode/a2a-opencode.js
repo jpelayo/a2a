@@ -251,6 +251,37 @@ export const A2A = async ({ client, directory }) => {
     }
   }
   const readStore = () => readJSON(STORE)
+
+  // --- the project switch --------------------------------------------------
+  // a2a is OFF in a project until <project>/.a2a.json says {"enabled": true}.
+  //
+  // This file lives in ~/.config/opencode/plugins, which OpenCode scans for
+  // EVERY session in EVERY directory, and the harness offers no way out: the
+  // `plugin` config key takes npm package names only, local plugins are
+  // documented as loaded automatically at startup, and the one per-invocation
+  // control, --pure, disables every plugin at once. So the switch has to be
+  // ours.
+  //
+  // ONE file, at the PROJECT ROOT, not one per harness. Several harnesses in
+  // one directory is a supported setup; per-harness markers would mean
+  // enabling the same project three or four times and keeping them in step.
+  //
+  // ONE KEY PER CLIENT — `enabled_opencode`, `enabled_pi` — because one
+  // directory can run several harnesses and each is a separate agent, so
+  // "a2a here" is not the same answer for all of them:
+  //
+  //     { "enabled_opencode": true }                        this one only
+  //     { "enabled_opencode": true, "enabled_pi": true }     both
+  //
+  // Every OTHER key in the file (read_on_init, catchup, agent) is
+  // project-wide: the switch is per client, the settings are per project.
+  const CLIENT = "opencode"
+  const ENABLE_KEY = `enabled_${CLIENT}`
+  const PROJECT_FILE = `${directory || "."}/.a2a.json`
+  const project = await readJSON(PROJECT_FILE)
+  // Strictly `true`: a typo must fail CLOSED. Turning a2a on in a directory
+  // nobody meant to connect is the failure this whole switch exists to stop.
+  let ENABLED = project[ENABLE_KEY] === true
   async function pin(id) {
     if (!id) return
     // The store answers "what is this DIRECTORY called", and it is read only
@@ -313,11 +344,16 @@ export const A2A = async ({ client, directory }) => {
   const settings = explicit
     ? { ...(await readJSON(SETTINGS_LEGACY)), ...(await readJSON(SETTINGS)) }
     : await readJSON(SETTINGS)
+  // The project file sits ON TOP of the chain, so .a2a.json can also carry
+  // read_on_init, catchup and agent for one project — settings that are
+  // otherwise global, which is why "catch up on init here but not there" was
+  // not expressible before.
   const pick = (fileKey, envKey, bakedKey, fallback) =>
-    settings[fileKey] !== undefined ? settings[fileKey]
-      : process.env[envKey] !== undefined ? process.env[envKey]
-        : BAKED[bakedKey] !== undefined ? BAKED[bakedKey]
-          : fallback
+    project[fileKey] !== undefined ? project[fileKey]
+      : settings[fileKey] !== undefined ? settings[fileKey]
+        : process.env[envKey] !== undefined ? process.env[envKey]
+          : BAKED[bakedKey] !== undefined ? BAKED[bakedKey]
+            : fallback
   const READ_ON_INIT =
     String(pick("read_on_init", "A2A_READ_ON_INIT", "read_on_init",
                 READ_ON_INIT_DEFAULT)) !== "false"
@@ -333,6 +369,13 @@ export const A2A = async ({ client, directory }) => {
   // all (a syntax error registers nothing and reports nothing), or it loaded
   // and bailed for want of credentials. One line in the log tells them apart.
   log("info", `a2a plugin loaded (version ${BAKED.version || "?"})`)
+  if (!ENABLED) {
+    log("info",
+        `a2a is off in ${directory}: ${PROJECT_FILE} does not say `
+        + `{"${ENABLE_KEY}": true}. `
+        + "The tools are here, but nothing is connected and nothing "
+        + "is injected. Say \"enable a2a here\" to turn it on.")
+  }
 
   if (!URL_BASE || !TOKEN) {
     log("error", `a2a plugin loaded but has no ${!URL_BASE ? "broker url" : "token"}`
@@ -849,7 +892,13 @@ export const A2A = async ({ client, directory }) => {
     }
   }
 
-  pump()
+  // The switch holds back EFFECTS, never the vocabulary: every tool is
+  // registered in every project, and what a disabled project does not get is
+  // the stream, the brief, the hello and the setup hint — anything that shows
+  // up in a session that did not ask for a2a. That also makes enabling work
+  // in the session you ask in: the tools are already there, so the pump can
+  // start under them.
+  if (ENABLED) pump()
 
   // --- tools ---------------------------------------------------------------
   // Every declared arg is required by OpenCode's schema conversion, so
@@ -928,6 +977,9 @@ export const A2A = async ({ client, directory }) => {
 
   return {
     event: async ({ event }) => {
+      // Registered even when off, so enable_a2a_here can switch this
+      // on under a live session rather than asking for a restart.
+      if (!ENABLED) return
       // Events are a hint, not the source of truth — drain() asks the server
       // when it has to. Any event naming a session tells us which one is live;
       // an idle one tells us it is a good moment to inject.
@@ -979,6 +1031,46 @@ export const A2A = async ({ client, directory }) => {
     },
 
     tool: {
+      enable_a2a_here: {
+        description:
+          "Record whether this PROJECT uses a2a, in <project>/.a2a.json. " +
+          "This is the human's decision, not yours: call it only when they " +
+          "ask you to, in the direction they asked for, and never on your " +
+          "own judgement — a2a connects this directory to other people's " +
+          "agents. It answers for THIS harness only: one directory can run " +
+          "several, and each is a separate agent, so enabling here says " +
+          "nothing about the others. With a2a off the tools are here but " +
+          "nothing is " +
+          "delivered and nothing is injected. Turning it on connects this " +
+          "session immediately, with no restart. The file is plain JSON that " +
+          "anyone can edit or delete.",
+        args: { enabled: { type: "boolean" } },
+        async execute(a) {
+          const on = a.enabled === true || String(a.enabled) === "true"
+          // Merge, never truncate: read_on_init, catchup or agent may be in
+          // here, and answering a yes/no must not throw the rest away.
+          // This client's key only: the tool runs in one harness and
+          // cannot speak for the others sharing the directory.
+          const next = { ...(await readJSON(PROJECT_FILE)), [ENABLE_KEY]: on }
+          await fs.writeFile(
+            PROJECT_FILE, JSON.stringify(next, null, 2) + "\n")
+          // Live, in this session. The tools were registered whatever the
+          // switch said, so there is nothing to wait for: connect under them.
+          const started = on && !ENABLED
+          ENABLED = on
+          if (started) pump()
+          return JSON.stringify({
+            enabled: on,
+            file: PROJECT_FILE,
+            next_step: on
+              ? "Tell the human a2a is on for this project, connecting now — " +
+                "no restart."
+              : "Tell the human a2a is off for this project. The tools stay " +
+                "listed but nothing is delivered here any more.",
+          })
+        },
+      },
+
       post_to_channel: {
         description:
           "Post a message to an a2a channel. Use the channel attribute of the " +

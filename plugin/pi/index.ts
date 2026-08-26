@@ -39,6 +39,9 @@
  * error anywhere. That is what the store prevents.
  */
 import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+// Sync, deliberately: the project switch has to be decided before
+// registerTool runs, and this extension's entry point is not async.
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -225,6 +228,36 @@ export default function (pi: ExtensionAPI) {
   const project = process.cwd();
   const dir = project.split(/[/\\]/).filter(Boolean).pop() || "agent";
 
+  // --- the project switch ---------------------------------------------------
+  // a2a is OFF in a project until <project>/.a2a.json says {"enabled": true}.
+  // This extension is installed under ~/.pi/agent/extensions, which every Pi
+  // session loads whatever directory it starts in, so the switch has to be
+  // ours. ONE file at the PROJECT ROOT, shared with the other clients:
+  // several harnesses in one directory is a supported setup, and a marker per
+  // harness would mean enabling the same project three or four times.
+  //
+  // ONE KEY PER CLIENT — `enabled_opencode`, `enabled_pi` — because one
+  // directory can run several harnesses and each is a separate agent, so
+  // "a2a here" is not the same answer for all of them. One JSON object:
+  //
+  //     { "enabled_pi": true }                        this one only
+  //     { "enabled_opencode": true, "enabled_pi": true }   both
+  //
+  // Every OTHER key in the file (read_on_init, catchup, agent) is
+  // project-wide: the switch is per client, the settings are per project.
+  const CLIENT = "pi";
+  const ENABLE_KEY = `enabled_${CLIENT}`;
+  const PROJECT_FILE = join(project, ".a2a.json");
+  let projectCfg: Record<string, unknown> = {};
+  try {
+    projectCfg = JSON.parse(readFileSync(PROJECT_FILE, "utf8")) || {};
+  } catch {
+    projectCfg = {};   // absent or unreadable: off, which is the default
+  }
+  // Strictly `true`. A typo must fail CLOSED — connecting a directory nobody
+  // meant to connect is the failure this switch exists to prevent.
+  let ENABLED = projectCfg[ENABLE_KEY] === true;
+
   // --- identity, resolved in ONE place --------------------------------------
   // Every input below except the environment is derived from a path, so
   // A2A_AGENT is the only thing that can tell two processes started in the
@@ -339,11 +372,14 @@ export default function (pi: ExtensionAPI) {
     settings = SETTINGS === SETTINGS_LEGACY
       ? await read(SETTINGS)
       : { ...(await read(SETTINGS_LEGACY)), ...(await read(SETTINGS)) };
+    // The project file sits ON TOP, so .a2a.json can also carry read_on_init,
+    // catchup and agent for one project — settings that are otherwise global.
     const pick = (fileKey: string, envKey: string, fallback: unknown) =>
-      settings[fileKey] !== undefined ? settings[fileKey]
-        : process.env[envKey] !== undefined ? process.env[envKey]
-          : BAKED[fileKey] !== undefined ? BAKED[fileKey]
-            : fallback;
+      projectCfg[fileKey] !== undefined ? projectCfg[fileKey]
+        : settings[fileKey] !== undefined ? settings[fileKey]
+          : process.env[envKey] !== undefined ? process.env[envKey]
+            : BAKED[fileKey] !== undefined ? BAKED[fileKey]
+              : fallback;
     READ_ON_INIT =
       String(pick("read_on_init", "A2A_READ_ON_INIT", READ_ON_INIT_DEFAULT))
         !== "false";
@@ -749,6 +785,19 @@ export default function (pi: ExtensionAPI) {
              + "<broker>/install/pi/<token>");
       return;
     }
+    // Off in this project: no stream, no brief, nothing injected. Said in the
+    // log rather than the session, because a session that did not ask for a2a
+    // should not be told about it.
+    // The switch holds back EFFECTS, never the vocabulary: the tools are
+    // registered in every project, and what a disabled one does not get is
+    // the stream, the brief and anything injected into a session that did not
+    // ask for a2a.
+    if (!ENABLED) {
+      log(`a2a is off in ${project}: ${PROJECT_FILE} does not say `
+          + `{"${ENABLE_KEY}": true}. The tools are registered; nothing `
+          + `connects.`);
+      return;
+    }
     // session_start fires for every session. One stream per process is what we
     // want: a second pump would open a second /stream for the same agent, and
     // delivery is a destructive read — the two would split this inbox.
@@ -829,6 +878,57 @@ export default function (pi: ExtensionAPI) {
       2,
     );
   }
+
+  pi.registerTool({
+    name: "enable_a2a_here",
+    label: "a2a: use here",
+    description:
+      "Record whether this PROJECT uses a2a, in <project>/.a2a.json. This is " +
+      "the human's decision, not yours: call it only when they ask you to, " +
+      "in the direction they asked for, and never on your own judgement — " +
+      "a2a connects this directory to other people's agents. It answers for " +
+      "THIS harness only: one directory can run several, and each is a " +
+      "separate agent, so enabling here says nothing about the others. With " +
+      "a2a off the tools are still here, but nothing is delivered and " +
+      "nothing is injected. Turning it on connects this session immediately, " +
+      "with no restart. The file is plain JSON anyone can edit or delete.",
+    parameters: Type.Object({ enabled: Type.Boolean() }),
+    async execute(_id, p) {
+      const on = p.enabled === true;
+      // Merge, never truncate: read_on_init, catchup or agent may be in here,
+      // and answering a yes/no must not throw the rest away.
+      let current: Record<string, unknown> = {};
+      try {
+        current = JSON.parse(await readFile(PROJECT_FILE, "utf8")) || {};
+      } catch {
+        current = {};
+      }
+      // This client's key only: the tool runs in one harness and cannot
+      // speak for the others sharing the directory.
+      await writeFile(
+        PROJECT_FILE,
+        JSON.stringify({ ...current, [ENABLE_KEY]: on }, null, 2) + "\n",
+      );
+      // Live, in this session. The tools were registered whatever the switch
+      // said, so there is nothing to wait for: connect under them.
+      const started = on && !ENABLED && !pumping;
+      ENABLED = on;
+      if (started) {
+        pumping = true;
+        await loadSettings();
+        pump();
+      }
+      return text(JSON.stringify({
+        enabled: on,
+        file: PROJECT_FILE,
+        next_step: on
+          ? "Tell the human a2a is on for this project, connecting now — no "
+            + "restart."
+          : "Tell the human a2a is off for this project. The tools stay "
+            + "listed but nothing is delivered here any more.",
+      }));
+    },
+  });
 
   pi.registerTool({
     name: "post_to_channel",

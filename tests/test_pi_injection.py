@@ -167,6 +167,9 @@ def run(tmp: Path, name: str, scenario: str = "", human_first: bool = False) -> 
         "export const Type = new Proxy({}, "
         "{ get: () => (...a) => ({ a }) });\n")
     shutil.copy(PI, work / "index.ts")
+    # a2a is off in a project until <project>/.a2a.json says otherwise,
+    # and Pi takes the project from process.cwd() — which is `work`.
+    (work / ".a2a.json").write_text('{"enabled_pi": true}')
     (work / "run.mjs").write_text(
         HARNESS.replace("HUMAN_FIRST", "true" if human_first else "false")
                .replace("SCENARIO", scenario))

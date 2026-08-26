@@ -93,7 +93,7 @@ const prompts = []
 const client = {
   app: { log: async () => {} },
   session: {
-    list: async () => [{ id: "ses_x", directory: "/tmp/proj",
+    list: async () => [{ id: "ses_x", directory: %(project)s,
                          time: { updated: 1 } }],
     promptAsync: async (a) => {
       prompts.push(a?.body?.parts?.[0]?.text || "")
@@ -103,7 +103,7 @@ const client = {
   },
 }
 const mod = await import(%(module)s)
-await mod.A2A({ client, directory: "/tmp/proj" })
+await mod.A2A({ client, directory: %(project)s })
 await new Promise((r) => setTimeout(r, 1500))
 console.log("@@" + JSON.stringify({ calls, prompts }))
 process.exit(0)
@@ -113,9 +113,15 @@ process.exit(0)
 def opencode_checks(home: Path) -> bool:
     """Is the agent asked to check its channels at startup, with this HOME?"""
     harness = home / "drive.mjs"
+    # a2a is off in a project until <project>/.a2a.json says otherwise, so the
+    # fixture has to opt in before read_on_init is even reachable.
+    project = home / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / ".a2a.json").write_text('{"enabled_opencode": true}')
     harness.write_text(OC_HARNESS % {
         "home": json.dumps(str(home)),
         "module": json.dumps(str(OPENCODE)),
+        "project": json.dumps(str(project)),
     })
     out = subprocess.run(["node", str(harness)], text=True,
                          capture_output=True, timeout=60)
