@@ -3,10 +3,11 @@
 
     python3 tests/test_project_gate.py
 
-Both these clients install into a directory their harness scans for EVERY
+OpenCode and Pi install into a directory their harness scans for EVERY
 session in EVERY directory — ~/.config/opencode/plugins and
-~/.pi/agent/extensions — and neither harness offers a per-project way out.
-So the switch is ours, and this is what pins it.
+~/.pi/agent/extensions — and Codex registers its client with `codex mcp add`,
+which puts it in every session too. None of the three harnesses offers a
+per-project way out. So the switch is ours, and this is what pins it.
 
 The switch holds back EFFECTS, never the vocabulary. Every a2a tool is
 registered in every project; what a disabled project does not get is the
@@ -17,9 +18,11 @@ nothing to wait for, because the tools are already under it.
 
 The OpenCode half RUNS the real plugin — imports it, stubs fetch, calls A2A()
 against temp directories — because a source grep would pass a client that
-reads the file and ignores it. Pi cannot be imported here (typebox is not
-installed), so its half is source-level, the same trade test_client_loads.py
-makes.
+reads the file and ignores it. The Codex half runs the real client as a
+process against a fake broker that counts every request, and drives its pump
+in-process to prove that turning a project OFF stops delivery. Pi cannot be
+imported here (typebox is not installed), so its half is source-level, the
+same trade test_client_loads.py makes.
 
   off      tools registered, and ZERO network calls and ZERO injections.
            A typo must fail CLOSED.
@@ -28,12 +31,17 @@ makes.
 
 No broker, no database, no node_modules.
 """
+import importlib.util
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -41,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "plugin"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 PI = PLUGIN / "pi" / "index.ts"
+CODEX = PLUGIN / "codex" / "a2a-codex.py"
 
 fails: list[str] = []
 
@@ -154,6 +163,214 @@ def run_opencode() -> dict:
     return json.loads(res.stdout.split("@@", 1)[1])
 
 
+# --- the Codex client, actually run ------------------------------------------
+class FakeBroker:
+    """Counts every request, answers enough for the client to get going, and
+    serves a /stream that can be fed lines, replays what is unacked on every
+    new connection — as the real broker does — and can go quiet (no
+    keepalives) so the next line on the wire is exactly the one a test sends.
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+        self.acked: list[str] = []
+        self.unacked: list[dict] = []
+        self.live: queue.Queue = queue.Queue()
+        self.quiet = threading.Event()
+        self.stop = threading.Event()
+        self.streams = 0
+        broker = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"     # a stream runs until close
+
+            def log_message(self, *a):
+                pass
+
+            def _json(self, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                broker.calls.append(path)
+                if path == "/stream":
+                    return self._stream()
+                self._json({"agent": "x", "registered": True,
+                            "stations": ["s"], "channels": []})
+
+            def do_POST(self):
+                path = self.path.split("?")[0]
+                broker.calls.append(path)
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                if path == "/ack":
+                    ids = body.get("ids") or []
+                    broker.acked += ids
+                    broker.unacked = [m for m in broker.unacked
+                                      if m["id"] not in ids]
+                self._json({"ok": True})
+
+            do_PATCH = do_DELETE = do_POST
+
+            def _stream(self):
+                broker.streams += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.end_headers()
+                try:
+                    for m in list(broker.unacked):
+                        self.wfile.write((json.dumps(m) + "\n").encode())
+                        self.wfile.flush()
+                    while not broker.stop.is_set():
+                        try:
+                            m = broker.live.get(timeout=0.2)
+                        except queue.Empty:
+                            if not broker.quiet.is_set():
+                                self.wfile.write(b"\n")
+                                self.wfile.flush()
+                            continue
+                        broker.unacked.append(m)
+                        self.wfile.write((json.dumps(m) + "\n").encode())
+                        self.wfile.flush()
+                except OSError:
+                    pass
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_port}"
+
+    def close(self):
+        self.stop.set()
+        self.srv.shutdown()
+
+
+def _project(contents) -> Path:
+    d = Path(tempfile.mkdtemp(prefix="a2a-gate-cx-")).resolve()
+    if contents is not None:
+        (d / ".a2a.json").write_text(json.dumps(contents))
+    return d
+
+
+def run_codex(contents, follow=()) -> dict:
+    """The real Codex client as Codex runs it: a process in the project
+    directory, spoken to over MCP stdio. `before` is every request that
+    reached the broker while the session merely sat there; `after` is what
+    the follow-up requests caused."""
+    fb = FakeBroker()
+    proj = _project(contents)
+    env = dict(os.environ, A2A_URL=fb.url, A2A_TOKEN="t", A2A_CODEX_SOCK="",
+               # its log and identity store, kept out of the real ~/.codex
+               CODEX_HOME=str(proj.parent / (proj.name + "-home")))
+    env.pop("A2A_AGENT", None)
+    proc = subprocess.Popen([sys.executable, str(CODEX)], cwd=str(proj),
+                            env=env, text=True, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def say(obj):
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+
+    say({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    say({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    say({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    time.sleep(1.5)
+    before = list(fb.calls)
+    for i, (name, args) in enumerate(follow):
+        say({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call",
+             "params": {"name": name, "arguments": args}})
+        time.sleep(1.5)
+    after = fb.calls[len(before):]
+    proc.stdin.close()
+    out, err = proc.communicate(timeout=30)
+    fb.close()
+    replies = {r.get("id"): r.get("result") or {}
+               for r in (json.loads(l) for l in out.splitlines() if l.strip())}
+    try:
+        file = json.loads((proj / ".a2a.json").read_text())
+    except Exception:
+        file = None
+    return {
+        "before": before, "after": after, "stderr": err,
+        "instructions": (replies.get(1) or {}).get("instructions"),
+        "tools": [t["name"] for t in (replies.get(2) or {}).get("tools", [])],
+        "results": [json.loads(((replies.get(10 + i) or {}).get("content")
+                                or [{}])[0].get("text") or "null")
+                    for i in range(len(follow))],
+        "file": file,
+    }
+
+
+def codex_off_stops_the_stream() -> dict:
+    """Drive the real pump in-process: on, deliver; OFF, and a line arriving
+    after that must be neither injected nor acked; on again, and the broker's
+    replay hands that same line over. Push is stubbed to a recorder, because
+    what is under test is the switch, not the websocket."""
+    fb = FakeBroker()
+    proj = _project({"enabled_codex": True})
+    os.environ.update(A2A_URL=fb.url, A2A_TOKEN="t", A2A_CODEX_SOCK="",
+                      CODEX_HOME=str(proj.parent / (proj.name + "-home")))
+    os.environ.pop("A2A_AGENT", None)
+    here = os.getcwd()
+    os.chdir(proj)            # the client reads its project from its cwd
+    try:
+        spec = importlib.util.spec_from_file_location("gate_codex", CODEX)
+        cx = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cx)
+    finally:
+        os.chdir(here)
+
+    turns: list[str] = []
+
+    class Session:
+        def submit(self, text):
+            turns.append(text)
+
+    cx.get_server = lambda: Session()
+    cx._injectable = lambda: True
+    cx.RECONNECT_S = 0.1
+
+    def until(cond, secs=5.0):
+        end = time.time() + secs
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return False
+
+    msg = lambda i, t: {"id": i, "channel": "ops", "sender": "bob", "text": t,
+                        "audience": ["x"], "addressed": []}
+    out = {}
+    threading.Thread(target=cx.pump_guard, daemon=True).start()
+    out["connected"] = until(lambda: cx._state["connected"])
+    fb.live.put(msg("m1", "first-body"))
+    out["m1_in"] = until(lambda: any("first-body" in t for t in turns))
+    out["m1_acked"] = until(lambda: "m1" in fb.acked)
+
+    fb.quiet.set()                         # next line on the wire is m2
+    out["switched_off"] = json.loads(cx._enable_a2a_here({"enabled": False}))
+    fb.live.put(msg("m2", "second-body"))
+    out["closed"] = until(lambda: not cx._state["connected"])
+    time.sleep(0.5)
+    out["m2_in_while_off"] = any("second-body" in t for t in turns)
+    out["m2_acked_while_off"] = "m2" in fb.acked
+    streams = fb.streams
+
+    fb.quiet.clear()
+    cx._enable_a2a_here({"enabled": True})
+    out["m2_in_after"] = until(lambda: any("second-body" in t for t in turns))
+    out["m2_acked_after"] = until(lambda: "m2" in fb.acked)
+    out["reconnected"] = fb.streams == streams + 1
+    out["file"] = json.loads((proj / ".a2a.json").read_text())
+    fb.close()
+    return out
+
+
 def main() -> int:
     oc = run_opencode()
 
@@ -203,6 +420,66 @@ def main() -> int:
     check("opencode: it turns a project off as well as on",
           oc["off_again"]["enabled"] is False, str(oc["off_again"]))
 
+    # --- Codex: the real client, as a process ---------------------------------
+    for label, contents in (("no .a2a.json at all", None),
+                            ('{"enabled_codex": false}',
+                             {"enabled_codex": False}),
+                            ('{"enabled_codex": "true"} — a STRING', 
+                             {"enabled_codex": "true"}),
+                            ("ONLY the other clients' keys",
+                             {"enabled_opencode": True, "enabled_pi": True}),
+                            ('{"enabled": true} — the bare key', 
+                             {"enabled": True})):
+        got = run_codex(contents)
+        check(f"codex: {label} → NOTHING reaches the broker",
+              got["before"] == [], str(got["before"]))
+        check(f"codex: {label} → no brief in the session: the handshake "
+              f"carries no instructions",
+              not got["instructions"], str(got["instructions"])[:80])
+        check(f"codex: {label} → but every tool is listed, the switch "
+              f"included",
+              len(got["tools"]) > 1 and "enable_a2a_here" in got["tools"],
+              str(got["tools"]))
+
+    off = run_codex(None, follow=[("a2a_channel_status", {})])
+    step = (off["results"][0] or {}).get("next_step") or ""
+    check("codex: asked what is wrong in a project that is off, it says THAT "
+          "first — not 'register', not 'wait for the stream' — and leaves "
+          "the decision to the user",
+          "a2a is off" in step and "enable_a2a_here" in step
+          and "user" in step, step)
+
+    on = run_codex({"enabled_codex": True})
+    check('codex: {"enabled_codex": true} connects — the pump asks the '
+          "broker who it is",
+          "/me" in on["before"], str(on["before"]))
+    check("codex: and the session is briefed",
+          "ADDRESSING IS AN ARGUMENT" in (on["instructions"] or ""),
+          str(on["instructions"])[:80])
+
+    sw = run_codex({"catchup": 42, "enabled_pi": True},
+                   follow=[("enable_a2a_here", {"enabled": True})])
+    check("codex: the switch writes the file and MERGES — catchup and Pi's "
+          "answer both survive",
+          sw["file"] == {"catchup": 42, "enabled_pi": True,
+                         "enabled_codex": True}, str(sw["file"]))
+    check("codex: and enabling connects THIS session, with no restart",
+          sw["before"] == [] and "/me" in sw["after"],
+          f'before={sw["before"]} after={sw["after"]}')
+
+    st = codex_off_stops_the_stream()
+    check("codex: on, a message is delivered and acked",
+          st["connected"] and st["m1_in"] and st["m1_acked"], str(st))
+    check("codex: turning the project OFF closes the stream",
+          st["switched_off"]["enabled"] is False and st["closed"], str(st))
+    check("codex: and a message arriving after that is NOT injected and NOT "
+          "acked — it waits on the broker, because delivery is a destructive "
+          "read",
+          not st["m2_in_while_off"] and not st["m2_acked_while_off"], str(st))
+    check("codex: on again, the same message arrives — held, not lost",
+          st["reconnected"] and st["m2_in_after"] and st["m2_acked_after"],
+          str(st))
+
     # --- Pi: source, because typebox is not installed here --------------------
     pi = PI.read_text()
     check("pi: reads the project file SYNCHRONOUSLY — its entry point is not "
@@ -238,8 +515,10 @@ def main() -> int:
           "harnesses in one directory is a supported setup, and two names "
           "would mean enabling one project twice",
           '`${directory || "."}/.a2a.json`' in oc_src
-          and 'join(project, ".a2a.json")' in pi,
-          "the two clients name different files")
+          and 'join(project, ".a2a.json")' in pi
+          and 'PROJECT_FILE = Path(os.getcwd()) / ".a2a.json"'
+          in CODEX.read_text(),
+          "the clients name different files")
     check("and both put it on TOP of the settings chain, so .a2a.json can "
           "carry read_on_init / catchup / agent per project",
           "project[fileKey] !== undefined" in oc_src

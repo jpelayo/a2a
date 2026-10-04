@@ -208,8 +208,10 @@ mkdir -p ~/.codex/a2a && \
   codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py
 ```
 
-Tools work in every session from then on. Push needs the session to have its
-own app-server, which is one line:
+Tools are listed in every session from then on, but a2a stays silent in a
+project until `<project>/.a2a.json` has `"enabled_codex": true` — say "enable
+a2a here" in that project. Push also needs the session to have its own
+app-server, which is one line:
 
 ```bash
 codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; codex --remote unix://$TMPDIR/a2a-$$.sock

@@ -21,6 +21,10 @@ the shared suites, so they are covered here:
                    must work and push must be off, quietly — and the broker
                    stream must never be claimed, because delivery is a
                    destructive read.
+  ownership        only a server the a2a launch line started — socket
+                   `a2a-*.sock` — is pushed into or reaped. The reaper once
+                   SIGTERMed the shared control-socket server every fifteen
+                   seconds and took every Codex session on it down.
 
 Pure python3 stdlib.
 """
@@ -30,12 +34,15 @@ import importlib.util
 import inspect
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import types
 from pathlib import Path
 
 # The clients live in plugin/; the suite lives here, beside it.
@@ -200,10 +207,17 @@ def main() -> int:
     # resolve(): macOS TMPDIR lives behind a /var -> /private/var symlink, and
     # the client compares os.getcwd() (already resolved) against thread cwds.
     tmp = Path(tempfile.mkdtemp(prefix="a2acx-")).resolve()
+    # The client logs and keeps its identity store under CODEX_HOME. Pointed
+    # here, so running this suite writes nothing into the real ~/.codex.
+    codex_home = tmp / "codex-home"
+    os.environ["CODEX_HOME"] = str(codex_home)
 
     # --- identity ladder ----------------------------------------------------
     proj = tmp / "my-project"
     proj.mkdir()
+    # Opted in, so everything below exercises a project that is on. What a
+    # project that is off does is pinned in test_project_gate.py.
+    (proj / ".a2a.json").write_text('{"enabled_codex": true}')
     b = load(cwd=str(proj))
     check("with no store and no env, the id is the project directory's name — "
           "what every client sent before the store existed, so an upgrade is "
@@ -334,7 +348,7 @@ def main() -> int:
     os.environ.pop("A2A_CODEX_SOCK", None)
     b7._SOCK_ENV = None
     iso = Path(tempfile.mkdtemp(prefix="iso-", dir="/private/tmp")).resolve()
-    mine, theirs = str(iso / "mine.sock"), str(iso / "theirs.sock")
+    mine, theirs = str(iso / "a2a-1.sock"), str(iso / "a2a-2.sock")
     m_mine = MockAppServer(mine, cwds={"t-1": str(proj)})
     m_theirs = MockAppServer(theirs, threads=("t-9",), cwds={"t-9": str(proj)})
     m_mine.start(); m_theirs.start()
@@ -358,12 +372,12 @@ def main() -> int:
           str(b7.control_socket()))
 
     b7.drop_server()
-    b7._parent_argv = lambda: "codex app-server --listen unix:///gone/s.sock"
+    b7._parent_argv = lambda: "codex app-server --listen unix:///gone/a2a-9.sock"
     check("a socket named in the parent's argv but absent from disk yields "
           "nothing rather than an exception",
           b7.control_socket() == "" and b7.get_server() is None)
 
-    # --- the well-known socket is reachable ONLY as our own parent's ---------
+    # --- a server the launch line did not start is never ours ---------------
     # A SHORT fake home: the well-known socket path must fit in SUN_LEN
     # (~104 bytes), which a deep TMPDIR-based path does not.
     fakehome = Path(tempfile.mkdtemp(prefix="cxh-", dir="/private/tmp")).resolve()
@@ -376,22 +390,86 @@ def main() -> int:
         ctl = fakehome / "app-server-control" / "app-server-control.sock"
         mock3 = MockAppServer(str(ctl), cwds={"t-1": str(proj)})
         mock3.start()
-        b6._parent_argv = lambda: "codex app-server --listen unix:// -c x=1"
-        check("bare `--listen unix://` resolves to the well-known control "
-              "socket — reachable because it IS our parent's socket",
-              b6.control_socket() == str(ctl)
-              and b6.get_server() is not None
-              and b6.get_server().session_thread() == "t-1",
-              b6.control_socket())
-        b6.drop_server()
+        for argv in ("codex app-server --listen unix:// -c x=1",
+                     f"codex app-server --listen unix://{ctl}"):
+            b6._parent_argv = lambda argv=argv: argv
+            check(f"the shared control socket is NOT pushed into, even as "
+                  f"our own parent's ({argv.split('unix://')[1][:12] or 'bare'}"
+                  f"…) — something else started that server and put other "
+                  f"sessions on it",
+                  b6.parent_socket() == str(ctl)
+                  and b6.control_socket() == "" and b6.get_server() is None,
+                  f"{b6.parent_socket()} -> {b6.control_socket()!r}")
         b6._parent_argv = lambda: "codex"
         check("with no --listen in the parent, that same existing well-known "
-              "socket is NOT used — the convenient fallback that would break "
-              "isolation is absent on purpose",
+              "socket is not used either",
               b6.control_socket() == "" and b6.get_server() is None,
               b6.control_socket())
     finally:
-        os.environ.pop("CODEX_HOME", None)
+        os.environ["CODEX_HOME"] = str(codex_home)
+
+    # --- the reaper: only what the launch line started ---------------------
+    # Every call below stubs the three things that make reaper() dangerous to
+    # call in a test — sleep, the TUI probe, and os.kill/_exit — and records
+    # what it WOULD have done. A regression here must fail the check, not
+    # signal the shell that ran the suite.
+    class Os:
+        def __init__(self):
+            self.killed = []
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def kill(self, pid, sig):
+            self.killed.append((pid, sig))
+
+        def _exit(self, code):
+            raise SystemExit(code)
+
+    def reap(parent_argv, sock_env=None):
+        r = load(cwd=str(proj))
+        if sock_env is None:
+            os.environ.pop("A2A_CODEX_SOCK", None)
+            r._SOCK_ENV = None
+        else:
+            r._SOCK_ENV = sock_env
+        r._parent_argv = lambda: parent_argv
+        r._tui_attached = lambda sock: False      # nobody attached, ever
+        r.time = types.SimpleNamespace(sleep=lambda s: None, time=time.time,
+                                       strftime=time.strftime,
+                                       gmtime=time.gmtime)
+        r.os = Os()
+        try:
+            r.reaper()
+            return r.os.killed, False
+        except SystemExit:
+            return r.os.killed, True
+
+    killed, exited = reap(f"codex app-server --listen unix://{ctl}")
+    check("the reaper NEVER stops the shared control-socket server, even with "
+          "no TUI it can see — the bug that took down every Codex session on "
+          "it fifteen seconds after each opened",
+          killed == [] and not exited, f"{killed} exited={exited}")
+    killed, exited = reap("codex app-server --listen unix:// -c x=1")
+    check("nor when that server was started with a bare `--listen unix://`",
+          killed == [] and not exited, f"{killed} exited={exited}")
+    other = iso / "something-else.sock"
+    other.touch()
+    killed, exited = reap(f"codex app-server --listen unix://{other}")
+    check("nor any other socket the launch line did not name",
+          killed == [] and not exited, f"{killed} exited={exited}")
+    ours_sock = iso / "a2a-4242.sock"
+    ours_sock.touch()
+    killed, exited = reap("codex", sock_env=str(ours_sock))
+    check("an A2A_CODEX_SOCK override never makes the parent a target: it "
+          "names a socket, not a process",
+          killed == [] and not exited, f"{killed} exited={exited}")
+    killed, exited = reap(f"codex app-server --listen unix://{ours_sock}")
+    check("and a server the launch line DID start is still reaped once its "
+          "TUI is gone — the parent, with SIGTERM, then this client exits",
+          killed == [(os.getppid(), signal.SIGTERM)] and exited,
+          f"{killed} exited={exited}")
+
     # --- the orient call, in the two states an agent is actually stuck in ----
     b5.api = lambda meth, path, body=None, timeout=30: (
         {"agent": "x", "stations": ["acme"], "registered": False}
@@ -432,8 +510,10 @@ def main() -> int:
           and "mktemp" not in b5.LAUNCH_LINE
           and ".sh" not in b5.LAUNCH_LINE,
           b5.LAUNCH_LINE)
-    check("the tool surface is the shared vocabulary plus the diagnostic",
-          len(b5.TOOLS) == 21 and "post_to_channel" in b5.TOOL_BY_NAME,
+    check("the tool surface is the shared vocabulary plus the diagnostic "
+          "and the project switch",
+          len(b5.TOOLS) == 22 and "post_to_channel" in b5.TOOL_BY_NAME
+          and "enable_a2a_here" in b5.TOOL_BY_NAME,
           str(len(b5.TOOLS)))
 
     # --- a receipt, not a copy ----------------------------------------------
@@ -463,7 +543,8 @@ def main() -> int:
     # line while every function-level test above still passed. Nothing here
     # exercised the process, so nothing caught it.
     env = dict(os.environ, A2A_URL="http://127.0.0.1:1",
-               A2A_TOKEN="a2a_st_test", A2A_CODEX_SOCK="")
+               A2A_TOKEN="a2a_st_test", A2A_CODEX_SOCK="",
+               CODEX_HOME=str(codex_home))
     env.pop("A2A_AGENT", None)
     proc = subprocess.run(
         [sys.executable, str(CLIENT)],
@@ -484,7 +565,7 @@ def main() -> int:
           init and "ADDRESSING IS AN ARGUMENT"
           in (init["result"].get("instructions") or ""), str(init)[:200])
     check("and lists the whole surface over the wire, not just in a table",
-          listed and len(listed["result"]["tools"]) == 21,
+          listed and len(listed["result"]["tools"]) == 22,
           str(len((listed or {}).get("result", {}).get("tools", []))))
 
     print()

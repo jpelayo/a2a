@@ -67,12 +67,13 @@ ONLY_CLIENTS = {
     "enable_a2a_here",
 }
 
-# Tools that configure THIS install rather than name a capability. The parity
-# rule exists so an agent asking a peer for something need not know which
-# harness answered — and "use a2a in my project" is not something you ask a
-# peer. TEMPORARY: it empties again when Codex and Claude Code get the same
-# project switch. Read the note above DIAGNOSTIC before adding a second name.
-INSTALL_SCOPE = {"enable_a2a_here"}
+# Tools that configure THIS install rather than name a capability, exempted
+# from the Codex comparison while Codex lacked them. Empty again: Codex reads
+# .a2a.json and carries enable_a2a_here like the other two. (Claude Code's
+# client is not compared here — its vocabulary is the broker's MCP surface —
+# and it still has no switch.) Read the note above DIAGNOSTIC before putting
+# a name back.
+INSTALL_SCOPE: set[str] = set()
 
 fails: list[str] = []
 

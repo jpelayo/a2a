@@ -27,7 +27,7 @@ script, no wrapper, nothing but codex:
         codex --remote unix://$TMPDIR/a2a-$$.sock
 
 Two commands, no variable and no cleanup clause: the socket is named after the
-project, so both halves spell it identically; Codex unlinks it on exit; and
+shell's pid, so both halves spell it identically; Codex unlinks it on exit; and
 this client reaps the server once the TUI is gone (see reaper), because the
 app-server does NOT exit on its own when its last client leaves.
 
@@ -38,6 +38,21 @@ the `--listen unix://…` path — so it can only ever reach the server it belon
 to. Other sessions are unreachable from here by construction, not by
 convention, and a plain `codex` (in-process app-server, no --listen) finds
 nothing and runs with push off.
+
+ONLY A SERVER THAT LINE STARTED, and the socket's name is how it knows. A
+parent listening on anything but an `a2a-*.sock` socket was started by
+something else — the shared control socket under ~/.codex/app-server-control
+is the case that bit: other sessions' threads, on a server this client did not
+start. Such a server is neither pushed into nor reaped. Reaping it is what
+killed every Codex session on it, fifteen seconds after each one opened, in
+projects that had nothing to do with a2a.
+
+OFF UNTIL THE PROJECT SAYS SO. `codex mcp add` puts this client in every
+session in every directory, so <project>/.a2a.json holding
+{"enabled_codex": true} is what turns it on — the same file OpenCode and Pi
+read, one key per client. Off, the tools are listed and do nothing until
+called: no brief, no stream, no turn injected. enable_a2a_here flips it in
+place, with no restart.
 
 As a second guard it still identifies the thread by cwd — the app-server spawns
 it with cwd = the thread's project directory — and injects only when EXACTLY
@@ -108,6 +123,33 @@ def _parent_argv() -> str:
         return ""
 
 
+# The launch line names its socket a2a-<pid>.sock. That name is the ONLY
+# evidence a server was started for a2a, so it alone decides whether this
+# client may push into the server or shut it down.
+LAUNCH_SOCKET = re.compile(r"^a2a-[^/]*\.sock$")
+
+
+def parent_socket() -> str:
+    """The socket our parent app-server listens on, read from its argv, or
+    "" when it has none. Says nothing about whether the server is ours."""
+    m = re.search(r"--listen[= ]+unix://(\S*)", _parent_argv())
+    if not m:
+        return ""
+    # `--listen unix://` with no path binds Codex's well-known control socket.
+    return m.group(1) or str(CODEX_HOME / "app-server-control"
+                             / "app-server-control.sock")
+
+
+def ours(path: str) -> bool:
+    """Was this server started by the a2a launch line?
+
+    Only the socket's name can say so. Anything else — the shared control
+    socket above all — belongs to whatever started it, with whatever
+    sessions it carries: not ours to push into, never ours to stop.
+    """
+    return bool(path) and LAUNCH_SOCKET.match(os.path.basename(path)) is not None
+
+
 def control_socket() -> str:
     """The socket to inject through, or "" while there is none.
 
@@ -119,24 +161,19 @@ def control_socket() -> str:
     from here, and a plain `codex` — whose app-server is in-process and has no
     --listen at all — finds nothing and simply runs without push.
 
-    Deliberately NOT falling back to the well-known control socket: that one is
-    shared, so a session that happened to find it could deliver into a window
-    belonging to somebody else's server.
+    Deliberately NOT the well-known control socket, not even when it is our
+    own parent's: that server is shared — whatever started it put other
+    sessions on it — so injecting there could land in somebody else's window.
+    Only a server the launch line started (see ours) is reachable.
 
     Re-evaluated per reconnect rather than cached: the server is an ordinary
     foreground process and may outlive or predecease this one.
     """
     if _SOCK_ENV is not None:
         return _SOCK_ENV
-    m = re.search(r"--listen[= ]+unix://(\S*)", _parent_argv())
-    if not m:
+    path = parent_socket()
+    if not ours(path):
         return ""
-    path = m.group(1)
-    if not path:
-        # `--listen unix://` with no path: Codex binds the well-known control
-        # socket. Reachable only because it IS our parent's socket.
-        path = str(CODEX_HOME / "app-server-control"
-                   / "app-server-control.sock")
     return path if os.path.exists(path) else ""
 STORE = CODEX_HOME / "a2a-identity.json"
 SETTINGS_LEGACY = CODEX_HOME / "a2a.json"
@@ -150,10 +187,11 @@ STREAM_READ_TIMEOUT = float(os.environ.get("A2A_STREAM_TIMEOUT") or 30)
 # Quoted verbatim in the log and in a2a_channel_status, because a user staring
 # at a quiet channel needs the command, not a description of it.
 #
-# The socket is named after the project directory, so both halves can spell it
-# without a variable to carry it, and there is no bookkeeping to clean up: this
-# client reaps the server itself once the TUI is gone (see reaper()), and Codex
-# unlinks the socket on the way out.
+# The socket is named a2a-<shell pid>, so both halves can spell it without a
+# variable to carry it, and there is no bookkeeping to clean up: this client
+# reaps the server itself once the TUI is gone (see reaper()), and Codex unlinks
+# the socket on the way out. That name is also how this client recognises a
+# server it may push into and reap at all (see ours()).
 LAUNCH_LINE = ("codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; "
                "codex --remote unix://$TMPDIR/a2a-$$.sock")
 
@@ -228,6 +266,44 @@ def pin(agent_id):
 KEY, EXPLICIT = resolve_key()
 NAME = KEY
 
+# --- the project switch --------------------------------------------------------
+# a2a is OFF in a project until <project>/.a2a.json says {"enabled_codex": true}.
+#
+# `codex mcp add` registers this client for EVERY session in EVERY directory,
+# and Codex offers no per-project way out, so the switch is ours — and it is
+# the one OpenCode and Pi already read: ONE file at the project root, ONE key
+# per client, because one directory can run several harnesses and each is a
+# separate agent. Every other key in the file (read_on_init, catchup) is
+# project-wide.
+#
+# The project is our cwd: the app-server spawns this client with cwd = the
+# thread's project directory, which is also what the identity store keys on.
+#
+# The switch holds back EFFECTS, never vocabulary. Every tool is listed in
+# every project, which is what lets enable_a2a_here turn a project on under a
+# live session. What a project that is off does not get: the brief, the
+# stream, the catch-up, and any turn injected into it.
+CLIENT = "codex"
+ENABLE_KEY = f"enabled_{CLIENT}"
+PROJECT_FILE = Path(os.getcwd()) / ".a2a.json"
+
+
+def _read_project():
+    try:
+        data = json.loads(PROJECT_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}           # absent or unreadable: off, which is the default
+
+
+PROJECT = _read_project()
+# Set while the project is on. Strictly `true` in the file: a typo must fail
+# CLOSED. An Event rather than a flag so the pump can WAIT on it — turning a
+# project on starts it at once, and nothing polls while it is off.
+_enabled = threading.Event()
+if PROJECT.get(ENABLE_KEY) is True:
+    _enabled.set()
+
 # --- settings ----------------------------------------------------------------
 # ~/.codex/a2a.json, which normally does not exist: the install is one command
 # and the defaults here are the supported setup.
@@ -254,6 +330,10 @@ _SET = _settings()
 
 
 def _flag(key, default):
+    # The project file sits ON TOP of the chain, as in the other clients, so
+    # one project can catch up on init while another does not.
+    if PROJECT.get(key) is not None:
+        return bool(PROJECT[key])
     env = os.environ.get("A2A_" + key.upper())
     if env not in (None, ""):
         return env not in ("0", "false", "False")
@@ -262,6 +342,11 @@ def _flag(key, default):
 
 
 def _num(key, default):
+    try:
+        if PROJECT.get(key) is not None:
+            return int(PROJECT[key])
+    except (TypeError, ValueError):
+        pass
     env = os.environ.get("A2A_" + key.upper())
     try:
         if env not in (None, ""):
@@ -758,18 +843,22 @@ def _injectable():
 
 
 def pump():
-    """Hold the broker's /stream and inject what arrives."""
+    """Hold the broker's /stream and inject what arrives — while, and only
+    while, this project is on. Returns when it is turned off; pump_guard then
+    waits for it to come back on."""
     resolve_name()
     check_version()
     said_off = False
     while not _injectable():
+        if not _enabled.is_set():
+            return
         if not said_off:
             log("push is off: this session has no app-server socket. Give "
                 f"it one with: {LAUNCH_LINE} . Tools work either way.")
             said_off = True
         time.sleep(10)
     catch_up()
-    while True:
+    while _enabled.is_set():
         # Built per connection from the CURRENT key: rename_me changes it, and
         # a url hoisted out of the loop would keep streaming as the old agent.
         stream_key = KEY
@@ -787,6 +876,13 @@ def pump():
                 log(f"stream open as {stream_key}")
                 for raw in resp:
                     _state["last_line"] = time.time()
+                    # Checked BEFORE emit: a line read after the project was
+                    # turned off is left unacked on the broker, never injected.
+                    # The broker's keepalive bounds how long this takes.
+                    if not _enabled.is_set():
+                        log("a2a turned off in this project; closing the "
+                            "stream")
+                        break
                     if KEY != stream_key:
                         log("agent id changed; reconnecting")
                         break
@@ -817,6 +913,7 @@ def pump():
             continue
         _state["connected"] = False
         time.sleep(1)
+    _state["connected"] = False
 
 
 # How long the TUI may be missing before the server it was started for is shut
@@ -854,13 +951,27 @@ def reaper():
     spawned, and which therefore outlives the TUI) does it: when no TUI is
     attached to our socket any more, it stops the parent and exits with it.
 
+    ONLY a server the launch line started — its socket is `a2a-*.sock`. Any
+    other parent was started by something else, for sessions this client
+    cannot see: TUIs on another spelling of the socket, the desktop app, an
+    IDE. Their absence from `pgrep` says nothing, and treating it as "no TUI"
+    is how this once sent SIGTERM to the shared control-socket server every
+    fifteen seconds, taking every Codex session on it down, in projects that
+    never asked for a2a. The socket comes from the parent's argv and NEVER
+    from A2A_CODEX_SOCK: an override names a socket, not a process, so it can
+    never make the parent a target.
+
+    Independent of the project switch, deliberately: a server started by the
+    a2a launch line exists for this client, and leaving it running after its
+    TUI has gone would leak it whatever .a2a.json says.
+
     A2A_CODEX_REAP=0 turns this off, for anyone running a long-lived server on
     purpose and attaching sessions to it by hand.
     """
     if os.environ.get("A2A_CODEX_REAP") == "0":
         return
-    sock = control_socket()
-    if not sock:
+    sock = parent_socket()
+    if not ours(sock) or not os.path.exists(sock):
         return
     misses = 0
     while True:
@@ -889,6 +1000,8 @@ def pump_guard():
     """Restart the pump if it ever falls out of its own loop. A dead pump used
     to be indistinguishable from a quiet day."""
     while True:
+        # A project that is off never reaches the broker: no /me, no stream.
+        _enabled.wait()
         try:
             pump()
         except Exception as e:
@@ -1089,6 +1202,41 @@ def _my_channels():
         return []
 
 
+def _enable_a2a_here(a):
+    """Write this client's answer into <project>/.a2a.json and act on it now.
+
+    Merge, never truncate: read_on_init, catchup, or another client's answer
+    may already be in the file, and a yes/no for Codex must not throw them
+    away. This client's key only — it cannot speak for the other harnesses
+    sharing the directory.
+    """
+    raw = a.get("enabled")
+    on = raw is True or str(raw).lower() == "true"
+    data = _read_project()
+    data[ENABLE_KEY] = on
+    try:
+        PROJECT_FILE.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return json.dumps({"error": f"could not write {PROJECT_FILE}: {e}"})
+    # Live, in this session: the tools are already listed, so the pump can
+    # start under them, or stop.
+    if on:
+        _enabled.set()
+    else:
+        _enabled.clear()
+    log(f"a2a turned {'on' if on else 'off'} in {os.getcwd()}")
+    return json.dumps({
+        "enabled": on,
+        "file": str(PROJECT_FILE),
+        "next_step": (
+            "Tell the human a2a is on for this project, connecting now — no "
+            "restart." if on else
+            "Tell the human a2a is off for this project. The tools stay "
+            "listed but nothing is delivered here any more."),
+    })
+
+
 def _status(a):
     quiet = (time.time() - _state["last_line"]) if _state["last_line"] else None
     stale = bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
@@ -1107,9 +1255,16 @@ def _status(a):
     registered = bool(me.get("registered"))
     stations = me.get("stations") or []
 
-    # In order: exist, then be reachable, then be healthy. Only the first
-    # unmet condition is worth telling an agent about.
-    if not registered:
+    # In order: be switched on, exist, be reachable, be healthy. Only the
+    # first unmet condition is worth telling an agent about — and "off" must
+    # come first, or an agent in a project that never opted in is told to
+    # register, or to wait for a stream that will never open.
+    if not _enabled.is_set():
+        step = (f"a2a is off in this project: {PROJECT_FILE} does not say "
+                f'{{"{ENABLE_KEY}": true}}, so nothing is delivered here. '
+                "That is the user's decision: only if they ask for a2a in "
+                "this project, call enable_a2a_here(enabled=true)")
+    elif not registered:
         step = ("you are not registered in this station yet: call "
                 "propose_me(note=\"what this project is\") and an operator "
                 "approves it with one keystroke — no restart needed")
@@ -1150,6 +1305,18 @@ def _status(a):
 
 
 TOOLS = [
+    ("enable_a2a_here",
+     "Record whether this PROJECT uses a2a, in <project>/.a2a.json. This is "
+     "the human's decision, not yours: call it only when they ask you to, in "
+     "the direction they asked for, and never on your own judgement — a2a "
+     "connects this directory to other people's agents. It answers for THIS "
+     "harness only: one directory can run several, and each is a separate "
+     "agent, so enabling here says nothing about the others. With a2a off the "
+     "tools are here but nothing is delivered and nothing is injected. "
+     "Turning it on connects this session immediately, with no restart. The "
+     "file is plain JSON that anyone can edit or delete.",
+     {"enabled": {"type": "boolean"}}, ["enabled"], _enable_a2a_here),
+
     ("post_to_channel",
      "Post a message to an a2a channel. Use the channel attribute of the "
      "message you are answering. EVERY member receives it, reads it and must "
@@ -1363,15 +1530,20 @@ def handle(msg):
     mid = msg.get("id")
     method = msg.get("method")
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
+        result = {
             "protocolVersion": (msg.get("params") or {}).get(
                 "protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "a2a", "version": CLIENT_VERSION or "0"},
-            # Codex hands this to the model, so the brief arrives even in a
-            # session where nothing is pushed.
-            "instructions": BRIEF,
-        }})
+        }
+        # Codex hands this to the model, so the brief arrives even in a
+        # session where nothing is pushed — but only in a project that is on.
+        # It is the largest thing a2a puts into a session, and a project
+        # that never asked for a2a gets none of it. Enabling later still
+        # briefs: catch_up() and the first delivery both carry it.
+        if _enabled.is_set():
+            result["instructions"] = BRIEF
+        send({"jsonrpc": "2.0", "id": mid, "result": result})
     elif method in ("notifications/initialized", "initialized"):
         return
     elif method == "ping":
@@ -1411,8 +1583,16 @@ def main():
             "a2a: no broker url or token. Reinstall with the one-line "
             "installer from your broker, or set A2A_URL and A2A_TOKEN.\n")
         return 1
+    psock = parent_socket()
     log(f"starting as {KEY} (explicit={EXPLICIT}) "
-        f"socket={control_socket() or None}")
+        f"socket={control_socket() or None}"
+        + (f" — parent listens on {psock}, which the a2a launch line did "
+           f"not start: no push into it, and it is never reaped"
+           if psock and not ours(psock) else ""))
+    if not _enabled.is_set():
+        log(f"a2a is off in {os.getcwd()}: {PROJECT_FILE} does not say "
+            f'{{"{ENABLE_KEY}": true}}. The tools are listed; nothing is '
+            f"streamed or injected.")
     threading.Thread(target=pump_guard, name="a2a-pump", daemon=True).start()
     threading.Thread(target=reaper, name="a2a-reaper", daemon=True).start()
     for raw in sys.stdin:

@@ -173,19 +173,19 @@ quietly and tells you exactly what to ask for.
 
 ### Turning a2a on in a project
 
-**OpenCode and Pi install once, for your user, and their harness loads them in
-every directory** — that is how those harnesses work, and neither offers a way
-to load a plugin in some projects and not others. So a2a stays **off** in a
+**OpenCode, Pi and Codex install once, for your user, and their harness loads
+them in every directory** — that is how those harnesses work, and none offers a
+way to load a plugin in some projects and not others. So a2a stays **off** in a
 project until that project says otherwise:
 
 ```json
 // <project>/.a2a.json
-{ "enabled_opencode": true, "enabled_pi": true }
+{ "enabled_opencode": true, "enabled_pi": true, "enabled_codex": true }
 ```
 
 **One key per client**, because one directory can run several harnesses and each
-is a separate agent — enabling OpenCode there says nothing about Pi. Any other
-key in the file (`read_on_init`, `catchup`, `agent`) is project-wide.
+is a separate agent — enabling OpenCode there says nothing about Pi. The other
+keys it reads (`read_on_init`, `catchup`) are project-wide.
 
 You do not write it. In the project you want, say:
 
@@ -198,8 +198,9 @@ if you want everyone who clones the project to get a2a.
 
 Until then those sessions are **silent**: nothing reaches the broker and
 nothing is injected. The a2a tools are still listed — the switch holds back
-effects, not vocabulary, which is also what lets it connect in place. Claude
-Code and Codex do not read this file yet.
+effects, not vocabulary, which is also what lets it connect in place. Turning
+a project off stops Codex's stream on the spot; OpenCode and Pi stop at their
+next restart. Claude Code does not read this file yet.
 
 ---
 
@@ -568,7 +569,7 @@ from the container's tree, so a feature that looks missing is usually a
 container that was never rebuilt:
 
 ```bash
-curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.3.0"}
+curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.3.1"}
 docker compose exec a2a-mcp python3 /app/a2a-mcp.py --version
 ```
 
