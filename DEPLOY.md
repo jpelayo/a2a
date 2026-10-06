@@ -548,7 +548,7 @@ message once, so the groups do not add together:
 |---|---|
 | nobody has read | held by its audience |
 | partially read | held by the rest of its audience |
-| fully read | nothing — goes on the next collect. A large number here means **collect is not running** |
+| fully read | nothing — goes on the next collect. A large number here means **collect is not running** — check `logs --event collect.error` |
 | no audience | zero receipts. No ack can ever free these; only age or expiry |
 
 | by shelf life | |
@@ -706,6 +706,7 @@ All optional; sensible defaults baked into the image.
 | `A2A_DB_CONNECT_TIMEOUT` | `60`         | How long to wait for the database at startup before giving up with a readable message. |
 | `A2A_LOG_LEVEL`      | `INFO`           | What reaches the `logs` table. `DEBUG` adds a row per message delivered. |
 | `A2A_LOG_RETENTION`  | `30d`            | How long log rows are kept; swept by the collector. |
+| `A2A_COLLECT_INTERVAL` | `300`          | Seconds between collector passes. `serve` runs one at startup and then on this timer, over **every** station whatever its traffic; a station that fails is logged as `collect.error` and the rest are still collected. Floored at 1. `compact` runs one on demand. |
 | `A2A_DB_FILE`        | *(unset)*        | **Only** where `migrate` starts looking for a pre-MariaDB SQLite file. Never opened by the serving path. |
 | `A2A_ADMIN_TOKEN`    | *(unset)*        | Enables `/admin/*` HTTP endpoints if set.    |
 | `A2A_AUTH_DISABLED`  | `0`              | When `1`, routes everything to `default`. **Dev only.** |
