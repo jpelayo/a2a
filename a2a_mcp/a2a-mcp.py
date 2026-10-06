@@ -59,6 +59,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import uuid
 import tarfile
@@ -422,7 +423,8 @@ TRANSFER_LOCKTIME = parse_duration(
 # against a 403; short enough that yesterday's diagnostics are never in today's
 # numbers.
 PING_TTL = parse_duration(os.environ.get("A2A_PING_TTL") or "10m")
-# How often a serving process may run the collector off the stream tick.
+# How often `serve` runs the collector over EVERY station, on its own timer
+# (see _collector_loop). Floored at 1 s where it is used, so 0 cannot spin.
 COLLECT_INTERVAL = float(os.environ.get("A2A_COLLECT_INTERVAL", "300"))
 
 DEFAULT_STATION_ID = "default"
@@ -2117,7 +2119,14 @@ def _collect_station(station_id: str, now: float | None = None) -> dict:
 
 
 def collect(station_id: str | None = None) -> dict:
-    """Run the collector over one station or all of them. Sync."""
+    """Run the collector over one station or all of them. Sync.
+
+    EACH STATION IN ISOLATION. One that raises is logged as `collect.error`
+    with its traceback, named in `failed_stations`, and skipped — the rest
+    are still collected. The rule that matters most here is expiry, the
+    fourth of five in _collect_station: an exception in any rule before it
+    used to leave a whole station's expired messages in place.
+    """
     ids = (
         [station_id] if station_id
         else [r["station_id"] for r in CONN.execute(
@@ -2125,45 +2134,73 @@ def collect(station_id: str | None = None) -> dict:
         ).fetchall()]
     )
     total: dict = {}
+    failed: list[str] = []
     now = time.time()
     for sid in ids:
-        for k, v in _collect_station(sid, now).items():
-            total[k] = total.get(k, 0) + v
-        # Names nobody approved. Swept here rather than anywhere closer to
-        # the proposal code so that this function stays the only thing that
-        # deletes — the property the whole ephemerality argument rests on —
-        # and per station, so collecting one never reaches into another.
-        total["proposals_expired"] = (
-            total.get("proposals_expired", 0) + PROPOSALS.sweep(sid, now)
-        )
-        # Denial locks whose time is up, for the same reason and in the same
-        # place: a lapsed lock stops one client asking for nothing.
-        total["denials_expired"] = (
-            total.get("denials_expired", 0)
-            + PROPOSALS.sweep_denials(sid, now)
-        )
+        try:
+            for k, v in _collect_station(sid, now).items():
+                total[k] = total.get(k, 0) + v
+            # Names nobody approved. Swept here rather than anywhere closer
+            # to the proposal code so that this function stays the only thing
+            # that deletes — the property the whole ephemerality argument
+            # rests on — and per station, so collecting one never reaches
+            # into another.
+            total["proposals_expired"] = (
+                total.get("proposals_expired", 0) + PROPOSALS.sweep(sid, now)
+            )
+            # Denial locks whose time is up, for the same reason and in the
+            # same place: a lapsed lock stops one client asking for nothing.
+            total["denials_expired"] = (
+                total.get("denials_expired", 0)
+                + PROPOSALS.sweep_denials(sid, now)
+            )
+        except Exception as e:
+            failed.append(sid)
+            log(f"collect failed: {e!r}\n{traceback.format_exc()}",
+                level="ERROR", station=sid, event="collect.error")
     # Log retention rides here for the same reason: collect() is the only
     # thing that deletes, and that stays true now that logs are rows too.
     # Once per run, not per station — the logs table is not station-scoped.
-    total["logs_expired"] = _sweep_logs(now)
+    try:
+        total["logs_expired"] = _sweep_logs(now)
+    except Exception as e:
+        log(f"log sweep failed: {e!r}\n{traceback.format_exc()}",
+            level="ERROR", event="collect.error")
+    # INFO, so a pass that removed anything is on record: with nothing
+    # written, "the collector is not running" and "there was nothing to
+    # collect" looked identical. A pass that removed nothing adds no row.
     if any(total.values()):
         log(f"collected {total}", event="collect",
-            station=station_id or "", level="DEBUG")
+            station=station_id or "", level="INFO")
+    if failed:
+        total["failed_stations"] = failed
     return total
 
 
-_last_collect = 0.0
+async def _collector_loop(interval: float) -> None:
+    """Collect every station on a timer, whatever their traffic.
 
+    The collector used to have no clock of its own: it ran off a stream's
+    quiet tick and a handful of read/ack handlers, debounced by ONE global
+    timestamp, and each pass collected only the station whose request had
+    triggered it. A station that kept losing that race — or had no streams
+    and no calls at all — went uncollected for hours, its expired messages
+    still on disk, with nothing failing and nothing logged. This is now the
+    only automatic trigger; `compact`, screening and the TUI still call
+    collect() on demand.
 
-def _maybe_collect(station_id: str) -> dict | None:
-    """Debounced collection off the stream tick. Cheap when there is nothing
-    to do, and never more often than COLLECT_INTERVAL per process."""
-    global _last_collect
-    now = time.time()
-    if now - _last_collect < COLLECT_INTERVAL:
-        return None
-    _last_collect = now
-    return _collect_station(station_id, now)
+    Runs once at startup, so what expired while the broker was down goes at
+    once, then every `interval` seconds. Only `serve` runs it.
+    """
+    while True:
+        try:
+            await _db(collect)
+        except Exception as e:
+            # collect() isolates stations itself; this is the outer net for
+            # what it cannot catch, such as listing the stations failing.
+            log(f"collector pass failed: {e!r}", level="ERROR",
+                event="collect.error")
+        await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -4554,7 +4591,6 @@ async def read_channel(
     if me and msgs:
         ids = [m["id"] for m in msgs]
         await _db(lambda: _mark_read(sid, me, ids))
-        await _db(lambda: _maybe_collect(sid))
     return msgs
 
 
@@ -4613,10 +4649,6 @@ async def ack_messages(ids: list[str]) -> dict:
         raise ValueError("this request names no agent, so it can ack nothing")
     clean = [str(i) for i in (ids or []) if str(i)]
     acked = await _db(lambda: _ack_receipts(sid, me, clean))
-    if acked:
-        # An ack is the only event that can make something collectible, so it
-        # is the natural moment to try.
-        await _db(lambda: _maybe_collect(sid))
     remaining = await _db(lambda: CONN.execute(
         "SELECT COUNT(*) AS n FROM message_receipts "
         "WHERE station_id = %s AND agent_id = %s AND acked_at IS NULL",
@@ -4647,8 +4679,6 @@ async def ack_all() -> dict:
     if not me:
         raise ValueError("this request names no agent, so it can ack nothing")
     out = await _db(lambda: screen(sid, me))
-    if out["acked"]:
-        await _db(lambda: _maybe_collect(sid))
     return {"acked": out["acked"], "by_kind": out.get("by_kind", {}),
             "pending_total": 0,
             "note": "everything addressed to you is marked handled"}
@@ -4726,7 +4756,6 @@ async def read_dms(since: float | None = None, limit: int = 50) -> list[dict]:
     if me and msgs:
         ids = [m["id"] for m in msgs]
         await _db(lambda: _mark_read(sid, me, ids))
-        await _db(lambda: _maybe_collect(sid))
     return msgs
 
 
@@ -5727,10 +5756,9 @@ def build_app() -> Starlette:
                         # writes made by OTHER processes (CLI) to one tick.
                         if json_mode:
                             yield "\n"
-                        # Quiet tick: cheap moment to retire finished
-                        # messages. Debounced to COLLECT_INTERVAL, so many
-                        # parked streams still collect at most once each.
-                        await _db(lambda: _maybe_collect(station_id))
+                        # The collector no longer rides on this tick: it has
+                        # its own timer (_collector_loop), which reaches every
+                        # station whether or not anything is streaming.
             finally:
                 wakers.discard(ev)
                 # Release only OUR claim: if a successor has already taken
@@ -6043,8 +6071,6 @@ def build_app() -> Starlette:
         if me and tx:
             ids = [m["id"] for m in tx]
             await _db(lambda: _mark_read(sid, me, ids))
-            await _db(lambda: _maybe_collect(sid))
-        await _db(lambda: _maybe_collect(sid))
         return JSONResponse({"transcript": tx})
 
     # ----- pending / ack ----------------------------------------------------
@@ -6104,8 +6130,6 @@ def build_app() -> Starlette:
                 status_code=400,
             )
         out = await _db(lambda: screen(sid, me))
-        if out["acked"]:
-            await _db(lambda: _maybe_collect(sid))
         return JSONResponse({"acked": out["acked"],
                              "by_kind": out.get("by_kind", {}),
                              "pending_total": 0})
@@ -6139,7 +6163,6 @@ def build_app() -> Starlette:
         # Same rule as the MCP twin: reading is receiving.
         if me and msgs:
             await _db(lambda: _mark_read(sid, me, [m["id"] for m in msgs]))
-            await _db(lambda: _maybe_collect(sid))
         return JSONResponse({"dms": msgs})
 
     # ----- md files ---------------------------------------------------------
@@ -6525,7 +6548,16 @@ def build_app() -> Starlette:
                     "[startup] note: A2A_ADMIN_TOKEN not set — /admin/* "
                     "endpoints disabled (use the CLI for tokens/stations)"
                 )
-            yield
+            # The collector's own clock. Floored so A2A_COLLECT_INTERVAL=0
+            # cannot turn it into a busy loop against the database.
+            collector = asyncio.create_task(
+                _collector_loop(max(COLLECT_INTERVAL, 1.0)))
+            try:
+                yield
+            finally:
+                collector.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await collector
 
     async def _denied(_: Request, exc: Exception) -> JSONResponse:
         """A station-scoped route ran without a station bound."""
