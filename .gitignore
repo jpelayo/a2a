@@ -224,6 +224,9 @@ __marimo__/
 .claude/
 old/
 .DS_Store
+# Plan-mode plans (plansDirectory in .claude/settings.local.json): working
+# notes, not source.
+plans/
 
 # Secrets stay out. There is no .env.example: every setting has its default
 # inline in docker-compose.yml and its row in DEPLOY.md §10, and a third copy
