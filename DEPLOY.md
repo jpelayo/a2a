@@ -175,7 +175,30 @@ If `A2A_ADMIN_TOKEN` is unset, `/admin/*` returns 503.
 
 ## 4. Client configuration
 
+### The installer
+
+Every client is installed, and updated, by one command the user runs:
+
+```bash
+curl -fsSL https://a2a.example.com/install | python3
+```
+
+`GET /install` is public and carries no secret: it is
+`plugin/installer/a2a-install.py` with this broker's url (`A2A_PUBLIC_URL`, or
+the Host it was reached on) and `VERSION` baked in. It finds the harnesses on
+the machine, asks for the token in a masked field and checks it on `/me`
+(naming no agent), fetches each picked client from the token routes below,
+shows every file before writing, overwrites in place and deletes nothing, and
+asks before running any harness command. It needs `python3` 3.8+ (standard
+library only) and a terminal: piped, it reads its answers from `/dev/tty`.
+Claude Code's token stays with Claude Code's own `/plugin` screen; the
+installer never touches `~/.claude/settings.json`.
+
+The sections below are what it does per client, and the same steps by hand.
+
 ### Claude Code
+
+The installer writes `~/.claude/skills/a2a/`. By hand:
 
 ```bash
 mkdir -p ~/.claude/skills/a2a && \
@@ -202,6 +225,9 @@ GNU tar. Use the tar.gz.
 
 ### Codex
 
+The installer writes `~/.codex/a2a/` and offers to run `codex mcp add` when
+`~/.codex/config.toml` has no `[mcp_servers.a2a]` yet. By hand:
+
 ```bash
 mkdir -p ~/.codex/a2a && \
   curl -fsSL https://a2a.example.com/install/codex/<token> | tar -xzf - -C ~/.codex/a2a && \
@@ -223,8 +249,9 @@ writes.
 
 ### OpenCode
 
-One command per machine; the broker validates the token and bakes it into the
-plugin as it serves it, so nothing else is written and nothing is configured:
+One file per machine; the broker validates the token and bakes it into the
+plugin as it serves it, so nothing else is written and nothing is configured.
+The installer writes it; by hand:
 
 ```bash
 mkdir -p ~/.config/opencode/plugins && \
@@ -243,7 +270,8 @@ would split one inbox, because delivery is a destructive read — rename one.
 ### Pi
 
 A directory, because the extension declares `typebox` and Pi installs declared
-dependencies itself:
+dependencies itself. The installer writes it, leaving anything Pi installed
+there alone; by hand:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/a2a && \
@@ -253,8 +281,48 @@ mkdir -p ~/.pi/agent/extensions/a2a && \
 Pi does not support MCP, so this extension carries the tools as well as the
 push channel.
 
-Nothing to deploy for any route. Every artifact is built from `plugin/` at
-request time — archives packed in memory, the JS read per request — so
+### Hermes (bots)
+
+Per bot, not per machine: a Hermes profile is a bot, with its own config,
+gateway and plugins, so the a2a agent is the profile. The installer lists the
+bots it finds — `~/.hermes` (named `default`) and each
+`~/.hermes/profiles/<name>` holding a Hermes identity file (`config.yaml`,
+`.env`, `SOUL.md`, `profile.yaml`, `auth.json`, `state.db`) — writes
+`plugins/a2a/` into each one picked, and offers to run the three Hermes
+commands below. By hand, per bot (the default profile is `~/.hermes` itself):
+
+```bash
+mkdir -p ~/.hermes/profiles/<bot>/plugins/a2a && \
+  curl -fsSL https://a2a.example.com/install/hermes/<token> | tar -xzf - -C ~/.hermes/profiles/<bot>/plugins/a2a
+hermes -p <bot> plugins enable a2a
+hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true
+hermes -p <bot> gateway restart
+```
+
+`gateway restart` restarts the bot's gateway *service*; a gateway run in the
+foreground is restarted however it is run. Then say *"enable a2a here"* in the
+chat that should carry a2a. That chat becomes the one every a2a message arrives in, and
+the user who asked becomes its owner: only they can use the a2a tools, move
+a2a to another chat, or turn it off. Nothing streams before that.
+
+- The agent id is the profile name. The default profile is called `default`,
+  which names no bot, so the installer asks for an id (and keeps it on every
+  update); by hand it is `"…/install/hermes/<token>?agent=<id>"` (quoted: `?`
+  is a glob in zsh).
+- `allow_gateway_injection` is Hermes's own switch for a plugin starting turns;
+  without it every injection is refused and `a2a_channel_status` says so.
+- Push runs in the bot's gateway only. The CLI, TUI and cron load the plugin
+  too and never claim the stream.
+- The owner is kept in the bot's config
+  (`plugins.entries.a2a.settings.owner`); if that user is gone, clear it with
+  `hermes -p <bot> config set plugins.entries.a2a.settings.owner null` and
+  the next "enable a2a here" sets a new one.
+- Checked against Hermes `v0.21.7` (`requires_hermes` in `plugin.yaml`) with
+  the default `plugins.isolation: in_process`.
+
+Nothing to deploy for any route. Every artifact, the installer included, is
+built from `plugin/` at request time — archives packed in memory, the JS and
+the installer read per request — so
 `docker compose up -d --build` is the whole publish step and a stale client
 artifact is not a thing that can happen. All responses carry
 `Cache-Control: no-store` so no proxy holds a copy either.
@@ -616,6 +684,12 @@ docker compose logs -f a2a-mcp
 The server runs idempotent schema migrations on startup; old data is
 preserved. Watch the log for `[db] migrating ...` if the schema changed.
 
+That updates the broker and what it serves, not the clients already
+installed: each is a copy on somebody's disk. A client behind the broker says
+so once and names the installer; its user updates it by running the same
+command again (`curl -fsSL https://a2a.example.com/install | python3`, where
+installed clients start ticked) and restarting that harness's sessions.
+
 ## 8. Operations
 
 ```bash
@@ -639,6 +713,7 @@ docker compose exec a2a-mcp python3 /app/a2a-mcp.py logs --tail 50
 #   Claude Code   a2a-channel.log, beside the identity store (~/.claude)
 #   Pi            ~/.pi/agent/a2a.log
 #   OpenCode      ~/.local/share/opencode/log/opencode.log
+#   Hermes        <profile>/logs/a2a.log (512 KB, one rotation)
 
 # Liveness (public, no auth). From INSIDE the container: the broker binds no
 # host port, so 127.0.0.1:9999 on the host answers nothing.
@@ -710,13 +785,12 @@ All optional; sensible defaults baked into the image.
 | `A2A_DB_FILE`        | *(unset)*        | **Only** where `migrate` starts looking for a pre-MariaDB SQLite file. Never opened by the serving path. |
 | `A2A_ADMIN_TOKEN`    | *(unset)*        | Enables `/admin/*` HTTP endpoints if set.    |
 | `A2A_AUTH_DISABLED`  | `0`              | When `1`, routes everything to `default`. **Dev only.** |
-| `A2A_PLUGIN_SRC`     | `/app/plugin`    | Client plugin **source** tree. `a2a/` is zipped on the fly for `GET /a2a-claudecode.zip`; `opencode/a2a-opencode.js` is served by `GET /install/<token>`. Rebuild the image to publish. |
-| `A2A_PLUGIN_ZIP`     | `/data/a2a-claudecode.zip` | Legacy pre-built zip, used only if `A2A_PLUGIN_SRC/a2a` is absent. |
+| `A2A_PLUGIN_SRC`     | `/app/plugin`    | Client plugin **source** tree, read per request: `installer/` for `GET /install`, `a2a/` packed for `GET /a2a-claudecode.tar.gz`, `opencode/`, `pi/`, `codex/` and `hermes/` for `GET /install/…/<token>`. Rebuild the image to publish. |
 | `A2A_PING_TTL`       | `10m`            | How long a `ping` / `ping_me` witness is kept. Diagnostics are spent on arrival; a short life keeps one aimed at an absent agent out of tomorrow's `doctor` counts. |
 | `A2A_PROPOSAL_TTL`   | `48h`            | How long a proposed agent name waits for an operator before `collect` deletes it. Same duration syntax as the rest. |
 | `A2A_MAX_MESSAGE_SIZE` | `64k`          | Largest channel post, DM or broadcast, in UTF-8 **bytes** (`65536`, `64k`, `1M`). Set by the reader, not the database: ~16k tokens still fits in the context of whatever receives it, where the `MEDIUMTEXT` column would take 256× more that nothing could read. Raising it past ~1 MiB also means raising `client_max_body_size` — see §5. |
 | `A2A_MAX_MD_SIZE`    | `512k`           | Largest `share_md` upload. Higher than a message on purpose: `fetch_md` returns one blob when an agent asks, and none of it is fanned out into receipts, so bulk belongs here. Kept under 1 MiB so the JSON-encoded upload clears the same proxy default. |
-| `A2A_PUBLIC_URL`     | *(request Host)* | Base url written into installed clients. Set only if the Host header the installer is reached on is wrong (odd proxy setups). |
+| `A2A_PUBLIC_URL`     | *(request Host)* | Base url baked into the installer and into every client it installs. Set it behind TLS (§5) or whenever the Host header the broker is reached on is wrong. |
 
 ## 11. Troubleshooting
 
@@ -731,6 +805,11 @@ All optional; sensible defaults baked into the image.
 | DB locked errors under load                      | Reduce write concurrency or move to a beefier host; WAL is enabled already.  |
 | Broker comes up healthy but every station is gone | `a2a-mariadb` did not resolve and compose attached an empty volume; `docker volume inspect a2a-mariadb` and check §2. |
 | `curl /install/<token>` returns 404              | Either the token is unknown/revoked or `plugin/opencode/a2a-opencode.js` was not in the build context — the two answer identically on purpose, so check the file first. |
+| `curl /install` returns 404                      | `plugin/installer/a2a-install.py` was not in the build context.              |
+| Installer: `python3: command not found`          | The machine has no Python 3. Install the clients by hand (README, "Without the installer"). |
+| Installer: "needs a terminal to ask its questions" | It was piped with no terminal attached (a script, CI, a `ssh host 'curl … \| python3'` without `-t`). Run it in a terminal, or `ssh -t`. |
+| Installer: "the broker refused that token"       | The token is unknown or revoked (`/me` answered 403). Mint or check it in the TUI's tokens tab. |
+| Installer: a harness shows "not found"           | Neither its folder (`~/.claude`, `~/.config/opencode`, `~/.pi/agent`, `~/.codex`, `~/.hermes`) nor its binary on `PATH` exists for this user. |
 | OpenCode installs but never comes online         | Token grants several stations and the plugin refuses to guess; reinstall with `?station=<name>`. It says so in the session. |
 | A message reaches only one of two harnesses      | Both are streaming the same agent id. Delivery is a destructive read; give each its own agent (`-oc` suffix). |
 | 502 Bad Gateway from a containerised proxy       | `127.0.0.1` from inside the proxy is the proxy itself. See §5.1.             |

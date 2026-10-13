@@ -50,6 +50,7 @@ import gzip
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 # Only the `migrate` subcommand opens sqlite, read-only, to read a pre-MariaDB
@@ -114,7 +115,10 @@ from starlette.routing import Mount, Route
 # capped, and posts carry `to`/`addressed`. A client compares its baked
 # version against /healthz's `clients` and says so once when it is behind, so
 # leaving this at 0.1.0 would let every stale install stay quiet.
-VERSION = "0.3.1"
+# 0.4.0: no schema change. Every client's "you are behind" notice now names
+# the installer at GET /install instead of a per-harness curl line, and that
+# only reaches a copy that knows it is behind.
+VERSION = "0.4.0"
 
 # Storage is MariaDB (A2A_DB_HOST and friends, defined with the pool below).
 # A2A_DB_FILE survives as one thing only: where `migrate` starts looking for a
@@ -175,6 +179,28 @@ PI_DIR = PLUGIN_SRC / "pi"
 # The Codex client: one MCP server plus the launcher that gives it a private
 # app-server to inject into. A directory, like Pi.
 CODEX_DIR = PLUGIN_SRC / "codex"
+# Hermes: GET /install/hermes/<token>. A directory plugin — plugin.yaml beside
+# __init__.py — extracted into one bot's profile.
+HERMES_DIR = PLUGIN_SRC / "hermes"
+# The installer: GET /install, public. One interactive program for all five
+# clients, served with the broker's url and version baked and NO token — the
+# token is typed into it, so it never sits in a URL or a shell history.
+INSTALLER_PY = PLUGIN_SRC / "installer" / "a2a-install.py"
+
+
+def _bake_seam(src: bytes, baked: str) -> bytes | None:
+    """Replace a python file's inert `A2A_BAKED = {}` line with `baked`.
+
+    Replaced rather than prepended: these files open with a module
+    docstring, and an assignment shoved above it would silently demote that
+    docstring to a no-op expression. None when the seam is gone — the file
+    was edited — so the caller refuses instead of serving a program that
+    starts with no configuration.
+    """
+    marker = b"A2A_BAKED = {}"
+    if marker not in src:
+        return None
+    return src.replace(marker, f"A2A_BAKED = {baked}".encode(), 1)
 
 
 
@@ -5201,8 +5227,10 @@ def _format_stream_line(m: dict, json_mode: bool = False) -> str:
 # (X-A2A-Agent header, or ?agent= on /stream) selects the station.
 # ---------------------------------------------------------------------------
 
+# /install (bare) is the installer: it carries no secret and asks for the
+# token itself, so it must be reachable before the user has typed one.
 PUBLIC_PATHS: tuple[str, ...] = (
-    "/healthz", "/a2a-claudecode.tar.gz", "/a2a-claudecode.zip",
+    "/healthz", "/a2a-claudecode.tar.gz", "/a2a-claudecode.zip", "/install",
 )
 # /install/<token> carries its credential in the path, so it cannot present a
 # bearer header; the handler validates the token itself and 404s otherwise.
@@ -5411,6 +5439,37 @@ def build_app() -> Starlette:
         one and is what the docs now say."""
         return await _serve_plugin(request, "zip")
 
+    async def installer(request: Request):
+        """The installer for every client, and the way to update them:
+
+            curl -fsSL https://<host>/install | python3
+
+        Public, and it carries no secret: only this broker's url and the
+        client version it serves are baked in. The program asks which
+        harnesses to install, asks for the token (masked, typed or pasted —
+        never in a URL, so never in a shell history or a proxy log), checks
+        it on /me, then fetches each client from the token routes below,
+        exactly as the manual lines do. Harness commands it needs (`codex
+        mcp add`, `hermes … plugins enable`) are listed and run only if the
+        user says so.
+        """
+        if not INSTALLER_PY.is_file():
+            return JSONResponse(
+                {"error": "no installer available"}, status_code=404
+            )
+        base = PUBLIC_URL or f"{request.url.scheme}://{request.url.netloc}"
+        src = _bake_seam(INSTALLER_PY.read_bytes(),
+                         json.dumps({"url": base, "version": VERSION}))
+        if src is None:
+            return JSONResponse(
+                {"error": "installer source is missing its A2A_BAKED seam"},
+                status_code=500,
+            )
+        return Response(
+            src, media_type="text/x-python",
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
+
     async def pi_install(request: Request):
         """One-command installer for the Pi extension:
 
@@ -5506,16 +5565,14 @@ def build_app() -> Starlette:
             # came from without a constant anybody has to remember to bump.
             "version": VERSION,
         })
-        src = client.read_bytes()
-        marker = b"A2A_BAKED = {}"
-        if marker not in src:
+        src = _bake_seam(client.read_bytes(), baked)
+        if src is None:
             # The client was edited and the seam is gone. Refusing beats
             # serving a client that would start with no credentials.
             return JSONResponse(
                 {"error": "installer source is missing its A2A_BAKED seam"},
                 status_code=500,
             )
-        src = src.replace(marker, f"A2A_BAKED = {baked}".encode(), 1)
         body = await _db(lambda: _archive_dir(
             CODEX_DIR, "tar.gz", rewrite={"a2a-codex.py": src},
         ))
@@ -5524,6 +5581,67 @@ def build_app() -> Starlette:
             headers={
                 "Content-Disposition":
                     'attachment; filename="a2a-codex.tar.gz"',
+                "Cache-Control": "no-store, must-revalidate",
+            },
+        )
+
+    async def hermes_install(request: Request):
+        """One-command installer for the Hermes bot plugin, per bot (profile):
+
+            P=~/.hermes/profiles/<bot>; mkdir -p $P/plugins/a2a && \
+            curl -fsSL https://<host>/install/hermes/<token> \
+                 | tar -xzf - -C $P/plugins/a2a && \
+            hermes -p <bot> plugins enable a2a && \
+            hermes -p <bot> config set \
+                plugins.entries.a2a.allow_gateway_injection true
+
+        A directory plugin: plugin.yaml beside __init__.py. Credentials are
+        baked by replacing the `A2A_BAKED = {}` seam, as for Codex and for the
+        same reason (a module docstring opens the file). plugin.yaml's
+        `version:` is stamped with this broker's, so Hermes shows the tree the
+        bot actually runs. `?agent=` is how the default profile, whose name
+        is "default", gets an id at all.
+
+        Unknown, revoked and not-installed all answer 404 with the same body,
+        so this cannot be used to probe which tokens exist.
+        """
+        missing = JSONResponse(
+            {"error": "no installer available"}, status_code=404
+        )
+        token = request.path_params["token"]
+        client = HERMES_DIR / "__init__.py"
+        manifest = HERMES_DIR / "plugin.yaml"
+        if not client.is_file() or not manifest.is_file() or not await _db(
+            lambda: TOKENS.resolve(token)
+        ):
+            return missing
+
+        base = PUBLIC_URL or f"{request.url.scheme}://{request.url.netloc}"
+        baked = json.dumps({
+            "url": base,
+            "token": token,
+            "station": request.query_params.get("station") or "",
+            "agent": request.query_params.get("agent") or "",
+            "version": VERSION,
+        })
+        src = _bake_seam(client.read_bytes(), baked)
+        if src is None:
+            return JSONResponse(
+                {"error": "installer source is missing its A2A_BAKED seam"},
+                status_code=500,
+            )
+        yaml = re.sub(rb"(?m)^version:.*$",
+                      f'version: "{VERSION}"'.encode(),
+                      manifest.read_bytes(), count=1)
+        body = await _db(lambda: _archive_dir(
+            HERMES_DIR, "tar.gz",
+            rewrite={"__init__.py": src, "plugin.yaml": yaml},
+        ))
+        return Response(
+            body, media_type="application/gzip",
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="a2a-hermes.tar.gz"',
                 "Cache-Control": "no-store, must-revalidate",
             },
         )
@@ -6470,11 +6588,14 @@ def build_app() -> Starlette:
     routes.append(Route("/healthz", healthz, methods=["GET"]))
     routes.append(Route("/a2a-claudecode.tar.gz", plugin_targz, methods=["GET"]))
     routes.append(Route("/a2a-claudecode.zip", plugin_zip, methods=["GET"]))
+    routes.append(Route("/install", installer, methods=["GET"]))
     # Before the general token route: Starlette matches in order, so
     # /install/{token} would otherwise swallow "pi" as a token.
     # Specific before general: /install/{token} would swallow these.
     routes.append(Route("/install/pi/{token}", pi_install, methods=["GET"]))
     routes.append(Route("/install/codex/{token}", codex_install, methods=["GET"]))
+    routes.append(Route("/install/hermes/{token}", hermes_install,
+                        methods=["GET"]))
     routes.append(Route("/install/{token}", opencode_install, methods=["GET"]))
     routes.append(Route("/stream", stream_route, methods=["GET"]))
 

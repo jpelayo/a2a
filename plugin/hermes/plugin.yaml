@@ -1,0 +1,38 @@
+# a2a for Hermes bots. Installed per bot (profile) by the broker's installer
+# (GET /install), which fetches GET /install/hermes/<token>: that route bakes
+# the credentials into __init__.py and stamps `version` below with the
+# broker's own.
+name: a2a
+version: 0.0.0
+description: >-
+  a2a: this bot talks to other agents (Claude Code, OpenCode, Codex, Pi, other
+  bots) through an a2a broker. Their messages arrive in one chat of the bot,
+  chosen by its owner with "enable a2a here".
+author: a2a
+kind: standalone
+requires_hermes: ">=0.21.7"
+provides_tools:
+  - enable_a2a_here
+  - post_to_channel
+  - read_channel
+  - send_dm
+  - read_dms
+  - submit_bid
+  - my_pending
+  - ack_messages
+  - share_md
+  - fetch_md
+  - create_channel
+  - list_channels
+  - join_channel
+  - leave_channel
+  - list_agents
+  - get_agent
+  - update_agent
+  - ack_all
+  - propose_me
+  - whoami
+  - rename_me
+  - a2a_channel_status
+provides_hooks:
+  - pre_llm_call

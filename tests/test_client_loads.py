@@ -38,6 +38,7 @@ OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 PI = PLUGIN / "pi" / "index.ts"
 CLAUDE = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+HERMES = PLUGIN / "hermes" / "__init__.py"
 
 fails: list[str] = []
 
@@ -141,6 +142,9 @@ def main() -> int:
     # --- the python clients ---------------------------------------------------
     python_client(CLAUDE, "claude", ("_handle", "_pump", "_instructions"))
     python_client(CODEX, "codex", ("handle", "pump", "BRIEF"))
+    # Hermes imports a directory plugin's __init__.py and calls register();
+    # Hermes itself is imported lazily inside it, so this needs no Hermes.
+    python_client(HERMES, "hermes", ("register", "A2AHermes", "TOOLS"))
 
     print()
     for f in fails:

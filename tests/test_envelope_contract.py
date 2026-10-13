@@ -36,6 +36,7 @@ CLAUDE = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+HERMES = PLUGIN / "hermes" / "__init__.py"
 BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
 
 fails: list[str] = []
@@ -200,6 +201,18 @@ def main() -> int:
           "to learn",
           named == node_envelopes(PI)[0], f"{named!r} vs pi")
 
+    # --- Hermes: the same string again, and the id its hook reads back -------
+    spec = importlib.util.spec_from_file_location("a2a_hermes", HERMES)
+    hx = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hx)
+    h_named, h_room = hx.envelope(MSG), hx.envelope(ROOM)
+    check("hermes renders byte-identically to codex, both shapes",
+          h_named == named and h_room == room, f"{h_named!r} vs {named!r}")
+    check("hermes: its hook finds the message id in the envelope it rendered "
+          "— that id is what acks it",
+          hx.ENVELOPE_ID.findall(h_named) == ["m1"],
+          str(hx.ENVELOPE_ID.findall(h_named)))
+
     # --- posting returns a receipt, not the message back ---------------------
     # The broker echoes the whole post. Handed to a model that is a copy of the
     # body it just wrote — twice the context, and in a client that renders tool
@@ -214,7 +227,7 @@ def main() -> int:
     spec = importlib.util.spec_from_file_location("a2a_codex_r", CODEX)
     cx = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cx)
-    trimmed = {"codex": cx._confirm(raw_json)}
+    trimmed = {"codex": cx._confirm(raw_json), "hermes": hx._confirm(raw_json)}
 
     spec = importlib.util.spec_from_file_location("a2a_broker_r", BROKER)
     br = importlib.util.module_from_spec(spec)
@@ -241,7 +254,7 @@ def main() -> int:
         check(f"{label}: the deadline in that receipt is a readable instant",
               "2026-08-21T08:14:55" in got, got[:160])
     shapes = {label: json.loads(got) for label, got in trimmed.items()}
-    check("all four agree on the receipt, so an agent sees the same answer "
+    check("every client agrees on the receipt, so an agent sees the same answer "
           "whichever harness it is running in",
           len({json.dumps(v, sort_keys=True) for v in shapes.values()}) == 1,
           str(shapes))
@@ -250,7 +263,7 @@ def main() -> int:
     # Only two words are allowed to name these two concepts. A third would put
     # us straight back where this started.
     for label, path in (("claude", CLAUDE), ("opencode", OPENCODE),
-                        ("pi", PI), ("codex", CODEX)):
+                        ("pi", PI), ("codex", CODEX), ("hermes", HERMES)):
         src = path.read_text()
         check(f"{label}: no delivered field is called 'to' any more",
               'm.to' not in src and 'm["to"]' not in src

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """a2a — Codex client (research preview).
 
-Installed by one command; the broker bakes the credentials in as it serves this
-file, and `codex mcp add` — Codex's own registration command — wires it in:
+Installed and updated by the broker's installer, which fetches this file from
+/install/codex/<token> (the broker bakes the credentials in as it serves it)
+into ~/.codex/a2a, and offers to run `codex mcp add` — Codex's own
+registration command — to wire it in:
 
-    mkdir -p ~/.codex/a2a && \
-    curl -fsSL https://<broker>/install/codex/<token> \
-         | tar -xzf - -C ~/.codex/a2a && \
+    curl -fsSL https://<broker>/install | python3
+    # the registration it runs once, if you say yes:
     codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py
 
 Two halves, both here, both dependency-free:
@@ -456,8 +457,8 @@ def check_version():
         return
     if theirs and theirs != CLIENT_VERSION:
         log(f"client {CLIENT_VERSION} is behind the broker's {theirs} — "
-            f"reinstall: mkdir -p ~/.codex/a2a && curl -fsSL "
-            f"{URL}/install/codex/<token> | tar -xzf - -C ~/.codex/a2a")
+            f"update: run the installer and pick Codex: "
+            f"curl -fsSL {URL}/install | python3")
 
 
 # --- the envelope ------------------------------------------------------------
@@ -1580,8 +1581,9 @@ def main():
         # Refuse rather than half-run: a client with no broker would sit in a
         # reconnect loop forever and say nothing useful.
         sys.stderr.write(
-            "a2a: no broker url or token. Reinstall with the one-line "
-            "installer from your broker, or set A2A_URL and A2A_TOKEN.\n")
+            "a2a: no broker url or token. Reinstall with your broker's "
+            "installer (curl -fsSL <broker>/install | python3), or set "
+            "A2A_URL and A2A_TOKEN.\n")
         return 1
     psock = parent_socket()
     log(f"starting as {KEY} (explicit={EXPLICIT}) "

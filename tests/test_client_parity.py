@@ -36,6 +36,7 @@ BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+HERMES = PLUGIN / "hermes" / "__init__.py"
 
 # Tools that legitimately exist on only one surface, with the reason.
 ONLY_BROKER = {
@@ -96,9 +97,10 @@ def pi_tools() -> set[str]:
                           PI.read_text()))
 
 
-def codex_tools() -> set[str]:
-    """Names in the Codex client's TOOLS table."""
-    src = CODEX.read_text()
+def codex_tools(path: Path = CODEX) -> set[str]:
+    """Names in a python client's TOOLS table (Codex's, or Hermes's, which
+    has the same shape)."""
+    src = path.read_text()
     body = src[src.index("TOOLS = ["):]
     return set(re.findall(r'^    \("([a-z_][a-z0-9_]*)",', body, re.M))
 
@@ -127,6 +129,26 @@ def status_shapes() -> dict:
         {"agent": "x", "stations": ["s"], "registered": True} if p == "/me"
         else {"channels": []})
     out["codex"] = _json.loads(cx._status({}))
+
+    # Hermes: the real plugin, register()ed against the smallest context it
+    # accepts. Its home (and so its log) goes to a temp dir, never ~/.hermes.
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="a2a-parity-hermes-")
+    spec = importlib.util.spec_from_file_location("parity_hermes", HERMES)
+    hx = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hx)
+
+    class _Ctx:
+        profile_name = "x"
+        register_tool = register_hook = on_unload = set_config = (
+            lambda self, *a, **k: None)
+        get_config = lambda self, key, default=None: default  # noqa: E731
+
+    hx.api = lambda m, p, body=None, timeout=30, agent="": (
+        {"agent": "x", "stations": ["s"], "registered": True} if p == "/me"
+        else {"channels": []})
+    inst = hx.A2AHermes(_Ctx())
+    out["hermes"] = _json.loads(inst.status())
+    inst.stop()
 
     claude = PLUGIN / "a2a" / "server" / "a2a-channel.py"
     _sys.path.insert(0, str(claude.parent))
@@ -190,6 +212,7 @@ DIAGNOSTIC: set[str] = set()
 def main() -> int:
     oc, pi, broker = opencode_tools(), pi_tools(), broker_tools()
     cx = codex_tools() - DIAGNOSTIC
+    hx = codex_tools(HERMES) - DIAGNOSTIC
     check("the OpenCode plugin registers tools at all", bool(oc), str(oc))
     check("the Pi extension registers tools at all", bool(pi), str(pi))
     check("the Codex client registers tools at all", bool(cx), str(cx))
@@ -205,6 +228,11 @@ def main() -> int:
           cx == oc - INSTALL_SCOPE,
           f"only in codex: {sorted(cx - oc)}; "
           f"missing: {sorted(oc - INSTALL_SCOPE - cx)}")
+    check("and the Hermes bot plugin exposes exactly Codex's vocabulary — a "
+          "bot is one more agent its peers address without knowing what "
+          "runs it",
+          hx == cx, f"only in hermes: {sorted(hx - cx)}; "
+                    f"missing: {sorted(cx - hx)}")
 
     # --- and neither may drift from the broker without a stated reason -----
     missing = (broker - oc) - ONLY_BROKER
@@ -219,7 +247,7 @@ def main() -> int:
                       "delete_channel"):
         check(f"no client offers {forbidden}",
               forbidden not in oc and forbidden not in pi
-              and forbidden not in cx)
+              and forbidden not in cx and forbidden not in hx)
 
     # --- and they must hit the same REST paths for the same capability -----
     def paths(src: str) -> set[str]:
@@ -273,7 +301,7 @@ def main() -> int:
     for label, path in (("claude", PLUGIN / "a2a" / "server" / "a2a-channel.py"),
                         ("opencode", PLUGIN / "opencode" / "a2a-opencode.js"),
                         ("pi", PLUGIN / "pi" / "index.ts"),
-                        ("codex", CODEX)):
+                        ("codex", CODEX), ("hermes", HERMES)):
         body = path.read_text()
         check(f"{label}: its brief does not tell the agent to wait",
               "stop and wait" not in body, "'stop and wait' is back")

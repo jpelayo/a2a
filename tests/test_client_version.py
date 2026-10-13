@@ -121,8 +121,9 @@ def main() -> int:
               f"{len(behind)} notifications")
         text = json.dumps(behind[0]) if behind else ""
         check("and names the command that fixes it, since knowing you are "
-              "stale without knowing what to do is not much better",
-              "curl" in text and "tar" in text, text[:300])
+              "stale without knowing what to do is not much better — the "
+              "installer, which is also how every client updates",
+              "/install | python3" in text, text[:300])
         check("it is a notification, never a prompt — a stale install must "
               "not cost a model turn",
               all(n.get("method", "").startswith("notifications/")
@@ -172,6 +173,8 @@ def main() -> int:
                      "versionChecked", "await checkVersion()"),
         "codex": (PLUGIN / "codex" / "a2a-codex.py", "log(", "_version_checked",
                   "\n    check_version()"),
+        "hermes": (PLUGIN / "hermes" / "__init__.py", "self.log(",
+                   "_version_checked", "self._check_version()"),
     }
     for name, (path, free_path, once, called) in clients.items():
         src = path.read_text()
@@ -188,6 +191,10 @@ def main() -> int:
         check(f"{name}: and something actually CALLS it — a check nobody "
               f"invokes passes every test of its own internals",
               called in src, f"no call site ({called.strip()})")
+        check(f"{name}: the fix it names is the installer, not a "
+              f"per-harness line that misses its setup steps",
+              "/install | python3" in src and "tar -x" not in src,
+              "names something other than the installer")
 
     # --- the broker actually serves the field the client reads -------------
     src = BROKER.read_text()

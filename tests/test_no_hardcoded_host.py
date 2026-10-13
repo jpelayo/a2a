@@ -113,6 +113,13 @@ def main() -> int:
           "request against an empty string",
           "if (!URL_BASE || !TOKEN)" in oc, "no guard")
     check("Pi refuses too", "if (!URL_BASE || !TOKEN)" in pi, "no guard")
+    inst = (ROOT / "plugin" / "installer" / "a2a-install.py").read_text()
+    check("the installer takes its url from what the broker baked, and only "
+          "from that — it is the program that writes every client's url",
+          'URL = (A2A_BAKED.get("url") or "").rstrip("/")' in inst
+          and "A2A_URL" not in inst, "a fallback crept in")
+    check("and refuses to run without one",
+          "if not URL or not VERSION:" in inst, "no guard")
 
     # --- and the broker fills it in ----------------------------------------
     broker = (ROOT / "a2a_mcp" / "a2a-mcp.py").read_text()
@@ -120,7 +127,7 @@ def main() -> int:
           "— otherwise the committed placeholder IS what every install uses",
           'rewrite={".mcp.json"' in broker, "archive still packed verbatim")
     check("and it derives the url from the deployment, not from source",
-          broker.count('PUBLIC_URL or f"{request.url.scheme}') >= 3,
+          broker.count('PUBLIC_URL or f"{request.url.scheme}') >= 6,
           "an installer route is missing the fallback")
 
     print()

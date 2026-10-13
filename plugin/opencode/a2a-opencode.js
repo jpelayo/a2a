@@ -380,8 +380,8 @@ export const A2A = async ({ client, directory }) => {
   if (!URL_BASE || !TOKEN) {
     log("error", `a2a plugin loaded but has no ${!URL_BASE ? "broker url" : "token"}`
                  + ", so NO a2a tools are registered: reinstall with "
-                 + "curl -fsSL <broker>/install/<token> "
-                 + "-o ~/.config/opencode/plugins/a2a-opencode.js")
+                 + "your broker's installer: curl -fsSL <broker>/install "
+                 + "| python3")
     return {}
   }
 
@@ -734,9 +734,9 @@ export const A2A = async ({ client, directory }) => {
       if (theirs && theirs !== mine) {
         log("warn",
             `this client is ${mine}, the broker now serves ${theirs}. `
-            + `Tools added since ${mine} are missing here until you reinstall: `
-            + `curl -fsSL ${URL_BASE}/install/<token> `
-            + "-o ~/.config/opencode/plugins/a2a-opencode.js")
+            + `Tools added since ${mine} are missing here until you update — `
+            + `run the installer and pick OpenCode: `
+            + `curl -fsSL ${URL_BASE}/install | python3`)
       }
     } catch (e) {
       log("warn", `could not check the broker's client version: ${e}`)

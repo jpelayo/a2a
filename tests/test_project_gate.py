@@ -173,6 +173,14 @@ class FakeBroker:
 
     def __init__(self):
         self.calls: list[str] = []
+        # (path, X-A2A-Agent) per request: /ack marks only the CALLER's
+        # receipts, so which id an ack went out as is part of what it did.
+        self.agents: list[tuple[str, str]] = []
+        # How many upcoming /ack requests answer 500 and ack nothing.
+        self.fail_acks = 0
+        # The ids /me/agents reports as this token's own (rename_me adopts
+        # one of these instead of renaming).
+        self.me_agents: list[str] = []
         self.acked: list[str] = []
         self.unacked: list[dict] = []
         self.live: queue.Queue = queue.Queue()
@@ -198,16 +206,28 @@ class FakeBroker:
             def do_GET(self):
                 path = self.path.split("?")[0]
                 broker.calls.append(path)
+                broker.agents.append(
+                    (path, self.headers.get("X-A2A-Agent") or ""))
                 if path == "/stream":
                     return self._stream()
                 self._json({"agent": "x", "registered": True,
-                            "stations": ["s"], "channels": []})
+                            "stations": ["s"], "channels": [],
+                            "agents": [{"agent_id": a}
+                                       for a in broker.me_agents]})
 
             def do_POST(self):
                 path = self.path.split("?")[0]
                 broker.calls.append(path)
+                broker.agents.append(
+                    (path, self.headers.get("X-A2A-Agent") or ""))
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                if path == "/ack" and broker.fail_acks > 0:
+                    broker.fail_acks -= 1
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if path == "/ack":
                     ids = body.get("ids") or []
                     broker.acked += ids

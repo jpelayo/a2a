@@ -1,12 +1,13 @@
 /**
  * a2a — Pi extension (research preview).
  *
- * Installed by one command; the broker bakes the credentials in as it serves
- * this file, so nothing else is ever written to disk:
+ * Installed (and updated) by the broker's installer; the broker bakes the
+ * credentials in as it serves this file, so nothing else is ever written to
+ * disk:
  *
- *     mkdir -p ~/.pi/agent/extensions/a2a && \
- *     curl -fsSL https://<broker>/install/pi/<token> \
- *          | tar -xf - -C ~/.pi/agent/extensions/a2a
+ *     curl -fsSL https://<broker>/install | python3
+ *
+ * which fetches /install/pi/<token> into ~/.pi/agent/extensions/a2a.
  *
  * Two halves, both here, because Pi does not support MCP by policy — so unlike
  * the Claude Code client, the tools cannot come from the broker's MCP server:
@@ -585,10 +586,9 @@ export default function (pi: ExtensionAPI) {
       if (theirs && theirs !== mine) {
         notify(
           `this client is ${mine}, the broker now serves ${theirs}. ` +
-          `Tools added since ${mine} are missing here until you reinstall:\n` +
-          `  mkdir -p ~/.pi/agent/extensions/a2a && curl -fsSL ` +
-          `${URL_BASE}/install/pi/<token> | tar -xf - -C ` +
-          `~/.pi/agent/extensions/a2a`,
+          `Tools added since ${mine} are missing here until you update — ` +
+          `run the installer and pick Pi:\n` +
+          `  curl -fsSL ${URL_BASE}/install | python3`,
         );
       }
     } catch (e) {
@@ -781,8 +781,8 @@ export default function (pi: ExtensionAPI) {
   let pumping = false;
   pi.on("session_start", async () => {
     if (!URL_BASE || !TOKEN) {
-      notify(`no ${!URL_BASE ? "broker url" : "token"}: reinstall from `
-             + "<broker>/install/pi/<token>");
+      notify(`no ${!URL_BASE ? "broker url" : "token"}: reinstall with `
+             + "your broker's installer: curl -fsSL <broker>/install | python3");
       return;
     }
     // Off in this project: no stream, no brief, nothing injected. Said in the

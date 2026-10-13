@@ -340,11 +340,11 @@ def _check_version() -> None:
     if theirs and theirs != mine:
         _notify(
             f"[a2a] this client is {mine}, the broker now serves {theirs}. "
-            f"Tools added since {mine} are missing here until you reinstall:\n"
-            f"  mkdir -p ~/.claude/skills/a2a && curl -fsSL "
-            f"{URL}/a2a-claudecode.tar.gz | tar -xzf - -C ~/.claude/skills/a2a\n"
-            f"(/reload-plugins will not pick it up — it keeps connections "
-            f"whose config has not changed.)",
+            f"Tools added since {mine} are missing here until you update — "
+            f"run the installer and pick Claude Code:\n"
+            f"  curl -fsSL {URL}/install | python3\n"
+            f"then restart this session (/reload-plugins will not pick it "
+            f"up — it keeps connections whose config has not changed.)",
             {"channel": "status", "sender": "a2a"},
         )
         _log(f"client {mine} is behind the broker's {theirs}")
@@ -1027,8 +1027,9 @@ def main() -> None:
     if not URL:
         # Nothing to talk to. Said once, in the debug log, rather than by
         # failing every request against a url that is the empty string.
-        _log("no A2A_URL: reinstall the plugin from your broker "
-             "(<broker>/a2a-claudecode.tar.gz), which writes it into .mcp.json")
+        _log("no A2A_URL: reinstall the plugin with your broker's installer "
+             "(curl -fsSL <broker>/install | python3), which writes it into "
+             ".mcp.json")
     threading.Thread(target=_pump_guard, daemon=True, name="a2a-pump").start()
     for line in sys.stdin:        # exits when Claude Code closes the pipe
         line = line.strip()

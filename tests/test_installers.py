@@ -57,6 +57,9 @@ def get(url: str) -> tuple[int, bytes, str]:
 
 
 def main() -> int:
+    # Without this a host with no database got a traceback from db_env()
+    # instead of the SKIP every other DB-backed suite prints.
+    dbharness.require_db()
     tmp = Path(tempfile.mkdtemp(prefix="a2a-inst-"))
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -225,6 +228,35 @@ def main() -> int:
               "app-server --listen unix://" in readme
               and "--remote unix://" in readme, readme[:200])
 
+        # --- Hermes: a directory plugin for one bot ---------------------------
+        code, body, ctype = get(f"{base}/install/hermes/{token}?agent=bot1")
+        check("hermes: served", code == 200, f"HTTP {code}")
+        hmembers: dict[str, bytes] = {}
+        try:
+            with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as t:
+                for m in t.getmembers():
+                    f = t.extractfile(m)
+                    if f:
+                        hmembers[m.name] = f.read()
+        except Exception as e:
+            check("hermes: extracts as a gzipped tar", False, repr(e))
+        check("hermes: exactly plugin.yaml and __init__.py — what Hermes "
+              "loads as a directory plugin, and nothing else",
+              sorted(hmembers) == ["__init__.py", "plugin.yaml"],
+              str(sorted(hmembers)))
+        hx_src = hmembers.get("__init__.py", b"").decode("utf8", "replace")
+        check("hermes: credentials are baked by replacing the A2A_BAKED seam",
+              "A2A_BAKED = {}" not in hx_src
+              and f'"token": "{token}"' in hx_src, hx_src[:200])
+        check("hermes: ?agent= is baked — the default profile has no other "
+              "way to get an id", '"agent": "bot1"' in hx_src, "")
+        check("hermes: the docstring survives the baking",
+              hx_src.lstrip().startswith('"""'), hx_src[:60])
+        yml = hmembers.get("plugin.yaml", b"").decode("utf8", "replace")
+        check("hermes: plugin.yaml's version is stamped with the serving "
+              "tree's, the same constant healthz reports",
+              f'version: "{health.get("version")}"' in yml, yml[:300])
+
         # --- OpenCode: still one file ---------------------------------------
         code, body, _ = get(f"{base}/install/{token}")
         check("opencode: served", code == 200, f"HTTP {code}")
@@ -232,9 +264,27 @@ def main() -> int:
               body[:24].decode("utf8", "replace").startswith("const A2A_BAKED = {"),
               body[:60].decode("utf8", "replace"))
 
+        # --- the installer: public, and carrying no secret -------------------
+        # Reached with NO bearer: it is what a user runs before they have
+        # typed a token anywhere, so the auth middleware must let it through.
+        code, body, ctype = get(f"{base}/install")
+        isrc = body.decode("utf8", "replace")
+        check("installer: served at /install without a token", code == 200,
+              f"HTTP {code}")
+        check("installer: is python source", "python" in ctype, ctype)
+        check("installer: the broker's url and version are baked into its seam",
+              "A2A_BAKED = {}" not in isrc
+              and f'"url": "{base}"' in isrc
+              and f'"version": "{health.get("version")}"' in isrc,
+              isrc[:200])
+        check("installer: and no token — it asks for one",
+              token not in isrc and '"token"' not in isrc.split(
+                  "A2A_BAKED = ", 1)[-1].split("\n", 1)[0], "")
+
         # --- a bad token must be indistinguishable from no installer --------
         bad_pi = get(f"{base}/install/pi/a2a_st_wrong")
         bad_cx = get(f"{base}/install/codex/a2a_st_wrong")
+        bad_hx = get(f"{base}/install/hermes/a2a_st_wrong")
         bad_oc = get(f"{base}/install/a2a_st_wrong")
         check("a bad token 404s on the pi route", bad_pi[0] == 404, str(bad_pi[0]))
         # Grok Build was removed as a client. Its route must be gone too, or
@@ -246,12 +296,16 @@ def main() -> int:
               gone[0] == 404, str(gone[0]))
         check("a bad token 404s on the codex route", bad_cx[0] == 404,
               str(bad_cx[0]))
+        check("a bad token 404s on the hermes route", bad_hx[0] == 404,
+              str(bad_hx[0]))
         check("a bad token 404s on the opencode route", bad_oc[0] == 404,
               str(bad_oc[0]))
+        # `bad_gk` was compared here after the grok route was removed — a
+        # NameError that stopped this file before its verdict.
         check("all refusals are byte-identical, so none can be used to "
               "probe which tokens exist",
-              bad_pi[1] == bad_oc[1] == bad_gk[1] == bad_cx[1],
-              f"{bad_pi[1]!r} vs {bad_oc[1]!r} vs {bad_gk[1]!r} "
+              bad_pi[1] == bad_oc[1] == bad_hx[1] == bad_cx[1],
+              f"{bad_pi[1]!r} vs {bad_oc[1]!r} vs {bad_hx[1]!r} "
               f"vs {bad_cx[1]!r}")
     finally:
         proc.terminate()
