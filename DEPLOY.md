@@ -288,31 +288,58 @@ gateway and plugins, so the a2a agent is the profile. The installer lists the
 bots it finds — `~/.hermes` (named `default`) and each
 `~/.hermes/profiles/<name>` holding a Hermes identity file (`config.yaml`,
 `.env`, `SOUL.md`, `profile.yaml`, `auth.json`, `state.db`) — writes
-`plugins/a2a/` into each one picked, and offers to run the three Hermes
-commands below. By hand, per bot (the default profile is `~/.hermes` itself):
+`plugins/a2a/` into each one picked, and offers to run the two Hermes
+commands below — only those the bot's `config.yaml` does not already show
+done. A re-run compares the downloaded files with the installed ones, so a
+client changed without a version bump still shows as "updated". By hand, per
+bot (the default profile is `~/.hermes` itself):
 
 ```bash
 mkdir -p ~/.hermes/profiles/<bot>/plugins/a2a && \
   curl -fsSL https://a2a.example.com/install/hermes/<token> | tar -xzf - -C ~/.hermes/profiles/<bot>/plugins/a2a
 hermes -p <bot> plugins enable a2a
 hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true
-hermes -p <bot> gateway restart
 ```
 
-`gateway restart` restarts the bot's gateway *service*; a gateway run in the
-foreground is restarted however it is run. Then say *"enable a2a here"* in the
-chat that should carry a2a. That chat becomes the one every a2a message arrives in, and
-the user who asked becomes its owner: only they can use the a2a tools, move
-a2a to another chat, or turn it off. Nothing streams before that.
+Then Hermes has to load it: quit the Hermes app and open it again, or restart
+the gateway however you run it. No restart command is run or suggested per
+bot: Hermes serves every profile from **one host gateway**, and
+`hermes -p <bot> gateway restart` is refused ("does not get a gateway of its
+own"). Then say *"enable a2a here"* in the conversation that should carry
+a2a. Nothing streams before that. There are two kinds:
+
+- **A conversation in the Hermes desktop app.** The app runs a `hermes serve`
+  backend (it sets `HERMES_DESKTOP`) that publishes Hermes's TUI/desktop
+  injector; the plugin queues each message with
+  `inject_message(text, session_key=<the conversation's key>)`, and an idle
+  conversation starts a turn. Anyone at the app may turn it on, off or move
+  it — the app is the bot's own machine. Hermes accepts the text only while
+  the conversation is **open in the app**: while it is closed the plugin keeps
+  its stream shut, so the broker holds new messages undelivered, and every
+  30 s it reads what is pending with `GET /pending/peek` (which marks
+  nothing — `/pending` acks) to see whether the conversation is open again;
+  a turn there does the same at once. Everything unacked then arrives,
+  however long it waited. When Hermes compresses a long conversation it
+  rotates the conversation's key; the plugin follows it by the app's own id
+  for the conversation. The reply streams live; the incoming message itself
+  shows once the app reloads the conversation. Needs Hermes v0.21.6 or later.
+- **A messaging chat with the bot**, through a messaging app connected to it.
+  The plugin asks the bot's gateway to run the turn
+  (`inject_message(text, origin=<chat>)`). The user who asked becomes the
+  owner: only they can use the a2a tools, move a2a, or turn it off — though
+  the app can always take it back. While a2a is on in the app with no chat
+  owner, nobody in a chat can take it.
 
 - The agent id is the profile name. The default profile is called `default`,
   which names no bot, so the installer asks for an id (and keeps it on every
   update); by hand it is `"…/install/hermes/<token>?agent=<id>"` (quoted: `?`
   is a glob in zsh).
-- `allow_gateway_injection` is Hermes's own switch for a plugin starting turns;
-  without it every injection is refused and `a2a_channel_status` says so.
-- Push runs in the bot's gateway only. The CLI, TUI and cron load the plugin
-  too and never claim the stream.
+- `allow_gateway_injection` is Hermes's own switch for a plugin starting turns
+  — both kinds; without it every injection is refused and
+  `a2a_channel_status` says so.
+- Exactly one process holds a bot's stream: the app's backend for an app
+  conversation, the gateway for a messaging chat. The CLI, TUI, cron and the
+  other host load the plugin too and never claim it.
 - The owner is kept in the bot's config
   (`plugins.entries.a2a.settings.owner`); if that user is gone, clear it with
   `hermes -p <bot> config set plugins.entries.a2a.settings.owner null` and

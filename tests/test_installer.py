@@ -137,7 +137,13 @@ def machine(root: Path):
     log = root / "commands.log"
     for name in ("claude", "opencode", "pi", "codex", "hermes"):
         p = bin_ / name
-        p.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n')
+        # Every fake talks on both streams — the installer must show none of
+        # it — and one command fails, the way Hermes refused a per-bot
+        # gateway restart on a real machine with a screenful of text.
+        p.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n'
+                     'echo "JUNK-OUT $*"; echo "JUNK-ERR $*" >&2\n'
+                     'case "$*" in "-p bot1 plugins enable a2a") exit 1;; '
+                     'esac\n')
         p.chmod(0o755)
     return home, bin_, cwd, log
 
@@ -153,6 +159,8 @@ def run_installer(installer: Path, home, bin_, cwd, answers):
     r = subprocess.run([sys.executable, str(installer)],
                        input="\n".join(answers) + "\n", cwd=cwd, env=env,
                        capture_output=True, text=True, timeout=120)
+    if os.environ.get("A2A_TEST_SHOW"):     # read what a person would see
+        print("-" * 72, r.stdout + r.stderr, "-" * 72, sep="\n")
     return r.returncode, r.stdout + r.stderr
 
 
@@ -298,16 +306,26 @@ def main() -> int:
                 "hermes -p default plugins enable a2a",
                 "hermes -p default config set "
                 "plugins.entries.a2a.allow_gateway_injection true",
-                "hermes -p default gateway restart",
                 "hermes -p bot1 plugins enable a2a",
                 "hermes -p bot1 config set "
-                "plugins.entries.a2a.allow_gateway_injection true",
-                "hermes -p bot1 gateway restart"]
-        check("fresh: with yes, exactly the needed commands ran, in order",
+                "plugins.entries.a2a.allow_gateway_injection true"]
+        check("fresh: with yes, exactly the needed commands ran, in order — "
+              "and no gateway restart, which a host gateway refuses",
               ran == want, "\n".join(ran))
-        check("fresh: the checklist names what no installer can do",
-              "plugin:a2a@skills-dir" in out and "enable a2a here" in out
-              and "app-server --listen unix://" in out, out[-1200:])
+        check("fresh: a command's own output is never shown",
+              "JUNK" not in out, out[-1500:])
+        check("fresh: a command that failed says so in one line…",
+              "turn the a2a plugin on" in out and "did not work" in out,
+              out[-1500:])
+        steps = out.split("Next steps", 1)[-1]
+        check("fresh: …and is in the next steps, to run by hand",
+              "hermes -p bot1 plugins enable a2a" in steps, steps[:1200])
+        check("fresh: the Hermes step is to quit the app and open it again",
+              "quit the Hermes app and open it again" in steps
+              and "gateway restart" not in out, steps[:1200])
+        check("fresh: the next steps name what no installer can do",
+              "plugin:a2a@skills-dir" in steps and "enable a2a here" in steps
+              and "app-server --listen unix://" in steps, steps[:1500])
         after = snapshot(root)
         outside = [p for p in after if p not in before
                    and not p.startswith("m1/home/") and p != "m1/commands.log"]
@@ -326,6 +344,17 @@ def main() -> int:
             '[mcp_servers.a2a]\ncommand = "python3"\n')
         cx.write_text(cx.read_text().replace(
             f'"version": "{b.VERSION}"', '"version": "0.0.9"', 1))
+        # Same version, different bytes — what a client changed without a
+        # version bump looks like on disk.
+        (pi / "package.json").write_text(
+            (pi / "package.json").read_text() + "\n")
+        # The default bot is set up the way the two Hermes commands and
+        # "enable a2a here" leave a config.yaml; bot1 is not (its enable
+        # failed above).
+        (home / ".hermes" / "config.yaml").write_text(
+            "model: x\nplugins:\n  enabled:\n  - a2a\n  entries:\n"
+            "    a2a:\n      allow_gateway_injection: true\n"
+            "      settings:\n        enabled: true\n")
         log.unlink()
         code, out = run_installer(installer, home, bin_, cwd, [
             "",             # ENTER: the installed ones, already ticked
@@ -342,12 +371,29 @@ def main() -> int:
         check("update: Codex is brought to the broker's version",
               f'"version": "{b.VERSION}"' in cx.read_text())
         check("update: a client that was behind is told to restart",
-              "restart running Codex sessions" in out, out[-1500:])
-        check("update: a client already current is not — nothing changed, "
-              "so a restart would buy nothing",
-              "restart your Claude Code sessions" not in out
-              and "restart running OpenCode sessions" not in out
-              and "restart running Pi sessions" not in out, out[-1500:])
+              "Codex: restart running sessions" in out, out[-1500:])
+        check("update: a client whose files are byte-identical is 'already "
+              "current' and not told to restart — nothing changed",
+              "Claude Code: restart" not in out
+              and "OpenCode: restart" not in out
+              and "already current" in out, out[-1500:])
+        check("update: a client changed WITHOUT a version bump is 'updated' "
+              "and told to restart — the version alone would have called it "
+              "current", f"{b.VERSION}, updated" in out
+              and "Pi: restart running sessions" in out, out[-1500:])
+        steps = out.split("Next steps", 1)[-1]
+        check("update: 'enable a2a here' is asked only for the bot whose a2a "
+              "is not on yet, and points at the Hermes app",
+              "Hermes bot 'bot1': in the Hermes app" in steps
+              and "Hermes bot 'default': in the Hermes app" not in steps,
+              steps[:1500])
+        ran = log.read_text().splitlines() if log.is_file() else []
+        check("update: only the setup not yet done is offered — the default "
+              "bot's config already has a2a enabled and allowed",
+              ran == ["hermes -p bot1 plugins enable a2a",
+                      "hermes -p bot1 config set "
+                      "plugins.entries.a2a.allow_gateway_injection true"],
+              "\n".join(ran))
 
         # --- running it once more, everything current ----------------------
         code, out = run_installer(installer, home, bin_, cwd, [
@@ -355,7 +401,7 @@ def main() -> int:
         check("current: picking an up-to-date Claude Code asks for no token",
               code == 0 and "Paste or type the token" not in out, out[-1200:])
         check("current: and ends with nothing to do — no restart line",
-              "Nothing left to do" in out and "restart" not in out,
+              "Nothing else to do" in out and "restart" not in out,
               out[-1200:])
         check("update: files it did not ship are left alone (Pi's "
               "node_modules)", (pi / "node_modules" / "keep.txt").is_file())
@@ -375,8 +421,9 @@ def main() -> int:
         check("declined: the install still finishes", code == 0, out[-800:])
         check("declined: no command ran", not log.exists(),
               log.read_text() if log.exists() else "")
-        check("declined: and they are printed to run by hand",
-              "Run them yourself" in out and "codex mcp add a2a" in out,
+        check("declined: and they are in the next steps, to run by hand",
+              "they are in your next steps" in out
+              and "codex mcp add a2a" in out.split("Next steps", 1)[-1],
               out[-800:])
 
         # --- a refused token ---------------------------------------------------

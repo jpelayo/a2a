@@ -6220,6 +6220,40 @@ def build_app() -> Starlette:
 
         return JSONResponse(await _db(_do))
 
+    async def pending_peek_route(request: Request) -> JSONResponse:
+        """The caller's unacked messages, WITHOUT touching them.
+
+        /pending is a read that acks ("reading it IS saying so"), which is
+        right for an agent pulling its inbox and wrong for a client that has
+        to hand each message to a session that may not be there: the Hermes
+        plugin delivering into a desktop-app conversation that is closed. A
+        stream line it could not deliver is re-sent only within
+        STREAM_REPLAY_WINDOW, so a conversation closed for an hour would
+        strand everything that arrived meanwhile. This marks nothing — not
+        delivered, not acked — and returns each message in the stream's own
+        JSON shape, so the client delivers it exactly as if it had streamed.
+        A broker without this route answers 404, which the plugin reads as
+        "no peek here" and falls back to the replay.
+        """
+        sid = require_station()
+        me = current_agent()
+        if not me:
+            return JSONResponse(
+                {"error": "this request names no agent, so it has no inbox"},
+                status_code=400,
+            )
+        limit = max(1, min(int(request.query_params.get("limit") or 50), 200))
+
+        def _do() -> dict:
+            rows = _pending_rows(sid, me, limit + 1)
+            more = len(rows) > limit
+            msgs = _resolve_receipts(sid, rows[:limit])
+            return {"agent_id": me, "has_more": more,
+                    "messages": [json.loads(_format_stream_line(m, True))
+                                 for m in msgs]}
+
+        return JSONResponse(await _db(_do))
+
     async def ack_route(request: Request) -> JSONResponse:
         sid = require_station()
         me = current_agent()
@@ -6628,6 +6662,7 @@ def build_app() -> Starlette:
     routes.append(Route("/md", fetch_md_route, methods=["GET"]))
 
     routes.append(Route("/pending", pending_route, methods=["GET"]))
+    routes.append(Route("/pending/peek", pending_peek_route, methods=["GET"]))
     routes.append(Route("/ack", ack_route, methods=["POST"]))
     routes.append(Route("/ack/all", ack_all_route, methods=["POST"]))
 

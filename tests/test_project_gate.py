@@ -183,6 +183,12 @@ class FakeBroker:
         self.me_agents: list[str] = []
         self.acked: list[str] = []
         self.unacked: list[dict] = []
+        # Unacked but past the replay window: the stream never offers these
+        # again, only GET /pending/peek returns them — what a Hermes app
+        # conversation closed for hours has to recover from.
+        self.aged: list[dict] = []
+        # False: answer /pending/peek 404, like a broker that predates it.
+        self.peek = True
         self.live: queue.Queue = queue.Queue()
         self.quiet = threading.Event()
         self.stop = threading.Event()
@@ -210,6 +216,15 @@ class FakeBroker:
                     (path, self.headers.get("X-A2A-Agent") or ""))
                 if path == "/stream":
                     return self._stream()
+                if path == "/pending/peek":
+                    if not broker.peek:
+                        self.send_response(404)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    # Read-only, like the real one: marks nothing.
+                    return self._json({"messages": broker.aged
+                                       + list(broker.unacked)})
                 self._json({"agent": "x", "registered": True,
                             "stations": ["s"], "channels": [],
                             "agents": [{"agent_id": a}
@@ -233,6 +248,8 @@ class FakeBroker:
                     broker.acked += ids
                     broker.unacked = [m for m in broker.unacked
                                       if m["id"] not in ids]
+                    broker.aged = [m for m in broker.aged
+                                   if m["id"] not in ids]
                 self._json({"ok": True})
 
             do_PATCH = do_DELETE = do_POST

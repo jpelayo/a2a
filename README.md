@@ -141,7 +141,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | OpenCode | `~/.config/opencode/plugins/a2a-opencode.js` | — | restart OpenCode (the desktop app too) |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
 | Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once | start each session with the launch line below |
-| Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` · `hermes -p <bot> gateway restart` | say *"enable a2a here"* in the chat that should carry a2a |
+| Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
 
 **Claude Code: the flag is what carries push.** Without it everything else
 works and nothing ever arrives; the startup dialog must show
@@ -160,11 +160,28 @@ codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; codex --remote u
 
 **Hermes: two of its commands are Hermes's own.** A plugin is loaded only once
 it is enabled, and may start turns in the bot only once
-`allow_gateway_injection` is set; no plugin can do either for itself. After the
-gateway restart, a2a messages arrive as turns in the chat where the bot's owner
-said *"enable a2a here"*, and only that user can use the a2a tools or move it.
-If the bot's gateway does not run as a service, `gateway restart` fails; restart
-it however you run it.
+`allow_gateway_injection` is set; no plugin can do either for itself. Hermes
+then needs a restart to load it: **quit the Hermes app and open it again** (if
+you run the gateway yourself, restart that). The installer does not try to do
+this for you — one gateway serves every bot on the machine, and asking it to
+restart one bot is refused.
+
+a2a messages arrive as turns in **one place** of the bot, chosen by saying
+*"enable a2a here"* there:
+
+- **a conversation in the Hermes desktop app** — the usual case. Anyone at the
+  app may choose it (the app is the bot's own machine). Keep it open: a2a
+  queues each message on that conversation, and the bot answers it there
+  while you watch the reply stream in. While the conversation is closed,
+  messages wait on the broker — nothing is lost — and arrive as soon as it is
+  open again. The incoming message itself shows in the conversation once the
+  app reloads it; the reply streams live.
+- **a messaging chat with the bot** (a messaging app connected to it). The
+  user who asks becomes its owner, and only they can use the a2a tools or move
+  it.
+
+Say *"turn a2a off here"* to stop it; say *"enable a2a here"* somewhere else
+to move it.
 
 **Updating** is the same command. A client that is behind the broker says so
 once — in the session, its log or its status — and names this command. Restart
@@ -227,9 +244,10 @@ effects, not vocabulary, which is also what lets it connect in place. Turning
 a project off stops Codex's stream on the spot; OpenCode and Pi stop at their
 next restart. Claude Code does not read this file yet.
 
-A Hermes bot has no project directory, so its switch is a chat instead: off
-until its owner says *"enable a2a here"* in one, and kept in the bot's own
-config.
+A Hermes bot has no project directory, so its switch is a conversation
+instead: off until someone says *"enable a2a here"* in one — a conversation
+in the Hermes app, or a messaging chat with the bot — and kept in the bot's
+own config.
 
 ---
 
@@ -258,7 +276,7 @@ How each harness gets them differs, and it is worth knowing which you are on:
 | **OpenCode** | the plugin, as REST wrappers | `client.session.promptAsync` |
 | **Pi** | the extension, as REST wrappers | `pi.sendMessage` as a custom message — starts a turn when idle, queues as a follow-up mid-run |
 | **Codex** | the client, as REST wrappers | `turn/start` into the session's own app-server — needs a one-line launch, see [Install](#install-or-update) |
-| **Hermes** | the plugin, as REST wrappers | `inject_message` into one chat of the bot, run by its gateway |
+| **Hermes** | the plugin, as REST wrappers | `inject_message` into one conversation of the bot: a Hermes app conversation (by its session key, in the app's backend) or a messaging chat (run by its gateway) |
 
 Claude Code is the odd one. OpenCode and Pi push by calling an API their
 harness always exposes, so it works the moment you install them. Claude Code's
@@ -536,9 +554,11 @@ the broker is fine and the client is not receiving — check, in this order:
 - **Codex**: the session must have its own app-server (the launch line under
   [Install or update](#install-or-update)); `a2a_channel_status` says whether
   push is on.
-- **Hermes**: the gateway must be running and may inject
-  (`allow_gateway_injection`), and a2a arrives only in the chat it was
-  enabled in; `a2a_channel_status`, asked there, names the missing piece.
+- **Hermes**: a2a arrives only in the conversation it was enabled in, and
+  only while that conversation is open in the Hermes app (or, for a messaging
+  chat, while the bot's gateway runs); it may inject only with
+  `allow_gateway_injection`. `a2a_channel_status`, asked there, names the
+  missing piece.
 - **any client**: its log, capped and per agent — `a2a_channel_status` names
   the file.
 
@@ -665,7 +685,7 @@ codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py
 mkdir -p ~/.hermes/profiles/<bot>/plugins/a2a && curl -fsSL https://a2a.example.com/install/hermes/<your-token> | tar -xzf - -C ~/.hermes/profiles/<bot>/plugins/a2a
 hermes -p <bot> plugins enable a2a
 hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true
-hermes -p <bot> gateway restart
+# then quit the Hermes app and open it again (or restart your gateway)
 ```
 
 Then the same last steps as in the [table above](#install-or-update): the

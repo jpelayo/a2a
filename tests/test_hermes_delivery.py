@@ -17,6 +17,10 @@ against `serve`, with the receipt read from the database:
              broker sends it again; seen, its receipt is acked.
   refused    the gateway refused it. The plugin reopens the stream, and the
              broker offers it again.
+  closed     a desktop-app conversation closed for longer than the replay
+             window: the stream will never offer its message again, so the
+             plugin reads it with GET /pending/peek — which marks nothing —
+             and delivers it once the conversation is open.
 
 And one constant: T_UNSEEN must sit inside STREAM_REPLAY_WINDOW, because the
 replay pass is what covers a broker killed too hard to run the stream's close.
@@ -160,7 +164,45 @@ def database_half() -> None:
         check("and, seen, acked in the database",
               th.until(lambda: bool(receipt(d2).get("acked_at")), 10),
               str(receipt(d2)))
+        th.stop(ctx)
+        ctx = None
+
+        # --- a desktop-app conversation, closed past the replay window -------
+        os.environ["HERMES_DESKTOP"] = "1"
+        plugin.PEEK_S = 0.5
+        ctx = th.Ctx("bot", gateway=False, tui=True, config=th.DESK_ON)
+        inst = th.start(plugin, ctx)
+        check("the app's backend streams the app route from the real broker",
+              th.until(lambda: inst.state["connected"], 10), str(inst.state))
+        d3 = dm("waits while the conversation is closed")
+        check("closed in the app: refused, and nothing is acked",
+              th.until(lambda: inst._closed_since is not None, 10)
+              and not receipt(d3).get("acked_at"), str(receipt(d3)))
+        before = receipt(d3)
+        peek = plugin.api("GET", "/pending/peek", agent="bot")
+        check("GET /pending/peek returns it, in the stream's own shape",
+              isinstance(peek, dict) and any(
+                  m.get("id") == d3 and "audience" in m
+                  for m in peek.get("messages") or []), str(peek)[:300])
+        check("and writes nothing — not delivered, not acked (/pending would "
+              "have acked it)", receipt(d3) == before, f"{before} → "
+              f"{receipt(d3)}")
+        # Past the replay window: the stream will never offer it again.
+        b.CONN.execute(
+            "UPDATE message_receipts SET delivered_at = %s "
+            "WHERE station_id = %s AND agent_id = %s AND msg_id = %s",
+            (time.time() - 2 * b.STREAM_REPLAY_WINDOW, sid, "bot", d3))
+        ctx.live_keys = {th.DESK["session_key"]}
+        check("opened again: the peek hands over what the stream never would",
+              th.until(lambda: d3 in ctx.ids_injected(), 15),
+              str(ctx.ids_injected()))
+        ctx.turn(th.DESK, "s1",
+                 [c for c, _ in ctx.injected if f'id="{d3}"' in c][-1])
+        check("and, seen in that conversation, acked in the database",
+              th.until(lambda: bool(receipt(d3).get("acked_at")), 10),
+              str(receipt(d3)))
     finally:
+        os.environ.pop("HERMES_DESKTOP", None)
         if ctx is not None:
             th.stop(ctx)
         proc.terminate()

@@ -135,11 +135,44 @@ def main() -> int:
         check(f"gateway.session_context.{name} exists",
               find(sc, ast.FunctionDef, name) is not None, "")
     client = CLIENT.read_text()
-    for var in sorted(set(re.findall(r'"(HERMES_SESSION_[A-Z_]+)"', client))):
-        check(f"the gateway binds {var}", f'"{var}"' in sc_text, "")
+    for var in sorted(set(re.findall(r'"(HERMES_(?:UI_)?SESSION_[A-Z_]+)"',
+                                     client))):
+        check(f"Hermes binds {var}", f'"{var}"' in sc_text, "")
     hc = tree(src, "hermes_constants.py")
     check("hermes_constants.get_hermes_home exists",
           find(hc, ast.FunctionDef, "get_hermes_home") is not None, "")
+
+    # The desktop app's conversations: a second host, by session key.
+    check("inject_message takes session_key as KEYWORD-only — how a text is "
+          "queued on a desktop-app conversation",
+          inj is not None
+          and "session_key" in [a.arg for a in inj.args.kwonlyargs], "")
+    tui = method(mgr, "has_tui_message_injector")
+    check("PluginManager.has_tui_message_injector is a property — the plugin "
+          "streams an app route only where it is true",
+          tui is not None and is_property(tui), "")
+    pi = tree(src, "tui_gateway/plugin_inject.py")
+    check("tui_gateway/plugin_inject.py defines inject_tui_session_message",
+          find(pi, ast.FunctionDef, "inject_tui_session_message") is not None,
+          "")
+    ws = src / "hermes_cli" / "web_server.py"
+    check("the desktop app's backend (hermes serve) installs the TUI injector",
+          ws.is_file() and "install_tui_message_injector" in ws.read_text(),
+          "")
+    check("a desktop turn binds HERMES_UI_SESSION_ID — the app's id the plugin "
+          "follows a rotated key by", '"HERMES_UI_SESSION_ID"' in sc_text, "")
+    check("'desktop' is the session source a desktop-app turn carries",
+          '"desktop"' in sc_text, "")
+    srv = src / "tui_gateway" / "server.py"
+    srv_text = srv.read_text() if srv.is_file() else ""
+    check("tui_gateway.server keeps _sessions and _sessions_lock (read, best "
+          "effort, to find a compressed conversation's new key)",
+          re.search(r"^_sessions\s*[:=]", srv_text, re.M) is not None
+          and re.search(r"^_sessions_lock\s*[:=]", srv_text, re.M) is not None,
+          "")
+    desk = " ".join(p.read_text() for p in (ws, srv) if p.is_file())
+    check("HERMES_DESKTOP is what marks the app's own backend",
+          "HERMES_DESKTOP" in desk, "")
 
     # plugin.yaml: every key the plugin's manifest uses is one Hermes reads.
     manifest_src = ""

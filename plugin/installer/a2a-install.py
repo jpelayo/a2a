@@ -185,9 +185,12 @@ def codex_registered():
 # ---------------------------------------------------------------------------
 
 def _state(v, found):
+    # Not "current": the version stays the same across many changes to a
+    # client, so whether the files are current is only known after the
+    # download, by comparing them (Target.same).
     if v is not None:
         return (f"installed {v or '(unstamped)'} {G.arrow} {VERSION}"
-                if v != VERSION else f"installed {VERSION}, current")
+                if v != VERSION else f"installed {VERSION}")
     return "found, not installed" if found else "not found"
 
 
@@ -341,8 +344,8 @@ def tilde(p):
 # ---------------------------------------------------------------------------
 
 class G:
-    check, dot, arrow, dash, bullet, updown = "x", "*", "->", "-", "-", \
-        "up/down"
+    check, cross, dot, arrow, dash, bullet, updown = (
+        "x", "!", "*", "->", "-", "-", "up/down")
 
     @classmethod
     def setup(cls):
@@ -351,9 +354,9 @@ class G:
         except locale.Error:
             pass
         if "utf" in (locale.getpreferredencoding(False) or "").lower():
-            cls.check, cls.dot, cls.arrow, cls.dash, cls.bullet, cls.updown = (
-                "✓", "•", "→", "—", "·",
-                "↑↓")
+            (cls.check, cls.cross, cls.dot, cls.arrow, cls.dash, cls.bullet,
+             cls.updown) = ("✓", "✗", "•", "→", "—",
+                            "·", "↑↓")
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +627,18 @@ class Target:
         self.key, self.label, self.dest = key, label, dest
         self.before, self.profile, self.agent = before, profile, agent
         self.files = []          # [(absolute path, bytes, mode)]
+        self.same = False        # every file already on disk, byte for byte
+
+    def compare(self):
+        """Is what was downloaded exactly what is installed? This, not the
+        version, decides "already current": the version stays the same
+        across changes to a client."""
+        try:
+            self.same = bool(self.files) and all(
+                p.is_file() and p.read_bytes() == data
+                for p, data, _ in self.files)
+        except OSError:
+            self.same = False
 
 
 def ask_token(ui):
@@ -716,132 +731,241 @@ def download(ui, targets, token):
                                     f"client: {e}; nothing was written."))
         if t.key == "opencode":
             t.files = [(t.dest / "a2a-opencode.js", data, 0o644)]
+        else:
+            try:
+                t.files = [(t.dest / rel, body, mode)
+                           for rel, body, mode in unpack(data)]
+            except Exception as e:
+                raise SystemExit(redact(
+                    f"a2a: the {t.label} download is not a usable archive "
+                    f"({e}); nothing was written."))
+        t.compare()
+
+
+def _hermes_config(home):
+    """(a2a plugin enabled, a2a may start turns, a2a switched on by "enable
+    a2a here") from a bot's config.yaml.
+
+    Read conservatively, without a YAML library: only the plain block layout
+    `hermes config set` and `hermes plugins enable` write is recognised, and
+    anything else counts as NOT done — the cost of a wrong "not done" is one
+    harmless command offered again, the cost of a wrong "done" is a bot that
+    silently never loads a2a.
+    """
+    try:
+        text = (home / "config.yaml").read_text(errors="replace")
+    except OSError:
+        return False, False, False
+    path, enabled, disabled, allowed, on = [], False, False, False, False
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-        try:
-            t.files = [(t.dest / rel, body, mode)
-                       for rel, body, mode in unpack(data)]
-        except Exception as e:
-            raise SystemExit(redact(f"a2a: the {t.label} download is not a "
-                                    f"usable archive ({e}); nothing was "
-                                    "written."))
+        line = raw.split(" #", 1)[0].rstrip()
+        indent = len(line) - len(line.lstrip())
+        s = line.strip()
+        if s.startswith("- "):
+            while path and path[-1][0] > indent:
+                path.pop()
+            item = s[2:].strip().strip("'\"")
+            keys = [k for _, k in path]
+            if item == "a2a" and keys == ["plugins", "enabled"]:
+                enabled = True
+            if item == "a2a" and keys == ["plugins", "disabled"]:
+                disabled = True
+            continue
+        key, sep, value = s.partition(":")
+        if not sep:
+            continue
+        while path and path[-1][0] >= indent:
+            path.pop()
+        keys = [k for _, k in path] + [key.strip().strip("'\"")]
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            items = [v.strip().strip("'\"") for v in value[1:-1].split(",")]
+            if keys == ["plugins", "enabled"] and "a2a" in items:
+                enabled = True
+            if keys == ["plugins", "disabled"] and "a2a" in items:
+                disabled = True
+        elif keys == ["plugins", "entries", "a2a", "allow_gateway_injection"]:
+            allowed = value.lower() in ("true", "yes", "on")
+        elif keys == ["plugins", "entries", "a2a", "settings", "enabled"]:
+            # The plugin's own switch ("enable a2a here" writes it).
+            on = value.lower() in ("true", "yes", "on")
+        if not value:
+            path.append((indent, keys[-1]))
+    return enabled and not disabled, allowed, on
 
 
-def commands_for(targets):
+def setup_needed(targets):
+    """The harness commands still needed: [(whose, what it does, argv)].
+
+    Only what is not done yet. An update of a Codex that is registered, or of
+    a bot whose a2a is already enabled and allowed, asks for nothing. No
+    gateway restart is run: on a Hermes that serves every bot from one host
+    gateway, `hermes -p <bot> gateway restart` is refused outright, and the
+    desktop app restarts its own. Quitting and reopening the app is a step
+    for the person, in the next steps.
+    """
     cmds = []
     for t in targets:
         if t.key == "codex" and not codex_registered():
-            cmds.append((t.label, ["codex", "mcp", "add", "a2a", "--",
-                                   "python3", str(t.dest / "a2a-codex.py")]))
+            cmds.append((t.label, "register a2a with Codex",
+                         ["codex", "mcp", "add", "a2a", "--", "python3",
+                          str(t.dest / "a2a-codex.py")]))
         if t.key == "hermes":
+            enabled, allowed, _ = _hermes_config(t.dest.parent.parent)
             p = ["hermes", "-p", t.profile]
-            cmds.append((t.label, p + ["plugins", "enable", "a2a"]))
-            cmds.append((t.label, p + [
-                "config", "set",
-                "plugins.entries.a2a.allow_gateway_injection", "true"]))
-            cmds.append((t.label, p + ["gateway", "restart"]))
+            if not enabled:
+                cmds.append((t.label, "turn the a2a plugin on",
+                             p + ["plugins", "enable", "a2a"]))
+            if not allowed:
+                cmds.append((t.label, "let a2a start conversations in the bot",
+                             p + ["config", "set",
+                                  "plugins.entries.a2a.allow_gateway_injection",
+                                  "true"]))
     return cmds
 
 
+def command_text(argv):
+    """A command as you would type it: quoted where needed, with your home
+    folder shown as ~ (left unquoted, so the shell still expands it)."""
+    out = []
+    h = str(HOME) + os.sep
+    for a in argv:
+        rest = a[len(h):] if a.startswith(h) else None
+        if rest is not None and shlex.quote(rest) == rest:
+            out.append("~/" + rest)
+        else:
+            out.append(shlex.quote(a))
+    return " ".join(out)
+
+
+def _change(t):
+    if t.before is None:
+        return f"new {G.dash} {VERSION}"
+    if t.same:
+        return f"{VERSION}, already current"
+    if t.before == VERSION:
+        return f"{VERSION}, updated"
+    return f"{t.before or 'unstamped'} {G.arrow} {VERSION}"
+
+
+def _where(t):
+    if t.key == "opencode":
+        return tilde(t.files[0][0]) if t.files else tilde(t.dest)
+    n = len(t.files)
+    return f"{tilde(t.dest)}/ ({n} file{'s' if n != 1 else ''})"
+
+
+def _table(rows, indent="  "):
+    """Rows of cells, columns padded to line up."""
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    return [indent + "  ".join(c.ljust(w) for c, w in zip(r, widths))
+            + "  " + r[-1] for r in rows]
+
+
 def summary(targets, me, cmds):
+    """The confirmation screen: what will be written, and what will be asked."""
     lines = []
     if me is not None:
         stations = me.get("stations") or []
-        lines.append(f"Token of {me.get('user') or '?'}, stations: "
+        lines.append(f"Token of {me.get('user') or '?'} {G.dash} stations: "
                      f"{', '.join(stations) if stations else 'none'}")
         if not stations:
-            lines.append("  WARNING: this token is granted into no station "
-                         "yet; your operator has to grant it before any "
-                         "client can work.")
+            lines.append("  This token is in no station yet: your operator "
+                         "has to grant it before any client can work.")
         lines.append("")
-    for t in targets:
-        was = (f"{t.before or '(unstamped)'} {G.arrow} {VERSION}"
-               if t.before is not None else f"new, {VERSION}")
-        lines.append(f"{t.label}  ({was})")
-        for path, _, _ in t.files:
-            lines.append(f"  {tilde(path)}")
+    lines.append("Will be installed")
+    lines += _table([[t.label, _change(t), _where(t)] for t in targets])
     if cmds:
-        lines += ["", "Commands that will be needed (you will be asked "
-                      "before any runs):"]
-        lines += [f"  {shlex.join(c)}" for _, c in cmds]
-    lines += ["", "Files are overwritten in place; nothing is deleted."]
+        lines += ["", "Setup it will ask to run afterwards"]
+        lines += _table([[who, what] for who, what, _ in cmds])
+    lines += ["", "Nothing outside these folders is touched, and nothing is "
+                  "deleted."]
     return lines
 
 
-def run_commands(say, cmds, use_tty):
+def run_setup(say, cmds, use_tty):
+    """Run each command quietly: its output is captured, never dumped. What
+    the person sees is one line per command — done, or not done and why it
+    is now in their next steps. [(whose, what, argv)] that did not work."""
     failed = []
-    for label, argv in cmds:
-        say(f"$ {shlex.join(argv)}")
+    for who, what, argv in cmds:
         try:
             r = subprocess.run(argv, stdin=None if use_tty
-                               else subprocess.DEVNULL, timeout=300)
-            ok = r.returncode == 0
+                               else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=300)
+            ok, why = r.returncode == 0, ""
         except FileNotFoundError:
-            say(f"  {argv[0]}: not found on PATH")
-            ok = False
+            ok, why = False, f"{argv[0]} is not on PATH"
         except subprocess.TimeoutExpired:
-            say("  timed out")
-            ok = False
-        if not ok:
-            failed.append((label, argv))
+            ok, why = False, "it did not finish"
+        if ok:
+            say(f"  {G.check} {who}: {what}")
+        else:
+            say(f"  {G.cross} {who}: {what} {G.dash} did not work"
+                + (f" ({why})" if why else "") + "; it is in your next steps")
+            failed.append((who, what, argv))
     return failed
 
 
-def checklist_after(say, targets, gateway_failed):
-    keys = {t.key for t in targets}
+def next_steps(targets, pending, hermes_touched):
+    """What is left for the person, in the order to do it: [[line, ...]]."""
     first = {t.key for t in targets if t.before is None}
-    # Already at this version: the files written are the ones it had, so
-    # there is nothing to restart and saying so would only cost a restart.
-    current = {t.key for t in targets if t.before == VERSION}
-    left = []                    # (heading, [lines]); empty sections dropped
-    b = f"    {G.bullet} "
-    if "claude" in keys:
-        if "claude" in first:
-            lines = [f"{b}start it with: {CLAUDE_LAUNCH}",
-                     f"{b}then /plugin {G.arrow} enable a2a {G.arrow} paste "
-                     "your token"]
-        elif "claude" not in current:
-            lines = [f"{b}restart your Claude Code sessions "
-                     "(/reload-plugins does not pick up a new copy)"]
-        else:
-            lines = []
-        left.append(("Claude Code", lines))
-    for key, flag in (("opencode", "enabled_opencode"),
-                      ("pi", "enabled_pi"), ("codex", "enabled_codex")):
+    # Byte-identical to what was installed: there is nothing to restart, and
+    # saying so would only cost a restart.
+    changed = {t.key for t in targets if not t.same}
+    keys = {t.key for t in targets}
+    steps = []
+    for who, what, argv in pending:
+        steps.append([f"{who}: {what}. Run:", f"   {command_text(argv)}"])
+    if "claude" in first:
+        steps.append([f"Claude Code: start it with",
+                      f"   {CLAUDE_LAUNCH}",
+                      f"then type /plugin {G.arrow} enable a2a {G.arrow} "
+                      "paste your token."])
+    elif "claude" in changed:
+        steps.append(["Claude Code: restart your sessions "
+                      "(/reload-plugins does not pick up a new copy)."])
+    off = [NAMES[k] for k in ("opencode", "pi", "codex") if k in first]
+    if off:
+        names = (", ".join(off[:-1]) + " and " + off[-1] if len(off) > 1
+                 else off[0])
+        steps.append([f"{names}: a2a stays off in each project until you turn "
+                      "it on there: ask the agent in that project to "
+                      "\"enable a2a here\"."])
+    for key in ("opencode", "pi", "codex"):
         if key not in keys:
             continue
-        lines = []
-        if key in first:
-            lines.append(f"{b}a2a is off in every project until you turn it "
-                         "on: ask the agent to \"enable a2a here\", or put "
-                         f"{{\"{flag}\": true}} in the project's .a2a.json")
-        if key not in current:
-            lines.append(f"{b}restart running {NAMES[key]} sessions"
-                         + (" (the desktop app too)" if key == "opencode"
-                            else ""))
-        if key == "codex":
-            lines.append(f"{b}start each session with push: {CODEX_LAUNCH}")
-        left.append((NAMES[key], lines))
+        if key == "codex" and "codex" in changed:
+            steps.append([("Codex: start each session like this to receive "
+                           "messages:" if "codex" in first else
+                           "Codex: restart running sessions, starting each "
+                           "like this to receive messages:"),
+                          f"   {CODEX_LAUNCH}"])
+        elif key in changed and key not in first:
+            steps.append([f"{NAMES[key]}: restart running sessions"
+                          + (" and the desktop app" if key == "opencode"
+                             else "") + "."])
+    if hermes_touched:
+        steps.append(["Hermes: quit the Hermes app and open it again, so it "
+                      "loads a2a.",
+                      "(If you run the Hermes gateway yourself instead, "
+                      "restart it.)"])
     for t in targets:
-        if t.key != "hermes":
-            continue
-        lines = []
-        if t.profile in gateway_failed:
-            lines.append(f"{b}restart this bot's gateway however you run it "
-                         "(the restart command failed)")
-        if t.before is None:
-            lines.append(f"{b}say \"enable a2a here\" in the chat of this bot "
-                         "that should carry a2a")
-        left.append((t.label, lines))
-    left = [(h, lines) for h, lines in left if lines]
-    if not left and not first:
-        say("", "Nothing left to do: everything picked was already current.")
-        return
-    say("", "What is left for you:")
-    for heading, lines in left:
-        say(f"  {heading}", *lines)
+        if t.key == "hermes" and not _hermes_config(t.dest.parent.parent)[2]:
+            steps.append([f"{t.label}: in the Hermes app, open the "
+                          "conversation with this bot that should carry a2a "
+                          "and say \"enable a2a here\" (a messaging chat with "
+                          "the bot works too).",
+                          "Keep that conversation open: a2a messages go into "
+                          "it while it is open, and wait on the broker while "
+                          "it is closed."])
     if first:
-        say("  Your operator approves each new agent when it asks to be "
-            "registered.")
+        steps.append(["Your operator approves each new agent when it asks to "
+                      "be registered."])
+    return steps
 
 
 def choose_ui():
@@ -903,7 +1027,7 @@ def main():
                 return 1
             targets = plan(selected, bots)
             download(ui, targets, token)
-            cmds = commands_for(targets)
+            cmds = setup_needed(targets)
             if not ui.confirm("Ready to install", summary(targets, me, cmds)):
                 raise Cancelled()
         finally:
@@ -913,34 +1037,56 @@ def main():
         return 1
 
     say = plain.say
-    say("", f"a2a {VERSION} from {URL}")
+    rows, broken = [], []
     for t in targets:
-        for path, data, mode in t.files:
-            write_file(path, data, mode)
-            say(f"  wrote {tilde(path)}")
-    failed = []
-    if cmds:
-        say("", "These commands need to be run:")
-        for _, argv in cmds:
-            say(f"  {shlex.join(argv)}")
         try:
-            run = plain.yes_no("Do you want me to run them?")
+            for path, data, mode in t.files:
+                write_file(path, data, mode)
+            rows.append([f"{G.check} {t.label}", _change(t), _where(t)])
+        except OSError as e:
+            rows.append([f"{G.cross} {t.label}", "could not write",
+                         str(e.strerror or e)])
+            broken.append(t)
+    say("", f"a2a {VERSION} {G.dash} {URL}", "", "Installed", *_table(rows))
+    targets = [t for t in targets if t not in broken]
+    cmds = [c for c in cmds if c[0] in {t.label for t in targets}]
+
+    pending = []
+    if cmds:
+        say("", "Setup still needed")
+        width = max(len(who) for who, _, _ in cmds)
+        for who, what, argv in cmds:
+            say(f"  {who.ljust(width)}  {what}",
+                f"  {' ' * width}  {G.dash} {command_text(argv)}")
+        ask = ("Run this command now?" if len(cmds) == 1
+               else f"Run these {len(cmds)} commands now?")
+        try:
+            run = plain.yes_no(ask)
         except Cancelled:
             run = False
         if run:
-            failed = run_commands(say, cmds, tty)
-            if failed:
-                say("", "These did not succeed; run them yourself:")
-                for _, argv in failed:
-                    say(f"  {shlex.join(argv)}")
+            pending = run_setup(say, cmds, tty)
         else:
-            say("", "Not run. Run them yourself:")
-            for _, argv in cmds:
-                say(f"  {shlex.join(argv)}")
-    gateway_failed = {a[2] for _, a in failed if a[-2:] == ["gateway", "restart"]}
-    checklist_after(say, targets, gateway_failed)
-    say("", "Done. Run the same command again any time to update.")
-    return 0
+            say("  Not run; they are in your next steps.")
+            pending = list(cmds)
+    hermes_touched = any(t.key == "hermes" and not t.same
+                         for t in targets) or any(
+        argv[0] == "hermes" for _, _, argv in cmds)
+
+    steps = next_steps(targets, pending, hermes_touched)
+    if broken:
+        steps.insert(0, ["Run the installer again for what could not be "
+                         "written: " + ", ".join(t.label for t in broken)
+                         + "."])
+    if steps:
+        say("", "Next steps")
+        for i, lines in enumerate(steps, 1):
+            say(f"  {i}. {lines[0]}", *[f"     {l}" for l in lines[1:]])
+    else:
+        say("", "Nothing else to do: everything you picked was already "
+                "current.")
+    say("", "To update later, run the same command again.")
+    return 1 if broken else 0
 
 
 if __name__ == "__main__":

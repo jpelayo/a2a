@@ -24,6 +24,11 @@ What is pinned, and why each matters:
               reopened and the broker sends it again; a failed ack retries on
               its own clock.
   isolation   two profiles in one process share nothing.
+  desktop     a conversation in the Hermes desktop app is a route too: queued
+              by its session key in the app's backend only; closed in the app
+              → nothing goes in, nothing is lost, and it all arrives when the
+              conversation is open again (a turn there, or the peek); a key
+              Hermes rotates by compressing is followed by the app's id.
 
 Contract with Hermes itself — that these names and signatures exist — is
 tests/test_hermes_contract.py, against a Hermes checkout.
@@ -86,7 +91,11 @@ VAR = {"HERMES_SESSION_PLATFORM": "platform",
        "HERMES_SESSION_CHAT_TYPE": "chat_type",
        "HERMES_SESSION_THREAD_ID": "thread_id",
        "HERMES_SESSION_USER_ID": "user_id",
-       "HERMES_SESSION_SCOPE_ID": "scope_id"}
+       "HERMES_SESSION_SCOPE_ID": "scope_id",
+       # What a turn in the desktop app binds instead: no platform, no user.
+       "HERMES_SESSION_SOURCE": "source",
+       "HERMES_SESSION_KEY": "session_key",
+       "HERMES_UI_SESSION_ID": "ui"}
 
 gateway = types.ModuleType("gateway")
 session_context = types.ModuleType("gateway.session_context")
@@ -111,24 +120,32 @@ def in_turn(chat: dict, fn, *a, **kw):
 
 
 class Manager:
-    def __init__(self, gateway=True):
+    def __init__(self, gateway=True, tui=False):
         self.has_gateway_message_injector = gateway
+        # The desktop app's backend publishes this one instead.
+        self.has_tui_message_injector = tui
 
 
 class Ctx:
     """The PluginContext surface the plugin uses, and nothing else."""
 
-    def __init__(self, profile, gateway=True, config=None, allowed=True):
+    def __init__(self, profile, gateway=True, config=None, allowed=True,
+                 tui=False):
         self.profile_name = profile
-        self._manager = Manager(gateway)
+        self._manager = Manager(gateway, tui)
         self.allowed = allowed
         self.tools: dict = {}
         self.hooks: dict = {}
         self.unload: list = []
         self.config: dict = dict(config or {})
+        # (content, origin) for a chat; (content, {"session_key": K}) for an
+        # app conversation.
         self.injected: list[tuple[str, dict]] = []
         self.inject_result = True
         self.on_inject = None
+        # The app conversations open in the app: Hermes's TUI host accepts a
+        # session_key only when a live session has it.
+        self.live_keys: set = set()
 
     def register_tool(self, name, toolset, schema, handler, check_fn=None,
                       requires_env=None, is_async=False, description="",
@@ -150,9 +167,15 @@ class Ctx:
 
     def inject_message(self, content, role="user", *, session_key=None,
                        origin=None):
-        self.injected.append((content, dict(origin or {})))
+        if session_key is not None:
+            if session_key not in self.live_keys:
+                return False                 # no live session has that key
+            where = {"session_key": session_key}
+        else:
+            where = dict(origin or {})
+        self.injected.append((content, where))
         if self.on_inject:
-            self.on_inject(content, dict(origin or {}))
+            self.on_inject(content, where)
         return self.inject_result
 
     def _gateway_injection_allowed(self):
@@ -171,7 +194,8 @@ class Ctx:
         return [in_turn(chat, cb, session_id=session_id, task_id="t",
                         turn_id="u", user_message=user_message,
                         conversation_history=[], is_first_turn=first,
-                        model="m", platform=chat.get("platform"),
+                        model="m",
+                        platform=chat.get("platform") or chat.get("source"),
                         parent_session_id=None,
                         sender_id=chat.get("user_id"))
                 for cb in self.hooks.get("pre_llm_call", [])]
@@ -225,6 +249,16 @@ CLI = {"platform": "cli", "chat_id": "", "chat_type": "", "thread_id": "",
        "user_id": "alice", "scope_id": ""}
 ON = {"enabled": True, "route": GROUP,
       "owner": {"platform": "x", "user_id": "alice"}}
+# Conversations in the Hermes desktop app: a key, and the app's own id.
+DESK = {"source": "desktop", "session_key": "20261013_120000_aaaaaa",
+        "ui": "a1b2c3d4"}
+DESK2 = {"source": "desktop", "session_key": "20261013_120500_bbbbbb",
+         "ui": "e5f6a7b8"}
+TUI = {"source": "tui", "session_key": "20261013_121000_eeeeee",
+       "ui": "0a0b0c0d"}
+DESK_ROUTE = {"surface": "desktop", "session_key": DESK["session_key"],
+              "ui_session_id": DESK["ui"]}
+DESK_ON = {"enabled": True, "route": DESK_ROUTE}
 
 
 def msg(i, text="hello"):
@@ -592,13 +626,250 @@ def main() -> int:
     fbb.close()
 
     served_artifact()
+    desktop()
 
     print()
     for f in fails:
         print("FAIL", f)
     print("FAILED" if fails else
-          "PASS — one chat, one owner, nothing acked until a turn has seen it")
+          "PASS — one chat or one app conversation, nothing acked until a "
+          "turn has seen it")
     return 1 if fails else 0
+
+
+def _no_tui_gateway():
+    for name in ("tui_gateway.server", "tui_gateway"):
+        sys.modules.pop(name, None)
+
+
+def desktop() -> None:
+    """A conversation in the Hermes DESKTOP APP as the route.
+
+    The app's backend (`hermes serve`, HERMES_DESKTOP set) publishes Hermes's
+    TUI/desktop injector, which queues text on a live session by its key. The
+    fake Ctx accepts a key only while it is in `live_keys` — open in the app.
+    """
+    saved = os.environ.get("HERMES_DESKTOP")
+    os.environ["HERMES_DESKTOP"] = "1"
+    try:
+        _desktop_route()
+        _desktop_hosts()
+        _desktop_owner()
+    finally:
+        _no_tui_gateway()
+        if saved is None:
+            os.environ.pop("HERMES_DESKTOP", None)
+        else:
+            os.environ["HERMES_DESKTOP"] = saved
+
+
+def _desktop_route() -> None:
+    fb = FakeBroker()
+    mod = load(fb.url)
+    mod.PEEK_S = 0.3
+    key = DESK["session_key"]
+    ctx = Ctx("bot", gateway=False, tui=True)
+    ctx.live_keys = {key}
+    start(mod, ctx)
+    inst = ctx_inst(ctx)
+    time.sleep(0.3)
+    check("desktop: off until asked — no broker request", fb.calls == [],
+          str(fb.calls))
+
+    out = ctx.call("enable_a2a_here", DESK, {"enabled": True})
+    check("desktop: 'enable a2a here' in an app conversation is accepted, "
+          "with no user id — the app is the bot's operator",
+          out.get("enabled") is True, str(out))
+    check("desktop: it pins that conversation by its key and by the app's id "
+          "for it", ctx.config.get("route") == DESK_ROUTE,
+          str(ctx.config.get("route")))
+    check("desktop: and the app's backend opens the stream at once",
+          until(lambda: "/stream" in fb.calls), str(fb.calls))
+
+    # --- delivery, by key -------------------------------------------------
+    fb.live.put(msg("d1"))
+    check("desktop: a message is queued on the conversation by its KEY — "
+          "never by origin, which is the gateway's",
+          until(lambda: "d1" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": key},
+          str(ctx.injected[-1:]))
+    content = ctx.injected[-1][0]
+    ctx.turn(DESK2, "s9", content)
+    time.sleep(0.3)
+    check("desktop: a turn in ANOTHER app conversation does not count",
+          "d1" not in fb.acked, str(fb.acked))
+    ctx.turn(DESK, "s1", content)
+    check("desktop: a turn in the route conversation shows it: acked",
+          until(lambda: "d1" in fb.acked), str(fb.acked))
+
+    # --- the tools ----------------------------------------------------------
+    check("desktop: the a2a tools work in the route conversation",
+          "error" not in json.dumps(ctx.call("whoami", DESK))[:40],
+          str(ctx.call("whoami", DESK))[:200])
+    other = ctx.call("whoami", DESK2)
+    chat = ctx.call("whoami", GROUP)
+    check("desktop: and refuse in another conversation and in a messaging "
+          "chat", isinstance(other, dict) and "error" in other
+          and isinstance(chat, dict) and "error" in chat,
+          f"{other} / {chat}")
+
+    # --- the brief: once per conversation session ----------------------------
+    first = ctx.turn(DESK, "s5", "hello")
+    again = ctx.turn(DESK, "s5", "hello")
+    check("desktop: the brief comes once per session, here too",
+          first and first[0] and "context" in first[0]
+          and again == [None], f"{first} / {again}")
+
+    # --- closed in the app: nothing goes in, nothing is lost -------------------
+    settle()
+    fb.quiet.set()
+    ctx.live_keys = set()
+    fb.live.put(msg("d2", "while you were away"))
+    check("closed: the app refuses it, so it is neither delivered nor acked",
+          until(lambda: inst._closed_since is not None)
+          and "d2" not in ctx.ids_injected() and "d2" not in fb.acked,
+          f"{ctx.ids_injected()} {fb.acked}")
+    st = ctx.call("a2a_channel_status", DESK)
+    check("closed: status says to open the conversation, and that messages "
+          "wait", "not open in the Hermes app" in (st.get("next_step") or ""),
+          str(st.get("next_step")))
+    streams = fb.streams
+    time.sleep(0.8)
+    check("closed: the stream stays shut, so the broker keeps new messages "
+          "undelivered", fb.streams == streams and not inst.state["connected"],
+          f"streams {streams}→{fb.streams}")
+    # One past the broker's replay window: only the peek still has it.
+    fb.aged.append(msg("d3", "from long ago"))
+    ctx.live_keys = {key}
+    ctx.turn(DESK, "s1", "back again")
+    check("reopened: a turn there shows it open, and what waited arrives — "
+          "including one the stream would never offer again",
+          until(lambda: {"d2", "d3"} <= set(ctx.ids_injected())),
+          str(ctx.ids_injected()))
+    for c, _ in [x for x in ctx.injected if 'id="d2"' in x[0]
+                 or 'id="d3"' in x[0]]:
+        ctx.turn(DESK, "s1", c)
+    check("reopened: each is acked once",
+          until(lambda: {"d2", "d3"} <= set(fb.acked))
+          and fb.acked.count("d2") == 1 and fb.acked.count("d3") == 1,
+          str(fb.acked))
+
+    # Closed again, then opened with no turn at all: the peek notices.
+    # (Keepalives on for a moment, so the handler of the stream closed above
+    # dies on a write instead of taking the next line.)
+    fb.quiet.clear()
+    settle()
+    fb.quiet.set()
+    ctx.live_keys = set()
+    fb.live.put(msg("d4"))
+    check("closed again: a message arriving meanwhile is refused",
+          until(lambda: inst._closed_since is not None, 3)
+          and "d4" not in ctx.ids_injected(), str(ctx.ids_injected()))
+    ctx.live_keys = {key}
+    check("reopened: with no turn, the periodic peek finds it open",
+          until(lambda: "d4" in ctx.ids_injected(), 4),
+          str(ctx.ids_injected()))
+    ctx.turn(DESK, "s1", [c for c, _ in ctx.injected if 'id="d4"' in c][0])
+    until(lambda: "d4" in fb.acked)
+
+    # --- Hermes compresses the conversation: its key rotates ----------------
+    new_key = "20261013_130000_cccccc"
+    srv = types.ModuleType("tui_gateway.server")
+    srv._sessions_lock = threading.Lock()
+    srv._sessions = {DESK["ui"]: {"session_key": new_key}}
+    pkg = types.ModuleType("tui_gateway")
+    pkg.server = srv
+    sys.modules.update({"tui_gateway": pkg, "tui_gateway.server": srv})
+    ctx.live_keys = {new_key}
+    fb.quiet.clear()
+    settle()
+    fb.quiet.set()
+    fb.live.put(msg("d5"))
+    check("compressed: the conversation's new key is found by the app's id, "
+          "and the message goes in under it",
+          until(lambda: "d5" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": new_key}
+          and (ctx.config.get("route") or {}).get("session_key") == new_key,
+          f"{ctx.injected[-1:]} {ctx.config.get('route')}")
+    ctx.turn(dict(DESK, session_key=new_key), "s1", ctx.injected[-1][0])
+    check("compressed: a turn under the new key acks it",
+          until(lambda: "d5" in fb.acked), str(fb.acked))
+    newer = dict(DESK, session_key="20261013_140000_dddddd")
+    ctx.turn(newer, "s1", "x")
+    check("compressed: a turn under yet another key, same app id, is followed",
+          (ctx.config.get("route") or {}).get("session_key")
+          == newer["session_key"], str(ctx.config.get("route")))
+    _no_tui_gateway()
+    stop(ctx)
+    fb.close()
+
+
+def _desktop_hosts() -> None:
+    """Exactly one process may hold a bot's stream: the gateway for a chat,
+    the app's backend for an app conversation."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+    for label, kw, env, cfg in (
+            ("an app route in the bot's GATEWAY",
+             dict(gateway=True, tui=False), "1", DESK_ON),
+            ("an app route in a TUI process (no HERMES_DESKTOP)",
+             dict(gateway=False, tui=True), "", DESK_ON),
+            ("a chat route in the APP's backend",
+             dict(gateway=False, tui=True), "1", ON)):
+        os.environ["HERMES_DESKTOP"] = env
+        fb.calls.clear()
+        c = Ctx("bot", config=cfg, **kw)
+        start(mod, c)
+        time.sleep(0.4)
+        check(f"host: {label} → zero broker requests", fb.calls == [],
+              str(fb.calls))
+        stop(c)
+    os.environ["HERMES_DESKTOP"] = "1"
+    fb.close()
+
+
+def _desktop_owner() -> None:
+    fb = FakeBroker()
+    mod = load(fb.url)
+    c = Ctx("bot", gateway=True, tui=True, config=ON)
+    c.live_keys = {DESK["session_key"]}
+    start(mod, c)
+    out = c.call("enable_a2a_here", DESK, {"enabled": True})
+    check("owner: the app takes a2a from a chat",
+          out.get("enabled") is True
+          and (c.config.get("route") or {}).get("surface") == "desktop",
+          str(out))
+    check("owner: and the chat's owner is kept, to move it back later",
+          c.config.get("owner") == {"platform": "x", "user_id": "alice"},
+          str(c.config.get("owner")))
+    out = c.call("enable_a2a_here", BOB, {"enabled": True})
+    check("owner: someone else in the chat cannot take it",
+          "error" in out, str(out))
+    out = c.call("enable_a2a_here", ALICE, {"enabled": True})
+    check("owner: the chat's owner can move it back to their chat",
+          out.get("enabled") is True and c.config.get("route") == GROUP,
+          str(out))
+    stop(c)
+
+    c = Ctx("bot", gateway=True, tui=True)
+    c.live_keys = {DESK["session_key"]}
+    start(mod, c)
+    c.call("enable_a2a_here", DESK, {"enabled": True})
+    out = c.call("enable_a2a_here", BOB, {"enabled": True})
+    check("owner: on in the app with no chat owner, nobody in a chat can "
+          "take it", "error" in out and "Hermes app" in out["error"],
+          str(out))
+    c.call("enable_a2a_here", DESK, {"enabled": False})
+    out = c.call("enable_a2a_here", BOB, {"enabled": True})
+    check("owner: once the app turns it off, a chat user can turn it on and "
+          "owns it", out.get("enabled") is True
+          and c.config.get("owner") == {"platform": "x", "user_id": "bob"},
+          str(out))
+    out = c.call("enable_a2a_here", TUI, {"enabled": True})
+    check("owner: a terminal UI session is refused, and told where a2a can "
+          "run", "error" in out and "Hermes app" in out["error"], str(out))
+    stop(c)
+    fb.close()
 
 
 def served_artifact() -> None:
