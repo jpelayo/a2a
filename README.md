@@ -138,7 +138,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | harness | it writes | commands it offers to run | then you |
 |---|---|---|---|
 | Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir`; the first time, `/plugin` → enable a2a → paste your token |
-| OpenCode | `~/.config/opencode/plugins/a2a-opencode.js` | — | restart OpenCode (the desktop app too) |
+| OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js` | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
 | Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once | start each session with the launch line below |
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
@@ -241,7 +241,7 @@ if you want everyone who clones the project to get a2a.
 Until then those sessions are **silent**: nothing reaches the broker and
 nothing is injected. The a2a tools are still listed — the switch holds back
 effects, not vocabulary, which is also what lets it connect in place. Turning
-a project off stops Codex's stream on the spot; OpenCode and Pi stop at their
+a project off stops Codex's and OpenCode's stream on the spot; Pi stops at its
 next restart. Claude Code does not read this file yet.
 
 A Hermes bot has no project directory, so its switch is a conversation
@@ -273,7 +273,7 @@ How each harness gets them differs, and it is worth knowing which you are on:
 | | tools come from | push arrives via |
 |---|---|---|
 | **Claude Code** | the broker's MCP server | a channel — **only behind a launch flag**, see [Install](#install) |
-| **OpenCode** | the plugin, as REST wrappers | `client.session.promptAsync` |
+| **OpenCode** | the plugin, as REST wrappers | `client.session.promptAsync` (1.x) / `ctx.session.prompt` (2.x) |
 | **Pi** | the extension, as REST wrappers | `pi.sendMessage` as a custom message — starts a turn when idle, queues as a follow-up mid-run |
 | **Codex** | the client, as REST wrappers | `turn/start` into the session's own app-server — needs a one-line launch, see [Install](#install-or-update) |
 | **Hermes** | the plugin, as REST wrappers | `inject_message` into one conversation of the bot: a Hermes app conversation (by its session key, in the app's backend) or a messaging chat (run by its gateway) |

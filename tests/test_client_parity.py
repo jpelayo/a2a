@@ -86,10 +86,13 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def opencode_tools() -> set[str]:
-    """Names in the `tool: { … }` object of the OpenCode plugin."""
+    """Names in the `const tools = { … }` table of the OpenCode plugin — the
+    one table both entry points hand over (V1 as `tool`, V2 through
+    ctx.tool.transform)."""
     src = OPENCODE.read_text()
-    body = src[src.index("    tool: {"):]
-    return set(re.findall(r"^      ([a-z_][a-z0-9_]*): \{", body, re.M))
+    start = src.index("\n  const tools = {\n")
+    body = src[start:src.index("\n  }\n", start)]
+    return set(re.findall(r"^    ([a-z_][a-z0-9_]*): \{", body, re.M))
 
 
 def pi_tools() -> set[str]:
@@ -169,6 +172,8 @@ def status_shapes() -> dict:
         i = src.index("async function statusReport")
         body = _re.sub(r"^  ", "", src[i:src.index("\n  }", i) + 4], flags=_re.M)
         pre = ('const key="x", name="x", toAck=new Set(), LOG="/tmp/x.log";\n'
+               'const ENABLED=true, PROJECT_FILE="/tmp/.a2a.json", '
+               'ENABLE_KEY="enabled_x";\n'
                'const BAKED={version:"0"};\n'
                'const pumpState={connected:true,lastLine:Date.now(),'
                'delivered:0,lastError:null,last:null};\n'

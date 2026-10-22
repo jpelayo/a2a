@@ -16,9 +16,12 @@ session that did not ask for a2a. Keeping the tools is also what lets
 enable_a2a_here connect the session you ask in, with no restart: there is
 nothing to wait for, because the tools are already under it.
 
-The OpenCode half RUNS the real plugin — imports it, stubs fetch, calls A2A()
-against temp directories — because a source grep would pass a client that
-reads the file and ignores it. The Codex half runs the real client as a
+The OpenCode half RUNS the real plugin — imports it, stubs fetch, and calls
+both entry points of its default export against temp directories: server()
+the way OpenCode V1 does, setup(ctx) the way V2 does — because a source grep
+would pass a client that reads the file and ignores it. It also pins what V2
+added: the cleanup setup() returns, and the switch, close the stream they
+leave behind, and switching off and on never opens a second one. The Codex half runs the real client as a
 process against a fake broker that counts every request, and drives its pump
 in-process to prove that turning a project OFF stops delivery. Pi cannot be
 imported here (typebox is not installed), so its half is source-level, the
@@ -64,7 +67,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 HARNESS = r"""
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 
 // URL_BASE and TOKEN are read at MODULE scope, so credentials have to exist
 // before the import or the plugin bails for want of them and never reaches
@@ -72,20 +75,54 @@ import { join } from "node:path"
 process.env.A2A_URL = "http://broker.invalid"
 process.env.A2A_TOKEN = "t"
 process.env.A2A_HELLO = "0"
+// Under V2 the plugin keeps its own log, in OpenCode's data directory: keep
+// that out of the real $HOME.
+process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), "a2a-gate-data-"))
 delete process.env.A2A_AGENT
 
 let calls = []
-globalThis.fetch = async (url) => {
+// Every /stream the plugin opened, by agent (each case's temp directory name,
+// so cases cannot see each other's), and whether it is still open. A stream
+// closes the way a real one does: its read rejects when the fetch's signal
+// aborts. "Off closes it" and "one pump" are statements about these.
+const streams = []
+globalThis.fetch = async (url, init = {}) => {
   const path = String(url).replace("http://broker.invalid", "")
-  calls.push(path)
+  // Who made the call: its X-A2A-Agent, or the stream's ?agent=. Each case's
+  // agent is its own temp directory's name, so a pump from an EARLIER case
+  // reconnecting on schedule is not counted against a later one. A call that
+  // names no agent at all is counted against every case.
+  calls.push({
+    path,
+    agent: init.headers?.["X-A2A-Agent"]
+      || new URL(String(url)).searchParams.get("agent") || "",
+  })
   const ok = (b) => ({ ok: true, status: 200,
     text: async () => JSON.stringify(b), json: async () => b })
   if (path === "/me") return ok({ agent: "x", registered: true })
   if (path === "/channels") return ok({ channels: [] })
-  if (path.startsWith("/stream"))
-    return { ok: true, status: 200,
-             body: { getReader: () => ({ read: () => new Promise(() => {}) }) } }
+  if (path.startsWith("/stream")) {
+    const s = { agent: new URL(String(url)).searchParams.get("agent"), open: true }
+    streams.push(s)
+    const signal = init.signal
+    const read = () => new Promise((_, reject) => {
+      const fail = () => {
+        s.open = false
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+      }
+      if (signal?.aborted) return fail()
+      signal?.addEventListener("abort", fail, { once: true })
+    })
+    return { ok: true, status: 200, body: { getReader: () => ({ read }) } }
+  }
   return ok({})
+}
+const callsOf = (dir) => calls
+  .filter((c) => c.agent === basename(dir) || c.agent === "")
+  .map((c) => c.path)
+const opened = (dir) => {
+  const mine = streams.filter((s) => s.agent === basename(dir))
+  return { total: mine.length, open: mine.filter((s) => s.open).length }
 }
 
 const prompts = []
@@ -101,7 +138,8 @@ const client = {
   },
 }
 
-const { A2A } = await import(PLUGIN_PATH)
+const mod = await import(PLUGIN_PATH)
+const plugin = mod.default
 const settle = () => new Promise((r) => setTimeout(r, 1200))
 
 const project = (contents) => {
@@ -114,40 +152,137 @@ const project = (contents) => {
 const run = async (contents) => {
   calls = []; prompts.length = 0
   const d = project(contents)
-  const s = await A2A({ client, directory: d })
+  const s = await plugin.server({ client, directory: d })
   await settle()
   return { dir: d, s, tools: Object.keys(s.tool || {}),
-           event: "event" in s, calls: [...calls], prompts: [...prompts] }
+           event: "event" in s, calls: callsOf(d), prompts: [...prompts] }
 }
 
+// --- V2: the smallest ctx setup() uses, recording what it is asked -----------
+const v2prompts = []
+const v2ctx = (d) => {
+  const added = []
+  const listed = []
+  const ctx = {
+    app: { name: "opencode", version: "2.1.3", channel: "latest" },
+    location: { directory: d, project: { id: "p", directory: d, canonical: d } },
+    options: {},
+    tool: {
+      transform: async (cb) => {
+        cb({ add: (t) => added.push(t) })
+        return { dispose: async () => {} }
+      },
+    },
+    // An event stream that stays quiet until it is aborted, as an idle
+    // server's does.
+    event: {
+      subscribe: ({ signal } = {}) => ({
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise((resolve) => {
+              const end = () => resolve({ done: true, value: undefined })
+              if (signal?.aborted) return end()
+              signal?.addEventListener("abort", end, { once: true })
+            }),
+            return: async () => ({ done: true, value: undefined }),
+          }
+        },
+      }),
+    },
+    session: {
+      list: async (q) => {
+        listed.push(q)
+        return { data: [{ id: "ses_x", time: { updated: 1 },
+                          location: { directory: d } }], cursor: {} }
+      },
+      prompt: async (input) => {
+        prompts.push(input?.text || "")
+        v2prompts.push(input)
+        return { id: "msg_x" }
+      },
+    },
+  }
+  return { ctx, added, listed }
+}
+const runV2 = async (contents) => {
+  calls = []; prompts.length = 0; v2prompts.length = 0
+  const d = project(contents)
+  const { ctx, added, listed } = v2ctx(d)
+  const cleanup = await plugin.setup(ctx)
+  await settle()
+  const tool = (n) => added.find((t) => t.name === n)
+  return { dir: d, cleanup, added, tool, listed: [...listed],
+           tools: added.map((t) => t.name), calls: callsOf(d),
+           prompts: [...prompts], v2prompts: [...v2prompts] }
+}
+
+const cases = async (go) => ({
+  absent: await go(null),
+  false_: await go({ enabled_opencode: false }),
+  stringy: await go({ enabled_opencode: "true" }),
+  // Pi's key must not speak for OpenCode: one directory, several harnesses,
+  // each its own agent.
+  other: await go({ enabled_pi: true }),
+  bare: await go({ enabled: true }),
+  on: await go({ enabled_opencode: true }),
+})
+
 const out = {}
-out.absent = await run(null)
-out.false_ = await run({ enabled_opencode: false })
-out.stringy = await run({ enabled_opencode: "true" })
-// Pi's key must not speak for OpenCode: one directory, several harnesses,
-// each its own agent.
-out.other = await run({ enabled_pi: true })
-out.bare = await run({ enabled: true })
-out.on = await run({ enabled_opencode: true })
+const v1 = await cases(run)
 
 // The switch: writes, merges, and connects in place.
 const off = await run({ catchup: 42, enabled_pi: true })
 calls = []
 out.wrote = JSON.parse(await off.s.tool.enable_a2a_here.execute({ enabled: true }))
 await settle()
-out.after_enable = [...calls]
+out.after_enable = callsOf(off.dir)
 out.file = JSON.parse(readFileSync(join(off.dir, ".a2a.json"), "utf8"))
 out.off_again = JSON.parse(await off.s.tool.enable_a2a_here.execute({ enabled: false }))
+await settle()
+// Off closes the stream that was open — not just the next one.
+out.off_closed = opened(off.dir)
+
+// "On" twice under a live stream: still ONE stream.
+const twice = await run({ enabled_opencode: true })
+await twice.s.tool.enable_a2a_here.execute({ enabled: true })
+// Off and straight back on: the old stream closes, exactly one is open after.
+const flip = await run({ enabled_opencode: true })
+await flip.s.tool.enable_a2a_here.execute({ enabled: false })
+await flip.s.tool.enable_a2a_here.execute({ enabled: true })
+
+const v2 = await cases(runV2)
+// The brief in V2 is a prompt that starts no turn, into the session asked of
+// the server for THIS directory, roots only.
+out.v2_brief = v2.on.v2prompts[0] || null
+out.v2_listed = v2.on.listed[0] || null
+out.v2_tools = v2.on.added.map((t) => ({
+  name: t.name, codemode: t.options?.codemode, input: t.input,
+  description: typeof t.description,
+}))
+out.v2_enable = JSON.parse(
+  (await v2.absent.tool("enable_a2a_here").execute({ enabled: true })).content)
+await settle()
+out.v2_enable_opened = opened(v2.absent.dir)
+await v2.absent.tool("enable_a2a_here").execute({ enabled: false })
+await settle()
+out.v2_off_closed = opened(v2.absent.dir)
+// Unload, as V2 does on reload: what setup returned must close the stream.
+out.v2_before_cleanup = opened(v2.on.dir)
+await v2.on.cleanup()
+await settle()
+
+// Past RECONNECT_MS, so a pump that survived its stop would have reconnected.
+await new Promise((r) => setTimeout(r, 6500))
+out.v2_after_cleanup = opened(v2.on.dir)
+out.off_after_wait = opened(off.dir)
+out.twice = opened(twice.dir)
+out.flip = opened(flip.dir)
 
 const strip = (r) => ({ tools: r.tools, event: r.event,
                         calls: r.calls, prompts: r.prompts })
-console.log("@@" + JSON.stringify({
-  absent: strip(out.absent), false_: strip(out.false_),
-  stringy: strip(out.stringy), other: strip(out.other),
-  bare: strip(out.bare), on: strip(out.on),
-  wrote: out.wrote, after_enable: out.after_enable,
-  file: out.file, off_again: out.off_again,
-}))
+const each = (c) => Object.fromEntries(
+  Object.entries(c).map(([k, r]) => [k, strip(r)]))
+console.log("@@" + JSON.stringify({ v1: each(v1), v2: each(v2), ...out }))
 process.exit(0)
 """
 
@@ -411,34 +546,109 @@ def codex_off_stops_the_stream() -> dict:
 def main() -> int:
     oc = run_opencode()
 
-    for label, key in (("no .a2a.json at all", "absent"),
-                       ('{"enabled_opencode": false}', "false_"),
-                       ('{"enabled_opencode": "true"} — a STRING, which must '
-                        "not count: the switch fails closed", "stringy"),
-                       ('{"enabled_pi": true} — ANOTHER client\'s key, which '
-                        "must not speak for this one", "other"),
-                       ('{"enabled": true} — the bare key names no client, '
-                        "so it enables none", "bare")):
-        got = oc[key]
-        check(f"opencode: {label} → NOTHING reaches the broker",
-              got["calls"] == [], str(got["calls"]))
-        check(f"opencode: {label} → nothing is injected into the session — "
-              "no hello, no brief, no setup hint",
-              got["prompts"] == [], str(got["prompts"]))
-        check(f"opencode: {label} → but every tool is still registered: the "
-              "switch holds back effects, not vocabulary",
-              len(got["tools"]) > 1 and "enable_a2a_here" in got["tools"],
-              str(got["tools"]))
+    # The same gate under both OpenCodes: V1 calls default.server(), V2 calls
+    # default.setup(ctx), and a project that did not opt in must look the
+    # same from the broker's side either way.
+    for host in ("v1", "v2"):
+        got_all = oc[host]
+        for label, key in (("no .a2a.json at all", "absent"),
+                           ('{"enabled_opencode": false}', "false_"),
+                           ('{"enabled_opencode": "true"} — a STRING, which '
+                            "must not count: the switch fails closed",
+                            "stringy"),
+                           ('{"enabled_pi": true} — ANOTHER client\'s key, '
+                            "which must not speak for this one", "other"),
+                           ('{"enabled": true} — the bare key names no '
+                            "client, so it enables none", "bare")):
+            got = got_all[key]
+            check(f"opencode {host}: {label} → NOTHING reaches the broker",
+                  got["calls"] == [], str(got["calls"]))
+            check(f"opencode {host}: {label} → nothing is injected into the "
+                  "session — no hello, no brief, no setup hint",
+                  got["prompts"] == [], str(got["prompts"]))
+            check(f"opencode {host}: {label} → but every tool is still "
+                  "registered: the switch holds back effects, not vocabulary",
+                  len(got["tools"]) > 1 and "enable_a2a_here" in got["tools"],
+                  str(got["tools"]))
 
-    check('opencode: {"enabled_opencode": true} connects — /me and then '
-          'the stream',
-          "/me" in oc["on"]["calls"]
-          and any(c.startswith("/stream") for c in oc["on"]["calls"]),
-          str(oc["on"]["calls"]))
-    check("opencode: an enabled project registers the same tools as a "
-          "disabled one, so nothing about the surface depends on the switch",
-          sorted(oc["on"]["tools"]) == sorted(oc["absent"]["tools"]),
-          f'on: {oc["on"]["tools"]} vs off: {oc["absent"]["tools"]}')
+        check(f'opencode {host}: {{"enabled_opencode": true}} connects — /me '
+              "and then the stream",
+              "/me" in got_all["on"]["calls"]
+              and any(c.startswith("/stream") for c in got_all["on"]["calls"]),
+              str(got_all["on"]["calls"]))
+        check(f"opencode {host}: an enabled project registers the same tools "
+              "as a disabled one, so nothing about the surface depends on "
+              "the switch",
+              sorted(got_all["on"]["tools"])
+              == sorted(got_all["absent"]["tools"]),
+              f'on: {got_all["on"]["tools"]} vs '
+              f'off: {got_all["absent"]["tools"]}')
+
+    check("opencode: V1 and V2 register the SAME tools — one vocabulary, "
+          "whichever OpenCode runs it",
+          sorted(oc["v1"]["on"]["tools"]) == sorted(oc["v2"]["on"]["tools"]),
+          f'v1: {oc["v1"]["on"]["tools"]} vs v2: {oc["v2"]["on"]["tools"]}')
+
+    # --- what V2 needs of a tool, read from its source ------------------------
+    v2t = oc["v2_tools"]
+    check("opencode v2: every tool says codemode:false — without it V2 hides "
+          "it behind one `execute` tool, and the brief's 'call "
+          "post_to_channel' names a tool the model does not have",
+          v2t and all(t["codemode"] is False for t in v2t),
+          str([t["name"] for t in v2t if t["codemode"] is not False]))
+    check("opencode v2: every input is a JSON Schema object with no type "
+          "arrays — an optional arg is simply not required",
+          all(t["input"].get("type") == "object"
+              and all(isinstance(p.get("type"), str)
+                      for p in t["input"]["properties"].values())
+              for t in v2t), str(v2t)[:400])
+    post = next((t for t in v2t if t["name"] == "post_to_channel"), None)
+    check("opencode v2: and `required` is exactly the non-nullable args",
+          post is not None
+          and sorted(post["input"]["required"]) == ["name", "text"],
+          str(post))
+
+    brief = oc["v2_brief"] or {}
+    check("opencode v2: the brief is a prompt that starts NO turn "
+          "(resume:false is V1's noReply), steered into the session the "
+          "server named",
+          brief.get("sessionID") == "ses_x" and brief.get("resume") is False
+          and brief.get("delivery") == "steer"
+          and "ADDRESSING IS AN ARGUMENT" in (brief.get("text") or ""),
+          str(brief)[:300])
+    listed = oc["v2_listed"] or {}
+    check("opencode v2: sessions are asked for by directory and roots only — "
+          "V2 sessions carry location.directory, so V1's filter would pass "
+          "every project's",
+          listed.get("directory", "").startswith("/")
+          and "parentID" in listed and listed["parentID"] is None,
+          str(listed))
+    check("opencode v2: enable_a2a_here answers through {content} and "
+          "connects in place",
+          oc["v2_enable"].get("enabled") is True
+          and oc["v2_enable_opened"]["open"] == 1, str(oc["v2_enable_opened"]))
+    check("opencode v2: and off closes that stream on the spot",
+          oc["v2_off_closed"]["open"] == 0, str(oc["v2_off_closed"]))
+    check("opencode v2: unloading — what setup() returned — closes the "
+          "stream, and nothing reconnects after it: V2 reloads a plugin when "
+          "the installer rewrites it, and a survivor would split the inbox "
+          "with its replacement",
+          oc["v2_before_cleanup"]["open"] == 1
+          and oc["v2_after_cleanup"] == {"total": 1, "open": 0},
+          f'before={oc["v2_before_cleanup"]} after={oc["v2_after_cleanup"]}')
+
+    # --- off stops what is running; on never doubles it (V1, same core) -------
+    check("opencode: turning a project OFF closes the stream that was open, "
+          "and it stays closed",
+          oc["off_closed"]["open"] == 0
+          and oc["off_after_wait"]["open"] == 0
+          and oc["off_after_wait"]["total"] == oc["off_closed"]["total"],
+          f'at off={oc["off_closed"]} later={oc["off_after_wait"]}')
+    check("opencode: saying ON twice under a live stream opens no second "
+          "stream",
+          oc["twice"] == {"total": 1, "open": 1}, str(oc["twice"]))
+    check("opencode: off and straight back on leaves exactly ONE stream open",
+          oc["flip"]["open"] == 1, str(oc["flip"]))
 
     check("opencode: the switch writes the file it is named for",
           oc["wrote"]["enabled"] is True

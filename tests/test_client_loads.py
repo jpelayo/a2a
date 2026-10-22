@@ -50,11 +50,17 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def imports_as_module(path: Path) -> tuple[bool, str]:
-    """Import a JS file exactly as its harness would: dynamically, as ESM."""
+    """Import a JS file exactly as its harness would: dynamically, as ESM.
+
+    The detail is the export names, then what `default` holds — its id and
+    the type of its two entry points — since that is all either OpenCode
+    reads: V1 takes `default.server`, V2 takes `default.setup`."""
     res = subprocess.run(
         ["node", "--input-type=module", "-e",
          f"import({str(path)!r}).then(m => console.log('@@' + "
-         f"Object.keys(m).join(','))).catch(e => {{ "
+         f"Object.keys(m).join(',') + '|' + (m.default ? [m.default.id, "
+         f"typeof m.default.server, typeof m.default.setup].join(',') : '')))"
+         f".catch(e => {{ "
          f"console.log('!!' + e.constructor.name + ': ' + e.message); "
          f"process.exitCode = 1 }})"],
         capture_output=True, text=True, timeout=90,
@@ -109,10 +115,14 @@ def main() -> int:
     # --- OpenCode: the one that broke. It has no dependencies, so the real
     # harness load can be reproduced exactly.
     ok, detail = imports_as_module(OPENCODE)
-    check("opencode: the plugin IMPORTS and exports A2A — a function declared "
-          "inside the returned object literal made this fail while every "
-          "other check passed",
-          ok and "A2A" in detail, detail)
+    check("opencode: the plugin IMPORTS — a function declared inside an "
+          "object literal made this fail while every other check passed",
+          ok, detail)
+    check("opencode: and its ONLY export is default {id, server, setup} — V2 "
+          "rejects a module without a default {id, setup} and loaded nothing "
+          "from the bare `export const A2A` this used to be; V1 1.18.28+ "
+          "reads default.server; a second export could start it twice",
+          ok and detail == "default|a2a,function,function", detail)
 
     # --- Pi: typebox is not installed here, so a full import cannot resolve.
     # Module-goal parsing is the part that matters and is available.
@@ -124,9 +134,11 @@ def main() -> int:
     # --- and prove the gate is real, rather than trusting it -----------------
     src = OPENCODE.read_text()
     i = src.index("  // One call an agent can make to orient itself")
-    j = src.index("\n  return {\n    event:", i)
+    j = src.index("\n  /** What an event says", i)
     block, rest = src[i:j], src[j:]
-    broken = (src[:i] + rest.replace("\n    tool: {", "\n" + block + "\n    tool: {", 1))
+    broken = (src[:i] + rest.replace("\n  const tools = {\n",
+                                     "\n  const tools = {\n" + block + "\n", 1))
+    assert broken != src[:i] + rest, "the tool table anchor moved"
     tmp = Path(tempfile.mkdtemp(prefix="a2a-broken-")) / "broken.js"
     tmp.write_text(broken)
     still_ok, _ = imports_as_module(tmp)

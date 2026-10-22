@@ -945,8 +945,11 @@ def next_steps(targets, pending, hermes_touched):
                            "like this to receive messages:"),
                           f"   {CODEX_LAUNCH}"])
         elif key in changed and key not in first:
+            # OpenCode 2 watches its plugin files and reloads a changed one by
+            # itself; 1.x loads them once per process, so it needs a restart.
             steps.append([f"{NAMES[key]}: restart running sessions"
-                          + (" and the desktop app" if key == "opencode"
+                          + (" and the desktop app (OpenCode 2 reloads the "
+                             "plugin by itself)" if key == "opencode"
                              else "") + "."])
     if hermes_touched:
         steps.append(["Hermes: quit the Hermes app and open it again, so it "

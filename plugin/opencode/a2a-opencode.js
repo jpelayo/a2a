@@ -18,9 +18,20 @@
  *   tools — the six calls needed to take part, as thin fetch wrappers over the
  *           broker's REST routes.
  *
+ * ONE FILE, BOTH OPENCODES. The default export carries two entry points over
+ * one plugin: `server()` for OpenCode V1, whose loader (1.18.28 and later)
+ * reads `default.server` and ignores the rest, and `setup(ctx)` for V2, whose
+ * loader accepts NOTHING but a default `{id, setup}`. This file used to be a
+ * bare `export const A2A`, and V2 rejected it outright: no tools, no stream,
+ * no log line. The named export is gone on purpose — a V1 legacy path walks
+ * every export, so keeping both could start the plugin twice. Both adapters
+ * are thin: the plugin itself is `core(host)`, and a host is four things — a
+ * directory, a logger, a session list and a way to prompt a session.
+ *
  * Zero imports on purpose. `tool()` from @opencode-ai/plugin is the identity
  * function and its schema helper only feeds a JSON-Schema converter, so plain
- * objects work and this file needs no node_modules to resolve.
+ * objects work and this file needs no node_modules to resolve. V2 takes JSON
+ * Schema directly (see jsonInput below).
  *
  * Config, in order of precedence: the A2A_BAKED object the installer prepends,
  * then the environment (A2A_URL / A2A_TOKEN / A2A_STATION). A2A_AGENT is the
@@ -94,6 +105,10 @@ const PROMPT_TIMEOUT_MS =
 // letting the events take over.
 const BRIEF_RETRY_MS = 2_000
 const BRIEF_GIVE_UP_MS = 30_000
+// V2 only: this client's own log file is capped, like Pi's. It is the one
+// record of what the client did, but it must not grow without bound on a
+// machine that runs OpenCode daily. The recent past is what diagnoses a hang.
+const LOG_MAX_BYTES = Number(process.env.A2A_LOG_MAX_BYTES || 65536)
 
 // `name` is what the BROKER resolves this session to (GET /me), never the
 // directory key: post_to_channel signs messages with it, so briefing the model
@@ -225,7 +240,40 @@ function envelope(m) {
   return `<channel ${bits.join(" ")}>${m.text}</channel>`
 }
 
-export const A2A = async ({ client, directory }) => {
+/** A V1 `args` table as the JSON Schema object V2 wants for a tool's input.
+ *
+ *  V1's conversion made every declared arg required, so the optional ones are
+ *  declared nullable — `type: [T, "null"]` — and say so in their description.
+ *  V2 takes the schema as written, so there they are simply optional: the
+ *  union drops to its one real type and the arg leaves `required`. No type
+ *  arrays reach V2's converter that way, and every execute below already
+ *  treats a missing arg exactly like a null one. */
+function jsonInput(args) {
+  const properties = {}
+  const required = []
+  for (const [k, s] of Object.entries(args)) {
+    const types = [].concat(s.type)
+    const real = types.filter((t) => t !== "null")
+    properties[k] = { ...s, type: real.length === 1 ? real[0] : real }
+    if (real.length === types.length) required.push(k)
+  }
+  return { type: "object", properties, required }
+}
+
+/** The plugin, whichever OpenCode runs it.
+ *
+ *  `host` is what differs between V1 and V2, and nothing else may:
+ *    directory          the project this instance serves
+ *    kind               "V1" or "V2", for the log
+ *    log(level, msg)    optional; without it this client logs to its own file
+ *    logFile            where status says the log is, when `log` is given
+ *    sessions()         sessions as [{id, parentID, directory, time}]
+ *    prompt(id, text, {noReply})   hand a text to a session; resolves on accept
+ *
+ *  Returns null when there is nothing to run (no url or token), else
+ *  {tools, onEvent, stop, log, sleep}. */
+async function core(host) {
+  const directory = host.directory
   // TWO identities, deliberately. `key` is what we SEND — the project
   // directory, stable forever, which the broker resolves through its alias
   // table. `name` is what we ARE, learned from GET /me, and it is the only
@@ -361,14 +409,45 @@ export const A2A = async ({ client, directory }) => {
     ? parseInt(pick("catchup", "A2A_CATCHUP", "catchup", CATCHUP_DEFAULT), 10) || 0
     : 0
 
-  const log = (level, message) =>
-    client.app.log({ body: { service: "a2a", level, message } }).catch(() => {})
+  // --- the log -------------------------------------------------------------
+  // V1 hands a plugin the host's logger (client.app.log), which lands in
+  // OpenCode's own log under service "a2a". V2 hands a promise plugin no
+  // logger at all — ctx.app is only {name, version, channel} — so there this
+  // client keeps its own file, the way Pi does. Under OpenCode's DATA
+  // directory, never its config directory: V2 watches config and reloads
+  // plugins when it changes, and a log written there could reload this
+  // plugin on every line. Per agent when the id was chosen: the cap below
+  // rewrites the whole file, so two processes sharing one log can drop each
+  // other's lines wholesale.
+  const DATA = process.env.XDG_DATA_HOME
+    || `${process.env.HOME || "."}/.local/share`
+  const LOG = host.logFile
+    || `${DATA}/opencode/log/a2a${explicit ? `-${slug(key)}` : ""}.log`
+  let logging = Promise.resolve()
+  const fileLog = (level, message) => {
+    const line = `${new Date().toISOString()} ${level} ${message}\n`
+    logging = logging
+      .then(() => fs.mkdir(LOG.replace(/\/[^/]*$/, ""), { recursive: true }))
+      .then(() => fs.appendFile(LOG, line))
+      .then(async () => {
+        const { size } = await fs.stat(LOG)
+        if (size <= LOG_MAX_BYTES) return
+        const kept = (await fs.readFile(LOG, "utf8")).slice(-LOG_MAX_BYTES / 2)
+        await fs.writeFile(
+          LOG,
+          `... earlier lines dropped (log capped at ${LOG_MAX_BYTES} bytes)\n` +
+            kept.slice(kept.indexOf("\n") + 1),
+        )
+      })
+      .catch(() => {})
+  }
+  const log = host.log || fileLog
 
   // Loaded. Said out loud because "no a2a tools in this session" has two
   // causes that look identical from inside it: this file failed to load at
   // all (a syntax error registers nothing and reports nothing), or it loaded
   // and bailed for want of credentials. One line in the log tells them apart.
-  log("info", `a2a plugin loaded (version ${BAKED.version || "?"})`)
+  log("info", `a2a plugin loaded (version ${BAKED.version || "?"}, OpenCode ${host.kind})`)
   if (!ENABLED) {
     log("info",
         `a2a is off in ${directory}: ${PROJECT_FILE} does not say `
@@ -382,7 +461,36 @@ export const A2A = async ({ client, directory }) => {
                  + ", so NO a2a tools are registered: reinstall with "
                  + "your broker's installer: curl -fsSL <broker>/install "
                  + "| python3")
-    return {}
+    return null
+  }
+
+  // --- stopping --------------------------------------------------------------
+  // Everything this instance starts has to be stoppable. V2 reloads a plugin
+  // when its file changes — which is exactly what the installer does — and
+  // calls the cleanup setup() returned. Without a stop, the old pump keeps
+  // streaming next to the new one: two readers of one agent's destructive-read
+  // inbox, each injecting, with stale code, the half the other did not get.
+  let stopped = false
+  const halt = new AbortController()
+  // The live /stream connection, so turning a2a off can close it on the spot.
+  let stream = null
+  /** setTimeout that ends early when the instance stops. */
+  const sleep = (ms) => new Promise((resolve) => {
+    if (halt.signal.aborted) return resolve()
+    const done = () => {
+      clearTimeout(timer)
+      halt.signal.removeEventListener("abort", done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    halt.signal.addEventListener("abort", done, { once: true })
+  })
+  function stop() {
+    if (stopped) return
+    stopped = true
+    halt.abort()
+    stream?.abort()
+    log("info", "a2a plugin unloaded: stream closed")
   }
 
   // --- broker calls --------------------------------------------------------
@@ -479,8 +587,7 @@ export const A2A = async ({ client, directory }) => {
    *  than being wrong. */
   async function currentSession() {
     try {
-      const res = await client.session.list({})
-      const list = Array.isArray(res) ? res : res?.data || []
+      const list = await host.sessions()
       if (!list.length) return null
       // Roots only. A subagent session carries parentID, and it is also the
       // most recently updated session for as long as it runs — so "newest in
@@ -512,8 +619,9 @@ export const A2A = async ({ client, directory }) => {
    *
    *  promptAsync is the same call that returns on accept — the SDK documents
    *  it as "start if needed and return immediately", 204 and no body, which is
-   *  exactly the boot case. The timeout is belt and braces: no future SDK
-   *  change may ever be able to wedge the queue again. */
+   *  exactly the boot case. V2's session.prompt returns on accept too ("admit
+   *  one input and schedule execution"). The timeout is belt and braces: no
+   *  future SDK change may ever be able to wedge the queue again. */
   async function say(text, opts = {}, id = sessionID) {
     // Explicit target, because the caller's idea of "the session" and the
     // module's can differ by the time an await returns: brief() memoises per
@@ -523,10 +631,9 @@ export const A2A = async ({ client, directory }) => {
       log("info", `refusing to inject into subagent session ${id}`)
       return
     }
-    const call = client.session.promptAsync({
-      path: { id },
-      body: { ...opts, parts: [{ type: "text", text }] },
-    })
+    if (stopped) return
+    const call = Promise.resolve().then(() =>
+      host.prompt(id, text, { noReply: !!opts.noReply }))
     let timer
     const guard = new Promise((resolve) => {
       timer = setTimeout(() => {
@@ -633,7 +740,10 @@ export const A2A = async ({ client, directory }) => {
   }
 
   async function drain() {
-    if (injecting || queue.length === 0) return
+    // Off holds the queue rather than injecting it: whatever is in it was
+    // never acked, so it waits here (or on the broker, after a restart) for
+    // the project to be switched back on.
+    if (injecting || queue.length === 0 || !ENABLED || stopped) return
 
     // Events are the authority on which session is live — they fire for the
     // one the user is in. Listing is the fallback for before any event has
@@ -770,125 +880,162 @@ export const A2A = async ({ client, directory }) => {
   }
 
   // --- the pump ------------------------------------------------------------
+  // ONE pump per instance. Switching a project off and on again under a live
+  // stream used to start a second one: two readers of one destructive-read
+  // inbox, splitting it between them.
+  let pumping = false
   async function pump() {
-    // Before registration, so a stale client still says so even when its id
-    // is not set up yet — the two problems look identical from the outside
-    // and it is worth being able to tell them apart.
-    await checkVersion()
+    if (pumping || stopped) return
+    pumping = true
     try {
-      if (!(await ensureRegistered())) return
-    } catch (e) {
-      log("error", `registration failed: ${e}`)
-      await notify(`could not reach ${URL_BASE}: ${e}`)
-      return
-    }
+      // Before registration, so a stale client still says so even when its id
+      // is not set up yet — the two problems look identical from the outside
+      // and it is worth being able to tell them apart.
+      await checkVersion()
+      try {
+        if (!(await ensureRegistered())) return
+      } catch (e) {
+        log("error", `registration failed: ${e}`)
+        await notify(`could not reach ${URL_BASE}: ${e}`)
+        return
+      }
 
-    if (HELLO) {
-      await notify(`connected as ${name} — ${URL_BASE}`)
-    }
+      if (HELLO) {
+        await notify(`connected as ${name} — ${URL_BASE}`)
+      }
 
-    // Brief without waiting to be told a session exists. This is the boot fix:
-    // brief() used to run only on session.idle or session.created, and in 23
-    // real sessions those fired once and never — idle only arrives AFTER a
-    // turn completes, and created never fires on a resume. So a session that
-    // was resumed and left alone was never briefed and never caught up, which
-    // is exactly what "opencode won't read the channel on boot" was.
-    void (async () => {
-      const until = Date.now() + BRIEF_GIVE_UP_MS
-      while (Date.now() < until && !briefed.size) {
-        const sn = await currentSession()
-        if (sn?.id) {
-          sessionID = sn.id
-          // An unregistered client has no channels to read and nothing to be
-          // briefed about; the one useful thing it can do is tell its human
-          // how to fix that. Said HERE rather than at the moment we found out,
-          // because at that moment there was no session to say it into and the
-          // warning was simply lost.
-          if (!registered) {
-            await say(`[a2a] ${setupHint}`, { noReply: true }, sn.id)
+      // Brief without waiting to be told a session exists. This is the boot fix:
+      // brief() used to run only on session.idle or session.created, and in 23
+      // real sessions those fired once and never — idle only arrives AFTER a
+      // turn completes, and created never fires on a resume. So a session that
+      // was resumed and left alone was never briefed and never caught up, which
+      // is exactly what "opencode won't read the channel on boot" was.
+      void (async () => {
+        const until = Date.now() + BRIEF_GIVE_UP_MS
+        while (Date.now() < until && !briefed.size && ENABLED && !stopped) {
+          const sn = await currentSession()
+          if (sn?.id) {
+            sessionID = sn.id
+            // An unregistered client has no channels to read and nothing to be
+            // briefed about; the one useful thing it can do is tell its human
+            // how to fix that. Said HERE rather than at the moment we found out,
+            // because at that moment there was no session to say it into and the
+            // warning was simply lost.
+            if (!registered) {
+              await say(`[a2a] ${setupHint}`, { noReply: true }, sn.id)
+              return
+            }
+            await brief(sn.id)
+            // Anything that arrived while there was nowhere to put it. push()
+            // calls drain() and drain() gives up when no session exists, so
+            // without this the backlog waits for the next event — and at boot
+            // there may not be one.
+            void drain()
             return
           }
-          await brief(sn.id)
-          // Anything that arrived while there was nowhere to put it. push()
-          // calls drain() and drain() gives up when no session exists, so
-          // without this the backlog waits for the next event — and at boot
-          // there may not be one.
-          void drain()
-          return
+          await sleep(BRIEF_RETRY_MS)
         }
-        await new Promise((r) => setTimeout(r, BRIEF_RETRY_MS))
-      }
-    })()
+      })()
 
-    const url = `${URL_BASE}/stream?agent=${encodeURIComponent(key)}&format=json`
-    for (;;) {
-      let wait = RECONNECT_MS
-      try {
-        const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } })
-        if (!res.ok) {
-          const body = (await res.text()).slice(0, 200)
-          if (res.status === 403) {
-            // 403 means this agent is not usable yet — unknown, not granted,
-            // or bound elsewhere. Back off hard rather than hammering: an
-            // operator has to act before this can change.
-            //
-            // Keyed on the STATUS, never on the message text. This used to
-            // look for the word "register" in the body, and when the hint was
-            // reworded the match silently failed — leaving the client
-            // retrying every 5s forever against a broker that kept saying no.
-            wait = UNREGISTERED_MS
+      const url = `${URL_BASE}/stream?agent=${encodeURIComponent(key)}&format=json`
+      // Why a connection ended when WE ended it.
+      const closed = () => stopped ? "stream closed: plugin unloaded"
+        : "stream closed: a2a is off in this project"
+      while (ENABLED && !stopped) {
+        let wait = RECONNECT_MS
+        const ctl = new AbortController()
+        stream = ctl
+        try {
+          const res = await fetch(url, {
+            headers: { Authorization: `Bearer ${TOKEN}` },
+            signal: ctl.signal,
+          })
+          if (!res.ok) {
+            const body = (await res.text()).slice(0, 200)
+            if (res.status === 403) {
+              // 403 means this agent is not usable yet — unknown, not granted,
+              // or bound elsewhere. Back off hard rather than hammering: an
+              // operator has to act before this can change.
+              //
+              // Keyed on the STATUS, never on the message text. This used to
+              // look for the word "register" in the body, and when the hint was
+              // reworded the match silently failed — leaving the client
+              // retrying every 5s forever against a broker that kept saying no.
+              wait = UNREGISTERED_MS
+            }
+            throw new Error(`HTTP ${res.status}: ${body}`)
           }
-          throw new Error(`HTTP ${res.status}: ${body}`)
-        }
-        log("info", `stream connected (agent=${name}, key=${key}, url=${URL_BASE})`)
+          log("info", `stream connected (agent=${name}, key=${key}, url=${URL_BASE})`)
 
-        pumpState.connected = true
-        pumpState.lastError = null
-        pumpState.lastLine = Date.now()
-        const reader = res.body.getReader()
-        const dec = new TextDecoder()
-        let buf = ""
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buf += dec.decode(value, { stream: true })
-          let nl
-          while ((nl = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, nl).trim()
-            buf = buf.slice(nl + 1)
-            pumpState.lastLine = Date.now()
-            if (!line) continue // keepalive
-            let m
-            try {
-              m = JSON.parse(line)
-            } catch {
-              continue // noise
+          pumpState.connected = true
+          pumpState.lastError = null
+          pumpState.lastLine = Date.now()
+          const reader = res.body.getReader()
+          const dec = new TextDecoder()
+          let buf = ""
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += dec.decode(value, { stream: true })
+            let nl
+            while ((nl = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, nl).trim()
+              buf = buf.slice(nl + 1)
+              pumpState.lastLine = Date.now()
+              if (!line) continue // keepalive
+              let m
+              try {
+                m = JSON.parse(line)
+              } catch {
+                continue // noise
+              }
+              if (!m.text) continue
+              // Off — or unloaded — between the broker sending this and us
+              // reading it. It is not ours to deliver any more: close the
+              // stream and leave it unacked, and the broker hands it over
+              // again on the first connection after the project is back on.
+              // Codex does the same, for the same reason: delivery is a
+              // destructive read, and a message injected into a session that
+              // switched a2a off is one the user said not to receive.
+              if (!ENABLED || stopped) {
+                ctl.abort()
+                break
+              }
+              // The broker replays every UNACKED message on the first fetch of
+              // each connection, and the stream reconnects every few minutes. So
+              // anything the agent read but never acked would be re-injected on
+              // every cycle. Ack is still what retires it server-side; this only
+              // stops one process saying the same thing twice.
+              if (m.id && seen.has(m.id)) {
+                log("info", `skip #${m.channel} ${m.id} — already injected`)
+                continue
+              }
+              if (m.id) seen.add(m.id)
+              pumpState.delivered++
+              pumpState.last = `#${m.channel}/${m.sender}`
+              log("info", `deliver #${m.channel} from ${m.sender}`)
+              push(envelope(m), m.id)
             }
-            if (!m.text) continue
-            // The broker replays every UNACKED message on the first fetch of
-            // each connection, and the stream reconnects every few minutes. So
-            // anything the agent read but never acked would be re-injected on
-            // every cycle. Ack is still what retires it server-side; this only
-            // stops one process saying the same thing twice.
-            if (m.id && seen.has(m.id)) {
-              log("info", `skip #${m.channel} ${m.id} — already injected`)
-              continue
-            }
-            if (m.id) seen.add(m.id)
-            pumpState.delivered++
-            pumpState.last = `#${m.channel}/${m.sender}`
-            log("info", `deliver #${m.channel} from ${m.sender}`)
-            push(envelope(m), m.id)
+            if (ctl.signal.aborted) break
+          }
+          pumpState.connected = false
+          log("info", ctl.signal.aborted ? closed()
+                                         : "stream closed by server; reconnecting")
+        } catch (e) {
+          pumpState.connected = false
+          if (ctl.signal.aborted) {
+            log("info", closed())
+          } else {
+            pumpState.lastError = String(e)
+            log("error", `stream error: ${e}`)
           }
         }
-        pumpState.connected = false
-        log("info", "stream closed by server; reconnecting")
-      } catch (e) {
-        pumpState.connected = false
-        pumpState.lastError = String(e)
-        log("error", `stream error: ${e}`)
+        if (!ENABLED || stopped) break
+        await sleep(wait)
       }
-      await new Promise((r) => setTimeout(r, wait))
+    } finally {
+      pumping = false
+      pumpState.connected = false
     }
   }
 
@@ -898,7 +1045,7 @@ export const A2A = async ({ client, directory }) => {
   // up in a session that did not ask for a2a. That also makes enabling work
   // in the session you ask in: the tools are already there, so the pump can
   // start under them.
-  if (ENABLED) pump()
+  if (ENABLED) void pump()
 
   // --- tools ---------------------------------------------------------------
   // Every declared arg is required by OpenCode's schema conversion, so
@@ -932,10 +1079,19 @@ export const A2A = async ({ client, directory }) => {
     const quiet = pumpState.lastLine ? (Date.now() - pumpState.lastLine) / 1000 : null
     const stale = quiet !== null && quiet > 60
     const stations = me.stations || []
-    // In order: exist, then be reachable, then be healthy. Only the first
-    // unmet condition is worth telling an agent about.
+    // In order: be switched on, exist, be reachable, be healthy. Only the
+    // first unmet condition is worth telling an agent about — and "off" comes
+    // first, or an agent in a project that never opted in is told to
+    // register, or to wait for a stream that will never open. Worded like
+    // Codex's, so the answer does not depend on the harness.
     let step = null
-    if (!me.registered) {
+    if (!ENABLED) {
+      step =
+        `a2a is off in this project: ${PROJECT_FILE} does not say ` +
+        `{"${ENABLE_KEY}": true}, so nothing is delivered here. That is the ` +
+        `user's decision: only if they ask for a2a in this project, call ` +
+        `enable_a2a_here(enabled=true)`
+    } else if (!me.registered) {
       step =
         "you are not registered in this station yet: call propose_me with one " +
         "line about this project, and an operator approves it with one " +
@@ -965,9 +1121,9 @@ export const A2A = async ({ client, directory }) => {
         // Local only, deliberately: /pending MARKS MESSAGES READ, so a status
         // call that counted the inbox would consume it. Use my_pending to read.
         unacked_here: toAck.size,
-        // This client logs through the host, not to a file of its own.
         client_version: BAKED.version || null,
-        log_file: "~/.local/share/opencode/log/opencode.log (service a2a)",
+        // V1: the host's log, service a2a. V2: this client's own file.
+        log_file: LOG,
         next_step: step,
       },
       null,
@@ -975,417 +1131,534 @@ export const A2A = async ({ client, directory }) => {
     )
   }
 
-  return {
-    event: async ({ event }) => {
-      // Registered even when off, so enable_a2a_here can switch this
-      // on under a live session rather than asking for a restart.
-      if (!ENABLED) return
-      // Events are a hint, not the source of truth — drain() asks the server
-      // when it has to. Any event naming a session tells us which one is live;
-      // an idle one tells us it is a good moment to inject.
-      const p = event?.properties || {}
-      // The session id is read from property names this plugin has to guess,
-      // and a wrong guess is silent. Log each event type once with its keys so
-      // the log answers what OpenCode actually sends, instead of us guessing
-      // again.
-      if (event?.type && !shapesSeen.has(event.type)) {
-        shapesSeen.add(event.type)
-        log("info", `event ${event.type} keys: ${Object.keys(p).join(",")}`)
-      }
-      // Learn parentage wherever an event carries a session object — this is
-      // the only place a subagent id announces itself as one, and it is also
-      // how a session opened after boot becomes adoptable.
-      learn(p.info)
-      learn(p.session)
-      // An event id is a HINT, per the note above, and adopting one blindly is
-      // what made this plugin unusable: any id starting "ses" became the
-      // target, so a parent and its subagents took turns owning the injection
-      // point, each switch re-arming the brief. Adopt only an id KNOWN to be a
-      // root. An unknown one is left alone rather than guessed at — drain()
-      // and the boot poll both go to currentSession(), which is authoritative
-      // and fills these sets on the way past.
-      const id = p.sessionID ?? p.info?.sessionID ?? p.info?.id ?? p.id
-      if (typeof id === "string" && id !== sessionID && roots.has(id)) {
-        sessionID = id
-      }
-      // Which events count, decided from what OpenCode actually emits rather
-      // than from what sounds right. session.idle fires only after a turn has
-      // completed and session.created only for a genuinely new session, so
-      // between them they cover neither boot nor resume; the boot poll above
-      // is what covers those, not the event stream.
-      //
-      // message.updated is deliberately NOT here. It fires for every streamed
-      // part of every reply, so it made brief().then(drain) run continuously —
-      // and since the brief starts a turn, the turn produced more of them. That
-      // was the loop. Waking on idle is enough: there is nothing to inject into
-      // a session that is mid-turn anyway.
-      const wakes = event?.type === "session.idle" ||
-                    event?.type === "session.created" ||
-                    event?.type === "session.updated" ||
-                    (event?.type === "session.status" && p.status?.type === "idle")
-      if (wakes) {
-        // Brief first: a session with no traffic still needs to know it is an
-        // a2a agent, and that it can catch up with my_pending.
-        void brief().then(drain)
-      }
-    },
+  /** What an event says, whichever OpenCode sent it: its type, and its
+   *  payload as V1 shapes it ({sessionID, info, status, ...}). */
+  function onEvent(type, p = {}) {
+    // Registered even when off, so enable_a2a_here can switch this
+    // on under a live session rather than asking for a restart.
+    if (!ENABLED || stopped) return
+    // Events are a hint, not the source of truth — drain() asks the server
+    // when it has to. Any event naming a session tells us which one is live;
+    // an idle one tells us it is a good moment to inject.
+    //
+    // The session id is read from property names this plugin has to guess,
+    // and a wrong guess is silent. Log each event type once with its keys so
+    // the log answers what OpenCode actually sends, instead of us guessing
+    // again.
+    if (type && !shapesSeen.has(type)) {
+      shapesSeen.add(type)
+      log("info", `event ${type} keys: ${Object.keys(p).join(",")}`)
+    }
+    // Learn parentage wherever an event carries a session object — this is
+    // the only place a subagent id announces itself as one, and it is also
+    // how a session opened after boot becomes adoptable.
+    learn(p.info)
+    learn(p.session)
+    // An event id is a HINT, per the note above, and adopting one blindly is
+    // what made this plugin unusable: any id starting "ses" became the
+    // target, so a parent and its subagents took turns owning the injection
+    // point, each switch re-arming the brief. Adopt only an id KNOWN to be a
+    // root. An unknown one is left alone rather than guessed at — drain()
+    // and the boot poll both go to currentSession(), which is authoritative
+    // and fills these sets on the way past.
+    const id = p.sessionID ?? p.info?.sessionID ?? p.info?.id ?? p.id
+    if (typeof id === "string" && id !== sessionID && roots.has(id)) {
+      sessionID = id
+    }
+    // Which events count, decided from what OpenCode actually emits rather
+    // than from what sounds right. session.idle fires only after a turn has
+    // completed and session.created only for a genuinely new session, so
+    // between them they cover neither boot nor resume; the boot poll above
+    // is what covers those, not the event stream.
+    //
+    // message.updated is deliberately NOT here. It fires for every streamed
+    // part of every reply, so it made brief().then(drain) run continuously —
+    // and since the brief starts a turn, the turn produced more of them. That
+    // was the loop. Waking on idle is enough: there is nothing to inject into
+    // a session that is mid-turn anyway.
+    const wakes = type === "session.idle" ||
+                  type === "session.created" ||
+                  type === "session.updated" ||
+                  (type === "session.status" && p.status?.type === "idle")
+    if (wakes) {
+      // Brief first: a session with no traffic still needs to know it is an
+      // a2a agent, and that it can catch up with my_pending.
+      void brief().then(drain)
+    }
+  }
 
-    tool: {
-      enable_a2a_here: {
-        description:
-          "Record whether this PROJECT uses a2a, in <project>/.a2a.json. " +
-          "This is the human's decision, not yours: call it only when they " +
-          "ask you to, in the direction they asked for, and never on your " +
-          "own judgement — a2a connects this directory to other people's " +
-          "agents. It answers for THIS harness only: one directory can run " +
-          "several, and each is a separate agent, so enabling here says " +
-          "nothing about the others. With a2a off the tools are here but " +
-          "nothing is " +
-          "delivered and nothing is injected. Turning it on connects this " +
-          "session immediately, with no restart. The file is plain JSON that " +
-          "anyone can edit or delete.",
-        args: { enabled: { type: "boolean" } },
-        async execute(a) {
-          const on = a.enabled === true || String(a.enabled) === "true"
-          // Merge, never truncate: read_on_init, catchup or agent may be in
-          // here, and answering a yes/no must not throw the rest away.
-          // This client's key only: the tool runs in one harness and
-          // cannot speak for the others sharing the directory.
-          const next = { ...(await readJSON(PROJECT_FILE)), [ENABLE_KEY]: on }
-          await fs.writeFile(
-            PROJECT_FILE, JSON.stringify(next, null, 2) + "\n")
+  const tools = {
+    enable_a2a_here: {
+      description:
+        "Record whether this PROJECT uses a2a, in <project>/.a2a.json. " +
+        "This is the human's decision, not yours: call it only when they " +
+        "ask you to, in the direction they asked for, and never on your " +
+        "own judgement — a2a connects this directory to other people's " +
+        "agents. It answers for THIS harness only: one directory can run " +
+        "several, and each is a separate agent, so enabling here says " +
+        "nothing about the others. With a2a off the tools are here but " +
+        "nothing is " +
+        "delivered and nothing is injected. Turning it on connects this " +
+        "session immediately, with no restart. The file is plain JSON that " +
+        "anyone can edit or delete.",
+      args: { enabled: { type: "boolean" } },
+      async execute(a) {
+        const on = a.enabled === true || String(a.enabled) === "true"
+        // Merge, never truncate: read_on_init, catchup or agent may be in
+        // here, and answering a yes/no must not throw the rest away.
+        // This client's key only: the tool runs in one harness and
+        // cannot speak for the others sharing the directory.
+        const next = { ...(await readJSON(PROJECT_FILE)), [ENABLE_KEY]: on }
+        await fs.writeFile(
+          PROJECT_FILE, JSON.stringify(next, null, 2) + "\n")
+        ENABLED = on
+        if (on) {
           // Live, in this session. The tools were registered whatever the
           // switch said, so there is nothing to wait for: connect under them.
-          const started = on && !ENABLED
-          ENABLED = on
-          if (started) pump()
-          return JSON.stringify({
-            enabled: on,
-            file: PROJECT_FILE,
-            next_step: on
-              ? "Tell the human a2a is on for this project, connecting now — " +
-                "no restart."
-              : "Tell the human a2a is off for this project. The tools stay " +
-                "listed but nothing is delivered here any more.",
-          })
-        },
+          // pump() is a no-op while one is already running, so saying "on"
+          // twice never opens a second stream.
+          void pump()
+          void drain()
+        } else {
+          // Off has to stop what is already running, not just what starts
+          // next: close the stream now. The pump sees the switch and exits,
+          // and anything unacked stays on the broker for when it is back on.
+          stream?.abort()
+        }
+        return JSON.stringify({
+          enabled: on,
+          file: PROJECT_FILE,
+          next_step: on
+            ? "Tell the human a2a is on for this project, connecting now — " +
+              "no restart."
+            : "Tell the human a2a is off for this project. The tools stay " +
+              "listed but nothing is delivered here any more.",
+        })
       },
+    },
 
-      post_to_channel: {
-        description:
-          "Post a message to an a2a channel. Use the channel attribute of the " +
-          "message you are answering. EVERY member receives it, reads it and " +
-          "must ack it — that set is the `audience` and you do not choose it; " +
-          "a channel post never reaches anyone outside the channel. " +
-          "`addressed` is who the post is FOR: name the agent you are " +
-          "answering even though they would receive it anyway, because it is " +
-          "how the room tells 'answering them' from 'telling everyone'. Leave " +
-          "it out for general traffic. It may only name MEMBERS — to reach " +
-          "anyone else use add_channel_member or send_dm. Writing @name in " +
-          "the text addresses nobody — it is decoration. There is a size cap " +
-          "(64 KiB by default); for more, share_md and post the md:// URI.",
-        args: { name: str, text: str, addressed: optList, expires_in: optStr },
-        async execute(a) {
-          return receipt(await api("POST", `/channels/${encodeURIComponent(a.name)}/messages`, {
-            sender: name,
-            text: a.text,
-            ...(a.addressed?.length ? { addressed: a.addressed } : {}),
-            ...(a.expires_in ? { expires_in: a.expires_in } : {}),
-          }))
-        },
+    post_to_channel: {
+      description:
+        "Post a message to an a2a channel. Use the channel attribute of the " +
+        "message you are answering. EVERY member receives it, reads it and " +
+        "must ack it — that set is the `audience` and you do not choose it; " +
+        "a channel post never reaches anyone outside the channel. " +
+        "`addressed` is who the post is FOR: name the agent you are " +
+        "answering even though they would receive it anyway, because it is " +
+        "how the room tells 'answering them' from 'telling everyone'. Leave " +
+        "it out for general traffic. It may only name MEMBERS — to reach " +
+        "anyone else use add_channel_member or send_dm. Writing @name in " +
+        "the text addresses nobody — it is decoration. There is a size cap " +
+        "(64 KiB by default); for more, share_md and post the md:// URI.",
+      args: { name: str, text: str, addressed: optList, expires_in: optStr },
+      async execute(a) {
+        return receipt(await api("POST", `/channels/${encodeURIComponent(a.name)}/messages`, {
+          sender: name,
+          text: a.text,
+          ...(a.addressed?.length ? { addressed: a.addressed } : {}),
+          ...(a.expires_in ? { expires_in: a.expires_in } : {}),
+        }))
       },
+    },
 
-      read_channel: {
-        description:
-          "Read recent messages from an a2a channel. limit may be null for 50.",
-        args: { name: str, limit: optNum },
-        async execute(a) {
-          const q = a.limit ? `?limit=${a.limit}` : ""
-          return await api("GET", `/channels/${encodeURIComponent(a.name)}/messages${q}`)
-        },
+    read_channel: {
+      description:
+        "Read recent messages from an a2a channel. limit may be null for 50.",
+      args: { name: str, limit: optNum },
+      async execute(a) {
+        const q = a.limit ? `?limit=${a.limit}` : ""
+        return await api("GET", `/channels/${encodeURIComponent(a.name)}/messages${q}`)
       },
+    },
 
-      send_dm: {
-        description: "Send a direct message to one a2a agent by its agent id.",
-        args: { to: str, text: str, expires_in: optStr },
-        async execute(a) {
-          return receipt(await api("POST", "/dms", { sender: name, to: a.to, text: a.text,
-            ...(a.expires_in ? { expires_in: a.expires_in } : {}) }))
-        },
+    send_dm: {
+      description: "Send a direct message to one a2a agent by its agent id.",
+      args: { to: str, text: str, expires_in: optStr },
+      async execute(a) {
+        return receipt(await api("POST", "/dms", { sender: name, to: a.to, text: a.text,
+          ...(a.expires_in ? { expires_in: a.expires_in } : {}) }))
       },
+    },
 
-      read_dms: {
-        description:
-          "Your direct messages, oldest first. A pull, not a push: ack what " +
-          "you take from it. since may be null for all of them.",
-        args: { since: optNum, limit: optNum },
-        async execute(a) {
-          const q = []
-          if (a.since != null) q.push(`since=${a.since}`)
-          if (a.limit != null) q.push(`limit=${a.limit}`)
-          return await api("GET", `/dms${q.length ? `?${q.join("&")}` : ""}`)
-        },
+    read_dms: {
+      description:
+        "Your direct messages, oldest first. A pull, not a push: ack what " +
+        "you take from it. since may be null for all of them.",
+      args: { since: optNum, limit: optNum },
+      async execute(a) {
+        const q = []
+        if (a.since != null) q.push(`since=${a.since}`)
+        if (a.limit != null) q.push(`limit=${a.limit}`)
+        return await api("GET", `/dms${q.length ? `?${q.join("&")}` : ""}`)
       },
+    },
 
-      submit_bid: {
-        description:
-          "Answer a help-wanted broadcast. bid is 'claim' to take the work or " +
-          "'pass' to decline. pitch may be null.",
-        args: { broadcast_id: str, bid: str, pitch: optStr },
-        async execute(a) {
-          return await api(
-            "POST",
-            `/broadcasts/${encodeURIComponent(a.broadcast_id)}/bids`,
-            { agent_id: name, bid: a.bid, pitch: a.pitch || "" },
+    submit_bid: {
+      description:
+        "Answer a help-wanted broadcast. bid is 'claim' to take the work or " +
+        "'pass' to decline. pitch may be null.",
+      args: { broadcast_id: str, bid: str, pitch: optStr },
+      async execute(a) {
+        return await api(
+          "POST",
+          `/broadcasts/${encodeURIComponent(a.broadcast_id)}/bids`,
+          { agent_id: name, bid: a.bid, pitch: a.pitch || "" },
+        )
+      },
+    },
+
+    my_pending: {
+      description:
+        "List every a2a message addressed to you that you have not acked. " +
+        "This is your whole inbox. limit may be null for 50.",
+      args: { limit: optNum },
+      async execute(a) {
+        return await api("GET", `/pending${a.limit ? `?limit=${a.limit}` : ""}`)
+      },
+    },
+
+    ack_messages: {
+      description:
+        "Confirm you have handled these a2a messages, by the id attribute of " +
+        "each. Unacked messages stay pending forever and are never collected.",
+      args: { ids: { type: "array", items: { type: "string" } } },
+      async execute(a) {
+        return await api("POST", "/ack", { ids: a.ids })
+      },
+    },
+
+    share_md: {
+      description:
+        "Share a markdown file with a channel. Use this for anything too " +
+        "long to post — a plan, a review, a spec: the channel gets a short " +
+        "message carrying an md:// URI and everyone reads it with fetch_md. " +
+        "You supply the text yourself; the broker never reads your disk, so " +
+        "a path is not what goes here. filename must end in .md, and " +
+        "sharing the same name again replaces it. note may be null.",
+      args: { channel: str, filename: str, content: str, note: optStr },
+      async execute(a) {
+        return receipt(await api("POST", "/md", {
+          channel: a.channel,
+          sender: name,
+          filename: a.filename,
+          content: a.content,
+          note: a.note || "",
+        }))
+      },
+    },
+
+    fetch_md: {
+      description:
+        "Read a markdown file somebody shared, by the md:// URI from the " +
+        "message that announced it. The URI is not a path on anyone's disk " +
+        "and not a resource server you have to connect to — it is the " +
+        "argument to this tool. The whole file comes back in one call, so " +
+        "check the size in that message first if it looked large. Never ask " +
+        "a peer to paste a file you can fetch.",
+      args: { uri: str },
+      async execute(a) {
+        return await api("GET", `/md?uri=${encodeURIComponent(a.uri)}`)
+      },
+    },
+
+    create_channel: {
+      description:
+        "Open a channel, with yourself in it. If the conversation you need " +
+        "does not exist, make it rather than asking anyone. You cannot " +
+        "delete one — a channel holds other agents' transcript, so that is " +
+        "an operator's call. members may be null for just you.",
+      args: { name: str, theme: optStr,
+              members: { type: ["array", "null"], items: { type: "string" } } },
+      async execute(a) {
+        return await api("POST", "/channels", {
+          name: a.name,
+          theme: a.theme || "",
+          members: a.members || [],
+        })
+      },
+    },
+
+    list_channels: {
+      description:
+        "The channels in this station, with their members and message " +
+        "counts. Read it before posting: a channel you are not a member of " +
+        "delivers your posts to nobody who is not @mentioned.",
+      args: {},
+      async execute() {
+        return await api("GET", "/channels")
+      },
+    },
+
+    join_channel: {
+      description:
+        "Join an existing channel, so its broadcasts reach you. Channels " +
+        "are created by an operator — if it does not exist yet, ask for it " +
+        "rather than posting into the void. Joining is not retroactive: " +
+        "messages posted before you joined were never addressed to you.",
+      args: { name: str },
+      async execute(a) {
+        return await api(
+          "POST", `/channels/${encodeURIComponent(a.name)}/members`,
+          // key, not name: this is the id we stream as, so it is the id
+          // whose receipts we will collect. Joining under anything else is
+          // a channel that looks joined and delivers nothing.
+          { agent_id: key })
+      },
+    },
+
+    leave_channel: {
+      description: "Stop receiving a channel's broadcasts.",
+      args: { name: str },
+      async execute(a) {
+        return await api(
+          "DELETE",
+          `/channels/${encodeURIComponent(a.name)}/members/` +
+            encodeURIComponent(key))
+      },
+    },
+
+    list_agents: {
+      description:
+        "Who else is in this station, with their cards — description, " +
+        "expertise, projects. Read this before asking for help, so a " +
+        "broadcast or @mention goes to someone who can answer it.",
+      args: {},
+      async execute() {
+        return await api("GET", "/agents")
+      },
+    },
+
+    get_agent: {
+      description: "Read one agent's card by its id.",
+      args: { agent_id: str },
+      async execute(a) {
+        return await api("GET", `/agents/${encodeURIComponent(a.agent_id)}`)
+      },
+    },
+
+    update_agent: {
+      description:
+        "Write your own card so others know what you are for. An agent with " +
+        "a blank description and no expertise is registered but invisible: " +
+        "nobody can tell whether to route a question to it. Pass null for " +
+        "any field you are not changing.",
+      args: {
+        description: optStr,
+        expertise: { type: ["array", "null"], items: { type: "string" } },
+        projects: { type: ["array", "null"], items: { type: "string" } },
+      },
+      async execute(a) {
+        const body = {}
+        if (a.description != null) body.description = a.description
+        if (a.expertise != null) body.expertise = a.expertise
+        if (a.projects != null) body.projects = a.projects
+        return await api(
+          "PATCH", `/agents/${encodeURIComponent(name)}`, body)
+      },
+    },
+
+    ack_all: {
+      description:
+        "Mark everything waiting for you as handled, without reading it. " +
+        "For a backlog you have decided not to work through — you were " +
+        "away and the conversation moved on. Acking says HANDLED, so do " +
+        "not use it to look responsive: if you might answer, read with " +
+        "my_pending instead, which acks one message at a time as it goes. " +
+        "Clears only your own inbox.",
+      args: {},
+      async execute() {
+        return await api("POST", "/ack/all")
+      },
+    },
+
+    propose_me: {
+      description:
+        "Ask an operator to register this agent id. Use when whoami says " +
+        "you are not registered: the name appears in the operator's " +
+        "console, they approve it with one keystroke, and this client " +
+        "connects with no restart. Unapproved requests expire on their " +
+        "own. This creates nothing by itself — it asks. If the name " +
+        "already belongs to another client this becomes a TRANSFER " +
+        "request, which moves that agent's channels and unacked messages " +
+        "here if the operator agrees; a refused transfer bars asking " +
+        "again for a while, so ask once and wait rather than retrying.",
+      args: { note: optStr },
+      async execute(a) {
+        return await api("POST", "/me/proposals", {
+          agent_id: key,
+          note: a.note || "",
+        })
+      },
+    },
+
+    a2a_channel_status: {
+      description:
+        "Orient yourself: the id the broker resolves you to, whether you are registered, whether push is alive, and which channels you are a MEMBER of. Call this first when something seems wrong — nothing arriving, a tool refusing, a room that does not answer. `next_step` names the one thing to do about it, or is null when nothing is wrong. It reads nothing from your inbox, so it costs you no messages.",
+      args: {},
+      async execute() {
+        return await statusReport()
+      },
+    },
+
+    whoami: {
+      description:
+        "Report the name the broker resolves this session to, its station, " +
+        "and whether it is registered yet.",
+      args: {},
+      async execute() {
+        const me = await json("GET", "/me")
+        name = me.agent || name
+        return JSON.stringify(me)
+      },
+    },
+
+    rename_me: {
+      description:
+        "Become an agent: pick a new name, or take one that already exists " +
+        "and is yours. It sticks for this project from now on. Renaming " +
+        "brings everything pending with it; taking an existing agent leaves " +
+        "that agent exactly as it is and simply starts answering as it.",
+      args: { new_id: str },
+      async execute(a) {
+        if (a.new_id === key) return JSON.stringify({ agent_id: key })
+
+        // If that agent already exists and is ours, becoming it is purely a
+        // matter of what this client announces — there is nothing to rename.
+        // Asking the broker would refuse (the name is taken, by us), and if
+        // it did not it would drag another agent's history onto this one.
+        const mine = (await json("GET", "/me/agents")).agents || []
+        const exists = mine.some((x) => x.agent_id === a.new_id)
+
+        let out
+        if (exists) {
+          out = { agent_id: a.new_id, was: key, adopted: true }
+        } else {
+          // Broker first, then this machine: writing the store before a
+          // failed call would leave us announcing a name that is not there.
+          out = await json(
+            "PATCH", `/me/agents/${encodeURIComponent(key)}`,
+            { rename: a.new_id },
           )
-        },
-      },
-
-      my_pending: {
-        description:
-          "List every a2a message addressed to you that you have not acked. " +
-          "This is your whole inbox. limit may be null for 50.",
-        args: { limit: optNum },
-        async execute(a) {
-          return await api("GET", `/pending${a.limit ? `?limit=${a.limit}` : ""}`)
-        },
-      },
-
-      ack_messages: {
-        description:
-          "Confirm you have handled these a2a messages, by the id attribute of " +
-          "each. Unacked messages stay pending forever and are never collected.",
-        args: { ids: { type: "array", items: { type: "string" } } },
-        async execute(a) {
-          return await api("POST", "/ack", { ids: a.ids })
-        },
-      },
-
-      share_md: {
-        description:
-          "Share a markdown file with a channel. Use this for anything too " +
-          "long to post — a plan, a review, a spec: the channel gets a short " +
-          "message carrying an md:// URI and everyone reads it with fetch_md. " +
-          "You supply the text yourself; the broker never reads your disk, so " +
-          "a path is not what goes here. filename must end in .md, and " +
-          "sharing the same name again replaces it. note may be null.",
-        args: { channel: str, filename: str, content: str, note: optStr },
-        async execute(a) {
-          return receipt(await api("POST", "/md", {
-            channel: a.channel,
-            sender: name,
-            filename: a.filename,
-            content: a.content,
-            note: a.note || "",
-          }))
-        },
-      },
-
-      fetch_md: {
-        description:
-          "Read a markdown file somebody shared, by the md:// URI from the " +
-          "message that announced it. The URI is not a path on anyone's disk " +
-          "and not a resource server you have to connect to — it is the " +
-          "argument to this tool. The whole file comes back in one call, so " +
-          "check the size in that message first if it looked large. Never ask " +
-          "a peer to paste a file you can fetch.",
-        args: { uri: str },
-        async execute(a) {
-          return await api("GET", `/md?uri=${encodeURIComponent(a.uri)}`)
-        },
-      },
-
-      create_channel: {
-        description:
-          "Open a channel, with yourself in it. If the conversation you need " +
-          "does not exist, make it rather than asking anyone. You cannot " +
-          "delete one — a channel holds other agents' transcript, so that is " +
-          "an operator's call. members may be null for just you.",
-        args: { name: str, theme: optStr,
-                members: { type: ["array", "null"], items: { type: "string" } } },
-        async execute(a) {
-          return await api("POST", "/channels", {
-            name: a.name,
-            theme: a.theme || "",
-            members: a.members || [],
-          })
-        },
-      },
-
-      list_channels: {
-        description:
-          "The channels in this station, with their members and message " +
-          "counts. Read it before posting: a channel you are not a member of " +
-          "delivers your posts to nobody who is not @mentioned.",
-        args: {},
-        async execute() {
-          return await api("GET", "/channels")
-        },
-      },
-
-      join_channel: {
-        description:
-          "Join an existing channel, so its broadcasts reach you. Channels " +
-          "are created by an operator — if it does not exist yet, ask for it " +
-          "rather than posting into the void. Joining is not retroactive: " +
-          "messages posted before you joined were never addressed to you.",
-        args: { name: str },
-        async execute(a) {
-          return await api(
-            "POST", `/channels/${encodeURIComponent(a.name)}/members`,
-            // key, not name: this is the id we stream as, so it is the id
-            // whose receipts we will collect. Joining under anything else is
-            // a channel that looks joined and delivers nothing.
-            { agent_id: key })
-        },
-      },
-
-      leave_channel: {
-        description: "Stop receiving a channel's broadcasts.",
-        args: { name: str },
-        async execute(a) {
-          return await api(
-            "DELETE",
-            `/channels/${encodeURIComponent(a.name)}/members/` +
-              encodeURIComponent(key))
-        },
-      },
-
-      list_agents: {
-        description:
-          "Who else is in this station, with their cards — description, " +
-          "expertise, projects. Read this before asking for help, so a " +
-          "broadcast or @mention goes to someone who can answer it.",
-        args: {},
-        async execute() {
-          return await api("GET", "/agents")
-        },
-      },
-
-      get_agent: {
-        description: "Read one agent's card by its id.",
-        args: { agent_id: str },
-        async execute(a) {
-          return await api("GET", `/agents/${encodeURIComponent(a.agent_id)}`)
-        },
-      },
-
-      update_agent: {
-        description:
-          "Write your own card so others know what you are for. An agent with " +
-          "a blank description and no expertise is registered but invisible: " +
-          "nobody can tell whether to route a question to it. Pass null for " +
-          "any field you are not changing.",
-        args: {
-          description: optStr,
-          expertise: { type: ["array", "null"], items: { type: "string" } },
-          projects: { type: ["array", "null"], items: { type: "string" } },
-        },
-        async execute(a) {
-          const body = {}
-          if (a.description != null) body.description = a.description
-          if (a.expertise != null) body.expertise = a.expertise
-          if (a.projects != null) body.projects = a.projects
-          return await api(
-            "PATCH", `/agents/${encodeURIComponent(name)}`, body)
-        },
-      },
-
-      ack_all: {
-        description:
-          "Mark everything waiting for you as handled, without reading it. " +
-          "For a backlog you have decided not to work through — you were " +
-          "away and the conversation moved on. Acking says HANDLED, so do " +
-          "not use it to look responsive: if you might answer, read with " +
-          "my_pending instead, which acks one message at a time as it goes. " +
-          "Clears only your own inbox.",
-        args: {},
-        async execute() {
-          return await api("POST", "/ack/all")
-        },
-      },
-
-      propose_me: {
-        description:
-          "Ask an operator to register this agent id. Use when whoami says " +
-          "you are not registered: the name appears in the operator's " +
-          "console, they approve it with one keystroke, and this client " +
-          "connects with no restart. Unapproved requests expire on their " +
-          "own. This creates nothing by itself — it asks. If the name " +
-          "already belongs to another client this becomes a TRANSFER " +
-          "request, which moves that agent's channels and unacked messages " +
-          "here if the operator agrees; a refused transfer bars asking " +
-          "again for a while, so ask once and wait rather than retrying.",
-        args: { note: optStr },
-        async execute(a) {
-          return await api("POST", "/me/proposals", {
-            agent_id: key,
-            note: a.note || "",
-          })
-        },
-      },
-
-      a2a_channel_status: {
-        description:
-          "Orient yourself: the id the broker resolves you to, whether you are registered, whether push is alive, and which channels you are a MEMBER of. Call this first when something seems wrong — nothing arriving, a tool refusing, a room that does not answer. `next_step` names the one thing to do about it, or is null when nothing is wrong. It reads nothing from your inbox, so it costs you no messages.",
-        args: {},
-        async execute() {
-          return await statusReport()
-        },
-      },
-
-      whoami: {
-        description:
-          "Report the name the broker resolves this session to, its station, " +
-          "and whether it is registered yet.",
-        args: {},
-        async execute() {
-          const me = await json("GET", "/me")
-          name = me.agent || name
-          return JSON.stringify(me)
-        },
-      },
-
-      rename_me: {
-        description:
-          "Become an agent: pick a new name, or take one that already exists " +
-          "and is yours. It sticks for this project from now on. Renaming " +
-          "brings everything pending with it; taking an existing agent leaves " +
-          "that agent exactly as it is and simply starts answering as it.",
-        args: { new_id: str },
-        async execute(a) {
-          if (a.new_id === key) return JSON.stringify({ agent_id: key })
-
-          // If that agent already exists and is ours, becoming it is purely a
-          // matter of what this client announces — there is nothing to rename.
-          // Asking the broker would refuse (the name is taken, by us), and if
-          // it did not it would drag another agent's history onto this one.
-          const mine = (await json("GET", "/me/agents")).agents || []
-          const exists = mine.some((x) => x.agent_id === a.new_id)
-
-          let out
-          if (exists) {
-            out = { agent_id: a.new_id, was: key, adopted: true }
-          } else {
-            // Broker first, then this machine: writing the store before a
-            // failed call would leave us announcing a name that is not there.
-            out = await json(
-              "PATCH", `/me/agents/${encodeURIComponent(key)}`,
-              { rename: a.new_id },
-            )
-          }
-          const settled = out.agent_id || a.new_id
-          await pin(settled)
-          key = settled
-          name = settled
-          // Re-brief THIS session only: the model still believes the old name,
-          // and the instructions carry it. Scoped to one id rather than
-          // clearing the memo, because a blanket reset is exactly what used to
-          // let the brief fire over and over.
-          briefed.delete(sessionID)
-          return JSON.stringify(out)
-        },
+        }
+        const settled = out.agent_id || a.new_id
+        await pin(settled)
+        key = settled
+        name = settled
+        // Re-brief THIS session only: the model still believes the old name,
+        // and the instructions carry it. Scoped to one id rather than
+        // clearing the memo, because a blanket reset is exactly what used to
+        // let the brief fire over and over.
+        briefed.delete(sessionID)
+        return JSON.stringify(out)
       },
     },
   }
+
+  return { tools, onEvent, stop, log, sleep }
 }
+
+/** OpenCode V1: `server({client, directory})`, read from the default export
+ *  by 1.18.28 and later. Exactly the hooks this plugin always returned. */
+async function server({ client, directory }) {
+  const a2a = await core({
+    directory,
+    kind: "V1",
+    log: (level, message) =>
+      client.app.log({ body: { service: "a2a", level, message } }).catch(() => {}),
+    logFile: "~/.local/share/opencode/log/opencode.log (service a2a)",
+    sessions: async () => {
+      const res = await client.session.list({})
+      return Array.isArray(res) ? res : res?.data || []
+    },
+    prompt: (id, text, { noReply }) => client.session.promptAsync({
+      path: { id },
+      body: { ...(noReply ? { noReply: true } : {}), parts: [{ type: "text", text }] },
+    }),
+  })
+  if (!a2a) return {}
+  return {
+    event: async ({ event }) => a2a.onEvent(event?.type, event?.properties || {}),
+    tool: a2a.tools,
+  }
+}
+
+/** OpenCode V2: `setup(ctx)`, run once per location (project directory).
+ *
+ *  Three rules this host imposes, each read from its source:
+ *  - setup must not await a prompt. A prompt waits for plugin activation, and
+ *    activation waits for setup, so a brief awaited here would hang the
+ *    server. setup registers and returns; everything networked runs detached.
+ *  - tools are added through a transform, with JSON Schema input, and say
+ *    codemode:false. Without it V2 puts every tool behind one `execute` tool,
+ *    and each "call post_to_channel" in the brief names a tool the model does
+ *    not have.
+ *  - V2 reloads a plugin when its file changes, and calls what setup returned
+ *    first. That has to stop the pump — see stop() in core. */
+async function setup(ctx) {
+  const directory = ctx.location?.directory || ""
+  const a2a = await core({
+    directory,
+    kind: "V2",
+    sessions: async () => {
+      // Asked for exactly what V1 had to filter by hand: roots, in this
+      // directory, newest first. V2 sessions carry location.directory rather
+      // than directory, so it is renamed for the code that picks one.
+      const res = await ctx.session.list({
+        directory, parentID: null, archived: false, order: "desc", limit: 20,
+      })
+      return (Array.isArray(res) ? res : res?.data || []).map((s) => ({
+        ...s, directory: s?.location?.directory,
+      }))
+    },
+    // resume:false is V1's noReply — admitted, no turn started. "steer" is
+    // V2's own default, the same as a human typing mid-turn: a brief sent
+    // without a turn then rides into the same turn as the catch-up prompt,
+    // where "queue" would spend a turn on the brief alone.
+    prompt: (id, text, { noReply }) => ctx.session.prompt({
+      sessionID: id, text, delivery: "steer", resume: !noReply,
+    }),
+  })
+  if (!a2a) return
+
+  await ctx.tool.transform((editor) => {
+    for (const [name, t] of Object.entries(a2a.tools)) {
+      editor.add({
+        name,
+        description: t.description,
+        input: jsonInput(t.args),
+        options: { codemode: false },
+        execute: async (input) => ({ content: String(await t.execute(input || {})) }),
+      })
+    }
+  })
+
+  // V2 events are {type, data, location}. Map them onto the V1 shape onEvent
+  // reads: session.created carries the new session's fields flat, with its id
+  // as sessionID, so it becomes the session object learn() expects.
+  const events = new AbortController()
+  void (async () => {
+    while (!events.signal.aborted) {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: events.signal })) {
+          const where = ev?.location?.directory
+          if (where && where !== directory) continue
+          const d = ev?.data || {}
+          a2a.onEvent(ev?.type, ev?.type === "session.created"
+            ? { ...d, info: { id: d.sessionID, parentID: d.parentID,
+                              directory: d.location?.directory, title: d.title } }
+            : d)
+        }
+      } catch (e) {
+        if (!events.signal.aborted) a2a.log("error", `event stream failed: ${e}`)
+      }
+      if (!events.signal.aborted) await a2a.sleep(RECONNECT_MS)
+    }
+  })()
+
+  return () => {
+    events.abort()
+    a2a.stop()
+  }
+}
+
+export default { id: "a2a", server, setup }
