@@ -1179,11 +1179,13 @@ class AuthRequired(Exception):
 def require_station() -> str:
     """The station this request acts in, resolving late if it has to.
 
-    An MCP session binds its context once, at initialize, and every later tool
-    call runs inside that same context. So an agent that registers itself
-    mid-session would stay unresolved forever if we only trusted what the
-    middleware bound. When no station is bound we therefore re-resolve from the
-    DB using the token and agent name (both stable), and cache the result.
+    /mcp/ is stateless now (see `mcp = FastMCP(...)`), so every MCP request
+    runs in its own context, bound by AuthMiddleware for that request. It used
+    to be bound ONCE, at initialize, for the whole session — and an agent that
+    registered itself mid-session stayed unresolved for good. The late
+    resolution below was the fix for that and is kept: when the middleware
+    bound no station (the agent was not usable yet when it ran), re-resolve
+    from the DB using the token and agent name, and cache the result.
     """
     sid = _current_station.get()
     if sid:
@@ -4332,8 +4334,25 @@ DIRECT = DirectRegistry()
 # That rejects every public Host header behind a reverse proxy with HTTP
 # 421 "Invalid Host header". Access control here is Bearer-token + TLS
 # at the edge, so this gate adds no security and breaks every real deploy.
+#
+# STATELESS, because a session is something a restart takes away. Stateful,
+# the SDK keeps every MCP session in this process's memory, so after any
+# redeploy the id a client holds answers 404 "Session not found" — and it
+# does the same after 30 idle minutes once the client's event stream has
+# gone. Claude Code retries that stream twice in two seconds, which a
+# restart always outlasts, then gives up: "Maximum reconnection attempts (2)
+# exceeded … leaving transport up", and every a2a tool in the session was
+# dead until the user restarted it. That was a real redeploy, 2026-10-22.
+# Nothing here needs a session: no tool takes an MCP Context, push goes
+# through /stream and never over /mcp/, and the token and X-A2A-Agent
+# arrive on every request. Stateless, each request gets a fresh transport
+# that issues no session id and ignores a stale one, so the first call after
+# a restart simply works — and runs under THAT request's identity, which
+# AuthMiddleware binds, instead of the one frozen at initialize.
+# tests/test_mcp_restart.py restarts a real broker under a live client.
 mcp = FastMCP(
     "a2a-mcp",
+    stateless_http=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
