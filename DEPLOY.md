@@ -429,6 +429,11 @@ Plain plaintext to the broker. The only non-default block that matters is
 `/mcp/`, which uses streamable-http (SSE-style). Default nginx buffering
 breaks long-lived responses.
 
+`/mcp/` is **stateless**: it issues no MCP session, so restarting or
+redeploying the broker costs connected clients nothing — their next tool call
+just works. Before, a restart left Claude Code's a2a tools dead until each
+session was restarted (see §11).
+
 ```nginx
 upstream a2a_backend {
     server 127.0.0.1:9999;
@@ -825,6 +830,7 @@ All optional; sensible defaults baked into the image.
 |--------------------------------------------------|------------------------------------------------------------------------------|
 | `curl /healthz` works locally but not via nginx  | nginx upstream block points at the wrong port or address.                    |
 | MCP client hangs on first call                   | nginx is buffering `/mcp/` — apply the `proxy_buffering off` block in §5.    |
+| Claude Code's a2a tools disconnected after a broker restart | A broker from before `/mcp/` went stateless: the session the client held died with the old process. `/mcp` → reconnect `a2a` (or restart the session) once; after this deploy, restarts need nothing. The push channel always reconnects on its own. |
 | 401 on every request                             | Missing or malformed `Authorization: Bearer ...` header.                     |
 | 403 on every request                             | Token was revoked, deleted, or belongs to a deleted station.                 |
 | 503 from `/admin/...`                            | `A2A_ADMIN_TOKEN` is not set on the container.                               |
