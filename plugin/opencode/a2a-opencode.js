@@ -114,6 +114,14 @@ const BRIEF_GIVE_UP_MS = 30_000
 const BRIEF_REFRESH_MS = 24 * 3600_000
 const BRIEF_KEEP_MS = 30 * 24 * 3600_000
 const BRIEF_KEEP_MAX = 500
+// This PROCESS, not this plugin instance. Only a brief from the same process
+// silences the next one: that is OpenCode 2 recycling or reloading the plugin
+// inside its long-lived server. A new process — OpenCode 1's resume, a
+// server restart — briefs and checks the session as it always did.
+const BOOT = `${process.pid}@${Math.round(globalThis.performance?.timeOrigin || 0)}`
+// OpenCode 2 checks a session when it is opened (see viewed()); this keeps
+// switching back and forth between sessions from spending a turn each time.
+const CHECK_COOLDOWN_MS = 10 * 60_000
 // V2 only: this client's own log file is capped, like Pi's. It is the one
 // record of what the client did, but it must not grow without bound on a
 // machine that runs OpenCode daily. The recent past is what diagnoses a hang.
@@ -782,33 +790,96 @@ async function core(host) {
   // a rename makes the entry stale for that one session, which then hears the
   // new name, and nothing else is disturbed.
   const BRIEFS = `${DATA}/opencode/a2a-briefed.json`
-  /** "fresh": briefed as this agent within a day. "stale": briefed as this
-   *  agent, longer ago. null: never, or as somebody else. */
-  async function briefState(id) {
+  /** This agent's entry for a session, or null when there is none or it
+   *  belongs to another key or name. */
+  async function memoOf(id) {
     const e = (await readJSON(BRIEFS))[id]
-    if (!e || e.key !== key || e.name !== name) return null
+    return e && e.key === key && e.name === name ? e : null
+  }
+  /** "fresh": briefed as this agent by THIS process within a day. "stale":
+   *  by this process, longer ago. null: never, as somebody else, or by
+   *  another process — a launch or restart, which briefs and checks. */
+  async function briefState(id) {
+    const e = await memoOf(id)
+    if (!e || e.boot !== BOOT) return null
     return Date.now() - (Number(e.at) || 0) < BRIEF_REFRESH_MS ? "fresh" : "stale"
   }
-  async function rememberBrief(id) {
+  /** Record `patch` ({at} for a brief, {checkedAt} for a check) on this
+   *  session's entry, keeping what the entry already says. */
+  async function remember(id, patch) {
     const now = Date.now()
     const tmp = `${BRIEFS}.${process.pid}.${now}.` +
       Math.random().toString(16).slice(2)
     try {
-      const kept = Object.entries(await readJSON(BRIEFS))
+      const all = await readJSON(BRIEFS)
+      const prev = all[id]?.key === key && all[id]?.name === name ? all[id] : {}
+      const kept = Object.entries(all)
         .filter(([sid, e]) => sid !== id && now - (Number(e?.at) || 0) < BRIEF_KEEP_MS)
         .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
         .slice(0, BRIEF_KEEP_MAX - 1)
       // Whole or not at all: another project's instance may be reading it.
       // Two writing at once can drop one entry, which costs one extra brief.
       await fs.mkdir(`${DATA}/opencode`, { recursive: true })
-      await fs.writeFile(tmp, JSON.stringify(
-        Object.fromEntries([[id, { key, name, at: now }], ...kept])) + "\n")
+      await fs.writeFile(tmp, JSON.stringify(Object.fromEntries([
+        [id, { ...prev, key, name, boot: BOOT, ...patch }], ...kept])) + "\n")
       await fs.rename(tmp, BRIEFS)
     } catch (e) {
       log("error", `could not remember the brief: ${e}`)
     } finally {
       await fs.unlink(tmp).catch(() => {})
     }
+  }
+
+  /** The channel check — the one part of a brief that starts a turn. True
+   *  when it was sent. CATCHUP is already 0 when read_on_init is false, so
+   *  this one gate covers both spellings of "do not". */
+  async function sendCheck(id, { hello = false } = {}) {
+    const rooms = CATCHUP > 0 ? await myChannels() : []
+    if (!rooms.length || stopped) {
+      log("info", `no channel check in ${id}` +
+                  (CATCHUP > 0 ? " — in no channels, nothing to check"
+                               : " (read_on_init off)"))
+      return false
+    }
+    if (hello) {
+      await say(`[a2a] connected as ${name} — ${URL_BASE}`, { noReply: true }, id)
+    }
+    await say(checkPrompt(rooms), {}, id)
+    log("info", `checking ${rooms.length} channel(s) in ${id}: ${rooms.join(", ")}`)
+    return true
+  }
+
+  // OpenCode 2's launch. Its plugin lives in a long-lived server, so starting
+  // `opencode` in a terminal is not a new plugin process — what the server
+  // sees is the TUI opening a session: `session.viewed`. That is when the
+  // check runs, once per CHECK_COOLDOWN_MS per session, so switching back and
+  // forth between sessions does not spend a turn each time. A recycle or a
+  // reload of this plugin views nothing, so it stays silent.
+  const viewing = new Map()
+  function viewed(id) {
+    if (!id || !registered || !ENABLED || stopped || children.has(id)) return
+    if (viewing.has(id)) return viewing.get(id)
+    const run = (async () => {
+      try {
+        // Instructions first, if this session lacks them — in a new process
+        // that is the full brief, check included, which the cooldown below
+        // then sees.
+        await brief(id)
+        if (stopped) return
+        const e = await memoOf(id)
+        if (e && Date.now() - (Number(e.checkedAt) || 0) < CHECK_COOLDOWN_MS) return
+        await sendCheck(id, { hello: HELLO })
+        // Recorded even when there was nothing to check, so the cooldown
+        // holds either way.
+        if (!stopped) await remember(id, { checkedAt: Date.now() })
+      } catch (e) {
+        log("error", `could not check on view: ${e}`)
+      } finally {
+        viewing.delete(id)
+      }
+    })()
+    viewing.set(id, run)
+    return run
   }
 
   function brief(id = sessionID) {
@@ -832,25 +903,17 @@ async function core(host) {
           await say(instructions(name), { noReply: true }, id)
           if (stopped) return
           if (state === "stale") {
-            // A refresh, not a new start: this session has been through the
-            // check before, and what arrived since comes by catchUp().
-            await rememberBrief(id)
+            // A refresh inside one long-lived process, not a launch: the
+            // instructions again, and no check — a launch is what checks.
+            await remember(id, { at: Date.now() })
             log("info", `re-briefed ${id}: a day since its last brief`)
             return
           }
-          // CATCHUP is already 0 when read_on_init is false, so this one gate
-          // covers both spellings of "do not".
-          const rooms = CATCHUP > 0 ? await myChannels() : []
-          if (rooms.length) {
-            await say(checkPrompt(rooms), {}, id)
-            log("info", `briefed ${id}; checking ${rooms.length} ` +
-                        `channel(s): ${rooms.join(", ")}`)
-          } else {
-            log("info", `briefed ${id}` +
-                        (CATCHUP > 0 ? " — in no channels, nothing to check"
-                                     : " (read_on_init off)"))
-          }
-          if (!stopped) await rememberBrief(id)
+          // A launch — a new process, or a session this process has never
+          // briefed: the check too, as it always did.
+          log("info", `briefed ${id}`)
+          await sendCheck(id)
+          if (!stopped) await remember(id, { at: Date.now(), checkedAt: Date.now() })
         } catch (e) {
           briefed.delete(id)         // let the next caller try again
           log("error", `could not brief: ${e}`)
@@ -1105,10 +1168,10 @@ async function core(host) {
           const sn = await currentSession()
           if (sn?.id) {
             sessionID = sn.id
-            // Once per session, not once per instance: V2 recycles this
-            // instance about hourly, and each one used to say it again into
-            // the same conversation.
-            if (HELLO && (await briefState(sn.id)) !== "fresh") {
+            // On a launch only — a new process, or a session this process
+            // never briefed: V2 recycles this instance about hourly, and each
+            // one used to say it again into the same conversation.
+            if (HELLO && (await briefState(sn.id)) === null) {
               await say(`[a2a] connected as ${name} — ${URL_BASE}`,
                         { noReply: true }, sn.id)
             }
@@ -1349,6 +1412,19 @@ async function core(host) {
     const id = p.sessionID ?? p.info?.sessionID ?? p.info?.id ?? p.id
     if (typeof id === "string" && id !== sessionID && roots.has(id)) {
       sessionID = id
+    }
+    // OpenCode 2: the TUI opened this session — a launch, or a resume, as far
+    // as this server can tell. Every one is logged, since this is the signal
+    // the check now rides on.
+    if (type === "session.viewed" && typeof p.sessionID === "string") {
+      log("info", `session.viewed ${p.sessionID} idle=${p.idle}`)
+      const vid = p.sessionID
+      // Listing learns whether it is a root or a subagent's session; only a
+      // root is checked.
+      void currentSession().then(() => {
+        if (roots.has(vid)) sessionID = vid
+        return viewed(vid)
+      })
     }
     // Which events count, decided from what OpenCode actually emits rather
     // than from what sounds right. session.idle fires only after a turn has
