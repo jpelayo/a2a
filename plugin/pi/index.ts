@@ -84,9 +84,8 @@ const CLIENT_SECRET = join(homedir(), ".pi", "agent", "a2a-client.secret");
 // replaces the instance on /new, /resume, /fork and /reload, and each new one
 // briefed the same session again — the instructions, and a check prompt that
 // starts a turn. Keyed by Pi's session id, which a resume reads back from the
-// session file's header, so a new process sees the same id. After a day the
-// instructions go in once more (no turn), so a session Pi has compacted does
-// not stay without them for long.
+// session file's header. Consulted only when Pi was NOT launched: a launch
+// (`pi`, `pi -c`) always briefs and checks.
 const BRIEFS = join(homedir(), ".pi", "agent", "a2a-briefed.json");
 const BRIEF_REFRESH_MS = 24 * 3600_000;
 const BRIEF_KEEP_MS = 30 * 24 * 3600_000;
@@ -521,6 +520,10 @@ export default function (pi: ExtensionAPI) {
   // This session's id, from session_start's context. Empty when Pi gives
   // none, and then nothing is remembered: the brief behaves as it always did.
   let sessionId = "";
+  // Why Pi started this instance: "startup" is a launch from the terminal
+  // (`pi`, `pi -c`) and the only reason that runs the channel check;
+  // "reload", "new", "resume" and "fork" happen inside a running Pi.
+  let startReason = "startup";
 
   // --- delivery state -------------------------------------------------------
   let briefed = false;
@@ -774,10 +777,15 @@ export default function (pi: ExtensionAPI) {
   async function briefSession() {
     if (briefed) return;
     try {
-      const state = await briefState();
+      // A LAUNCH from the terminal — `pi` or `pi -c` — briefs and checks, as
+      // it always did. Everything else Pi starts an instance for (/reload,
+      // /new, /resume, /fork, all inside a running Pi) is not a launch: it
+      // gets the instructions only if this session lacks them, and no check.
+      const launch = startReason === "startup";
+      const state = launch ? null : await briefState();
       if (state === "fresh") {
-        // A reload, a /resume, or `pi -c` on a session that already has all
-        // of this. Marked briefed so handOff does not prepend it either.
+        // Typically a /reload: the session already has all of this. Marked
+        // briefed so handOff does not prepend it either.
         briefed = true;
         log(`session ${sessionId} already briefed as ${name}; not again`);
         return;
@@ -788,11 +796,10 @@ export default function (pi: ExtensionAPI) {
         { triggerTurn: false, deliverAs: "followUp" },
       );
       briefed = true;
-      if (state === "stale") {
-        // A refresh, not a new start: this session has been through the check
-        // before, and what arrived since comes by catchUp().
+      if (!launch) {
         await rememberBrief();
-        log(`re-briefed session ${sessionId}: a day since its last brief`);
+        log(`briefed session ${sessionId} (${startReason}); no channel check — ` +
+            `that runs when Pi is launched`);
         return;
       }
       // CATCHUP is already 0 when read_on_init is false, so this one gate
@@ -1030,7 +1037,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   let pumping = false;
-  pi.on("session_start", async (_event: any, ctx: any) => {
+  pi.on("session_start", async (event: any, ctx: any) => {
+    // A Pi that sends no reason predates it: treat the start as a launch,
+    // which is what this client always did.
+    startReason = String(event?.reason || "startup");
     // The id Pi resumes this session under — read back from the session
     // file's header, so the same in a new process. What the brief is
     // remembered by.
