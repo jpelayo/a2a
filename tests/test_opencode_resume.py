@@ -103,6 +103,13 @@ globalThis.fetch = async (url, init = {}) => {
 
 // --- fake OpenCode 2 ---------------------------------------------------------
 const prompts = []
+// The server's event stream: quiet unless the test emits, as an idle one is.
+const evq = []
+let evWake = null
+const emitEvent = (type, data) => {
+  evq.push({ type, data, location: { directory: project } })
+  if (evWake) { const w = evWake; evWake = null; w() }
+}
 const ctx = {
   app: { name: "opencode", version: "2.1.3", channel: "latest" },
   location: { directory: project, project: { id: "p", directory: project } },
@@ -116,6 +123,11 @@ const ctx = {
             const end = () => resolve({ done: true, value: undefined })
             if (signal?.aborted) return end()
             signal?.addEventListener("abort", end, { once: true })
+            const pull = () => {
+              if (evq.length) return resolve({ done: false, value: evq.shift() })
+              evWake = pull
+            }
+            pull()
           }),
           return: async () => ({ done: true, value: undefined }),
         }
@@ -139,13 +151,20 @@ const MEMO = join(DATA, "opencode", "a2a-briefed.json")
 const memo = () => JSON.parse(readFileSync(MEMO, "utf8"))
 
 /** One instance's life, as V2 runs it: setup, a while, then cleanup. */
-const life = async () => {
+const life = async (during) => {
   prompts.length = 0; calls = []; acked = []
   const cleanup = await plugin.setup(ctx)
   await settle()
+  if (during) await during()
   const seen = { prompts: [...prompts], calls: [...calls], acked: [...acked] }
   await cleanup()
   return seen
+}
+/** Rewrite one session's memory entry, as time or another process would. */
+const forge = (id, change) => {
+  const m = memo()
+  change(m[id])
+  writeFileSync(MEMO, JSON.stringify(m))
 }
 
 const out = {}
@@ -170,9 +189,23 @@ out.catchup = await life()
 
 broker.peek = []; broker.stream = []; broker.peek404 = true
 out.nopeek = await life()
+broker.peek404 = false
+
+// A server restart: the entry was written by ANOTHER process.
+forge("ses_r", (e) => { e.boot = "1@0" })
+out.restart = await life()
+
+// Opening the session in the TUI, its last check eleven minutes ago: a launch
+// as far as the server can tell. Opened again at once: within the cooldown.
+forge("ses_r", (e) => { e.checkedAt -= 11 * 60_000 })
+out.viewed = await life(async () => {
+  emitEvent("session.viewed", { sessionID: "ses_r", idle: true })
+  await settle()
+  emitEvent("session.viewed", { sessionID: "ses_r", idle: true })
+  await settle()
+})
 
 // --- OpenCode 1: server(), a new process per launch ---------------------------
-broker.peek404 = false
 const v1prompts = []
 const client = {
   app: { log: async () => {} },
@@ -189,7 +222,10 @@ await plugin.server({ client, directory: project })
 await settle()
 out.v1_first = [...v1prompts]
 v1prompts.length = 0
-await plugin.server({ client, directory: project })     // `opencode -c`
+// `opencode -c`: OpenCode 1 is a new process per launch, so the entry the
+// last one wrote carries another process's mark.
+forge("ses_v1", (e) => { e.boot = "1@0" })
+await plugin.server({ client, directory: project })
 await settle()
 out.v1_second = [...v1prompts]
 
@@ -238,8 +274,10 @@ def main() -> int:
                       for p in out["first"]["prompts"]]))
     memo = out["memo_first"] or {}
     check("and the brief is remembered on disk, as this agent's, for this "
-          "session", memo.get("key") == "resume-proj"
-          and memo.get("name") == "resume-proj", str(memo))
+          "session, marked with the process that wrote it",
+          memo.get("key") == "resume-proj"
+          and memo.get("name") == "resume-proj" and bool(memo.get("boot"))
+          and bool(memo.get("checkedAt")), str(memo))
     check("in the DATA directory — never config, which OpenCode 2 watches",
           not out["config_memo"])
 
@@ -303,14 +341,29 @@ def main() -> int:
           any(c.startswith("/stream") for c in np["calls"]) and np["prompts"] == [],
           f"{np['calls']} {json.dumps(np['prompts'])[:200]}")
 
+    # --- a launch checks: a server restart, a session opened ----------------------
+    rs = kinds(out["restart"]["prompts"])
+    check("OpenCode 2: a server RESTART — the entry is another process's — "
+          "briefs and checks again, hello included",
+          len(rs["brief"]) == 1 and len(rs["check"]) == 1 and len(rs["hello"]) == 1,
+          json.dumps(out["restart"]["prompts"])[:400])
+    vw = kinds(out["viewed"]["prompts"])
+    check("OpenCode 2: opening the session in the TUI runs the channel check "
+          "(with the hello), and nothing else — the instructions are there",
+          len(vw["check"]) == 1 and len(vw["hello"]) == 1 and not vw["brief"],
+          json.dumps(out["viewed"]["prompts"])[:400])
+    check("…once: opening it again within the cooldown spends no second turn",
+          len(vw["check"]) == 1, json.dumps(out["viewed"]["prompts"])[:400])
+
     # --- OpenCode 1 ------------------------------------------------------------------
-    v1 = [p for p in out["v1_first"] if "You are a2a agent" in p["text"]]
-    check("OpenCode 1: the first launch briefs its session", len(v1) == 1,
+    v1 = kinds([dict(p, resume=not p["noReply"]) for p in out["v1_first"]])
+    check("OpenCode 1: the first launch briefs and checks its session",
+          len(v1["brief"]) == 1 and len(v1["check"]) == 1,
           json.dumps(out["v1_first"])[:300])
-    check("and the next launch on that session — a resume — does not brief it "
-          "again", not any("You are a2a agent" in p["text"]
-                           or "Check your channels" in p["text"]
-                           for p in out["v1_second"]),
+    v1b = kinds([dict(p, resume=not p["noReply"]) for p in out["v1_second"]])
+    check("and the NEXT launch on that session — `opencode -c`, a new process "
+          "— briefs and checks it again, as it always did",
+          len(v1b["brief"]) == 1 and len(v1b["check"]) == 1,
           json.dumps(out["v1_second"])[:300])
 
     print()
