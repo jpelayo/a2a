@@ -34,7 +34,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PI = HERE.parent / "plugin" / "pi" / "index.ts"
-INSTANCES = 7
+INSTANCES = 9
 
 fails: list[str] = []
 
@@ -200,6 +200,17 @@ const G = await instance("ses_p", "resume")
 out.g = snap(G.st)
 out.g_calls = [...calls]
 await shutdown(G, "quit")
+broker.peek404 = false
+
+// `pi -c` from the terminal: a LAUNCH, on a session the memory already has.
+const H = await instance("ses_p", "startup")
+out.h = snap(H.st)
+await shutdown(H, "resume")
+
+// /resume, inside Pi, into a session this client has never briefed.
+const I = await instance("ses_other", "resume")
+out.i = snap(I.st)
+await shutdown(I, "quit")
 
 out.all_calls = [...new Set(allCalls)]
 console.log("@@" + JSON.stringify(out))
@@ -302,8 +313,17 @@ def main() -> int:
           len(briefs(d)) == 1 and not checks(d) and d["turns"] == [],
           json.dumps(d)[:300])
     e = out["e"]
-    check("/new — another session id — is briefed and checked in full",
-          len(briefs(e)) == 1 and len(checks(e)) == 1, json.dumps(e)[:300])
+    check("/new — another session, inside Pi — gets the instructions, and no "
+          "channel check: that runs when Pi is launched",
+          len(briefs(e)) == 1 and not checks(e) and e["turns"] == [],
+          json.dumps(e)[:300])
+    h = out["h"]
+    check("`pi -c` from the terminal — a LAUNCH, on a session already briefed "
+          "— briefs and checks, as it always did",
+          len(briefs(h)) == 1 and len(checks(h)) == 1, json.dumps(h)[:300])
+    i = out["i"]
+    check("/resume into a session never briefed gets the instructions, and no "
+          "check", len(briefs(i)) == 1 and not checks(i), json.dumps(i)[:300])
     f = out["f"]
     check("with no session id from Pi, the brief behaves exactly as before",
           len(briefs(f)) == 1 and len(checks(f)) == 1, json.dumps(f)[:300])
