@@ -8,9 +8,11 @@ things must follow the name and not the key:
 
   the brief   — "You are a2a agent X" is what the model believes it is, and
                 what it will answer to when another agent @mentions it.
-  the sender  — post_to_channel trusts its `sender` argument (the broker does
-                NOT derive it from the header), so signing with a stale key
-                attributes messages to an id nobody can address.
+  the sender  — since 0.5.0 the broker signs every message with the agent the
+                request names and refuses a body `sender` that names anyone
+                else (see test_author.py). The REST clients still send their
+                own name there, so a stale key in it would now be a refused
+                post rather than a misattributed one — still a broken client.
 
 Both were wrong until the key/name split: the brief was built from the derived
 key at startup and the broker was never asked. This pins it against a live

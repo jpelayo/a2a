@@ -57,6 +57,9 @@ process.env.A2A_URL = "http://broker.invalid"
 process.env.A2A_TOKEN = "dev"
 process.env.A2A_HELLO = "0"
 process.env.HOME = %(home)s
+// The client secret lives under OpenCode's data dir: this HOME's, never the
+// real one, even when the real environment sets XDG_DATA_HOME.
+process.env.XDG_DATA_HOME = %(home)s + "/.local/share"
 %(agent)s
 globalThis.fetch = async (url) => {
   const path = String(url).replace("http://broker.invalid", "")
@@ -72,7 +75,7 @@ globalThis.fetch = async (url) => {
   return ok({})
 }
 const mod = await import(%(module)s)
-const plugin = await mod.A2A({
+const plugin = await mod.default.server({
   client: { app: { log: async () => {} } },
   directory: %(project)s,
   $: () => {},

@@ -71,11 +71,15 @@ serves several profiles in one process.
 # above to a no-op expression, so the seam is an assignment it can find.
 A2A_BAKED = {}
 
+import base64
 import contextvars
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.error
@@ -240,6 +244,53 @@ def _live_key(ui_session_id):
         return ""
 
 
+# --- the client key ------------------------------------------------------------
+# Which BOT this is. The broker pins each agent to the first client key that
+# acts as it, so no other harness, directory or bot — and no model in one —
+# can speak as an agent this bot owns. A bot has no project directory: the
+# scope is the profile, and the secret lives in the profile's home, so every
+# process of one bot (gateway, desktop backend, CLI) derives the same key.
+# DERIVED, never stored as such: HMAC-SHA256 of the scope under that secret,
+# which is written whole to a private temp file and link()ed into place —
+# link fails if another process got there first, so no two keys can exist.
+
+def derive_client_key(home, scope):
+    """The key for `scope` under `home`'s secret, '' if it cannot be had."""
+    try:
+        root = Path(home)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "a2a-client.secret"
+        if not path.exists():
+            tmp = root / f".a2a-client.secret.{os.getpid()}.{secrets.token_hex(4)}"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(secrets.token_hex(32) + "\n")
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass              # someone else won; theirs is THE one
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        secret = bytes.fromhex(path.read_text().strip())
+        if len(secret) != 32:
+            return ""                 # damaged: no key, never a wrong one
+        mac = hmac.new(secret, scope.encode(), hashlib.sha256).digest()
+        return "a2a_ck_" + base64.urlsafe_b64encode(mac).decode().rstrip("=")[:32]
+    except Exception:
+        return ""
+
+
+# The key of the bot making this call. A context variable rather than an
+# argument: one gateway process can serve several bots, so the key must come
+# from the instance doing the calling, and every caller goes through it.
+_client_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "a2a_client_key", default="")
+
+
 # --- broker HTTP -------------------------------------------------------------
 
 def api(method, path, body=None, timeout=30, agent=""):
@@ -251,6 +302,9 @@ def api(method, path, body=None, timeout=30, agent=""):
     # every call by — acks above all: /ack marks only THIS agent's receipts.
     if agent:
         req.add_header("X-A2A-Agent", agent)
+    ck = _client_ctx.get()
+    if ck:
+        req.add_header("X-A2A-Client", ck)
     if STATION:
         req.add_header("X-A2A-Station", STATION)
     if data is not None:
@@ -683,6 +737,10 @@ class A2AHermes:
             self.profile = ""
         self.log_file = self.home / "logs" / "a2a.log"
         self._log_lock = threading.Lock()
+        # Derived on first use (client_key), never at register(): loading the
+        # plugin must not write anything.
+        self._client_key = None
+        self._key_lock = threading.Lock()
 
         self.agent_setting = str(self._get("agent") or "")
         self.enabled = self._get("enabled") is True
@@ -779,11 +837,31 @@ class A2AHermes:
         except Exception:
             pass
 
+    def client_key(self):
+        """This bot's key for the broker, derived once. '' if none — and a
+        failure is not cached, so the next request tries again rather than
+        leaving the bot keyless, and refused, until it restarts."""
+        with self._key_lock:
+            if not self._client_key:
+                self._client_key = derive_client_key(
+                    self.home, f"profile:{self.profile or 'default'}")
+                if not self._client_key:
+                    self.log("no client key, so this bot can claim no agent")
+            return self._client_key or ""
+
     def api(self, method, path, body=None, timeout=30, agent=None):
-        return api(method, path, body, timeout, agent or self.key)
+        tok = _client_ctx.set(self.client_key())
+        try:
+            return api(method, path, body, timeout, agent or self.key)
+        finally:
+            _client_ctx.reset(tok)
 
     def api_text(self, method, path, body=None):
-        return api_text(method, path, body, agent=self.key)
+        tok = _client_ctx.set(self.client_key())
+        try:
+            return api_text(method, path, body, agent=self.key)
+        finally:
+            _client_ctx.reset(tok)
 
     @staticmethod
     def _chat_label(route):
@@ -1020,9 +1098,20 @@ class A2AHermes:
         if new_id == self.key:
             return json.dumps({"agent_id": new_id, "note": "already this id"})
         mine = self.api("GET", "/me/agents", timeout=15)
-        ids = [r.get("agent_id") for r in (mine or {}).get("agents") or []] \
-            if isinstance(mine, dict) else []
-        if new_id in ids:
+        rows = [r for r in (mine or {}).get("agents") or []
+                if isinstance(r, dict)] if isinstance(mine, dict) else []
+        found = next((r for r in rows if r.get("agent_id") == new_id), None)
+        if found and (found.get("client") == "other"
+                      or (found.get("bound") and not found.get("bound_to_me"))):
+            # Refused HERE, before anything is written: the broker refuses
+            # every request as an agent another client holds, and a config
+            # already pointing at it would leave this bot stuck on it.
+            return json.dumps({"error": (
+                f"{new_id} belongs to another client (another harness, "
+                f"directory, bot or token), so this bot cannot become it. Pick a new "
+                f"name, or ask an operator to release it: a2a-mcp.py agent "
+                f"free {new_id} --station <station>")})
+        if found:
             # Already ours: adopt it. The old agent stays as it is, so what is
             # in flight is still ITS, and is acked as it.
             self._become(new_id, moved=False)
@@ -1183,6 +1272,11 @@ class A2AHermes:
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {TOKEN}")
         req.add_header("X-A2A-Agent", stream_key)
+        # The broker re-checks the client key on every keepalive, so a stream
+        # for an agent another client claims ends instead of delivering here.
+        ck = self.client_key()
+        if ck:
+            req.add_header("X-A2A-Client", ck)
         if STATION:
             req.add_header("X-A2A-Station", STATION)
         try:
@@ -1407,6 +1501,7 @@ class A2AHermes:
             batches = {a: sorted(ids) for a, ids in self._ackq.items() if ids}
         ok = True
         for agent, ids in batches.items():
+            tok = _client_ctx.set(self.client_key())
             try:
                 api("POST", "/ack", {"ids": ids}, timeout=timeout, agent=agent)
             except Exception as e:
@@ -1414,6 +1509,8 @@ class A2AHermes:
                          f"{e!r}")
                 ok = False
                 continue
+            finally:
+                _client_ctx.reset(tok)
             with self._lock:
                 q = self._ackq.get(agent)
                 if q is not None:
@@ -1481,6 +1578,10 @@ class A2AHermes:
                     "is the user's decision: only if they ask for a2a, in the "
                     "chat that should carry it, call "
                     "enable_a2a_here(enabled=true)")
+        elif me.get("refused"):
+            # Another client holds this agent, or this install is too old to
+            # send a client key: nothing else will work until that is fixed.
+            step = f"the broker refuses to act as this agent: {me['refused']}"
         elif not registered:
             step = ("you are not registered in this station yet: call "
                     "propose_me(note=\"what this bot is for\") and an "

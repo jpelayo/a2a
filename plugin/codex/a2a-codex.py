@@ -75,9 +75,12 @@ error anywhere. That is what the store prevents.
 A2A_BAKED = {}
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import struct
@@ -267,6 +270,64 @@ def pin(agent_id):
 KEY, EXPLICIT = resolve_key()
 NAME = KEY
 
+# --- the client key ------------------------------------------------------------
+# Which harness-directory this is. The broker pins each agent to the first
+# client key that acts as it, so no other harness or directory — and no model
+# in one — can speak as an agent this client owns. DERIVED, never stored per
+# project: HMAC-SHA256 of the scope (`dir:<project>`, or `agent:<id>` when the
+# id was chosen for the process or at install) under one secret per install.
+# The secret is written whole to a private temp file and link()ed into place,
+# which fails if another process got there first — so several Codex sessions
+# in one directory never hold two keys. Computed on first use, not at import:
+# importing the client must not write anything.
+CLIENT_SECRET = CODEX_HOME / "a2a-client.secret"
+_CLIENT_SCOPE = (f"agent:{KEY}" if EXPLICIT
+                 else f"dir:{os.path.abspath(os.getcwd())}")
+_client_lock = threading.Lock()
+_client_cache: list = []
+
+
+def _derive_client_key():
+    try:
+        root = CLIENT_SECRET.parent
+        root.mkdir(parents=True, exist_ok=True)
+        if not CLIENT_SECRET.exists():
+            tmp = root / f".a2a-client.secret.{os.getpid()}.{secrets.token_hex(4)}"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(secrets.token_hex(32) + "\n")
+                try:
+                    os.link(tmp, CLIENT_SECRET)
+                except FileExistsError:
+                    pass              # someone else won; theirs is THE one
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        secret = bytes.fromhex(CLIENT_SECRET.read_text().strip())
+        if len(secret) != 32:
+            raise ValueError(f"damaged secret in {CLIENT_SECRET}")
+        mac = hmac.new(secret, _CLIENT_SCOPE.encode(), hashlib.sha256).digest()
+        return "a2a_ck_" + base64.urlsafe_b64encode(mac).decode().rstrip("=")[:32]
+    except Exception as e:
+        log(f"no client key, so this client can claim no agent: {e!r}")
+        return ""
+
+
+def client_key():
+    """This client's key for the broker, '' if it cannot be had. A failure is
+    not cached: the next request tries again rather than staying keyless, and
+    refused, for the rest of the session."""
+    with _client_lock:
+        if not _client_cache:
+            key = _derive_client_key()
+            if not key:
+                return ""
+            _client_cache.append(key)
+        return _client_cache[0]
+
 # --- the project switch --------------------------------------------------------
 # a2a is OFF in a project until <project>/.a2a.json says {"enabled_codex": true}.
 #
@@ -397,6 +458,11 @@ def api(method, path, body=None, timeout=30):
     # The id this session acts as. Several agents share one token, so this is
     # what the broker scopes every call by.
     req.add_header("X-A2A-Agent", KEY)
+    # And which harness-directory says so: the broker refuses an agent another
+    # client holds, and lets this one claim an agent nobody holds yet.
+    ck = client_key()
+    if ck:
+        req.add_header("X-A2A-Client", ck)
     if STATION:
         req.add_header("X-A2A-Station", STATION)
     if data is not None:
@@ -869,6 +935,12 @@ def pump():
             req = urllib.request.Request(url)
             req.add_header("Authorization", f"Bearer {TOKEN}")
             req.add_header("X-A2A-Agent", stream_key)
+            # The broker re-checks the client key on every keepalive, so a
+            # stream for an agent another client claims ends instead of
+            # delivering into the wrong session.
+            ck = client_key()
+            if ck:
+                req.add_header("X-A2A-Client", ck)
             with urllib.request.urlopen(
                     req, timeout=STREAM_READ_TIMEOUT) as resp:
                 _state["connected"] = True
@@ -1155,9 +1227,20 @@ def _rename_me(a):
     if new_id == KEY:
         return json.dumps({"agent_id": KEY, "note": "already this id"})
     mine = api("GET", "/me/agents", timeout=15)
-    ids = [r.get("agent_id") for r in (mine or {}).get("agents") or []] \
+    rows = [r for r in (mine or {}).get("agents") or [] if isinstance(r, dict)] \
         if isinstance(mine, dict) else []
-    if new_id in ids:
+    found = next((r for r in rows if r.get("agent_id") == new_id), None)
+    if found and (found.get("client") == "other"
+                  or (found.get("bound") and not found.get("bound_to_me"))):
+        # Refused HERE, before anything is written: the broker refuses every
+        # request as an agent another harness-directory holds, and a store
+        # already pointing at it would leave this client stuck on it.
+        return json.dumps({"error": (
+            f"{new_id} belongs to another client (another harness, directory "
+            f"or token), so this one cannot become it. Pick a new name, or "
+            f"ask an operator to release it: a2a-mcp.py agent free {new_id} "
+            f"--station <station>")})
+    if found:
         # Already ours: adopt it locally rather than asking the broker to
         # rename anything, which would move the wrong agent.
         KEY = NAME = new_id
@@ -1265,6 +1348,10 @@ def _status(a):
                 f'{{"{ENABLE_KEY}": true}}, so nothing is delivered here. '
                 "That is the user's decision: only if they ask for a2a in "
                 "this project, call enable_a2a_here(enabled=true)")
+    elif me.get("refused"):
+        # Another client holds this agent, or this install is too old to send
+        # a client key: nothing else will work until that is fixed.
+        step = f"the broker refuses to act as this agent: {me['refused']}"
     elif not registered:
         step = ("you are not registered in this station yet: call "
                 "propose_me(note=\"what this project is\") and an operator "

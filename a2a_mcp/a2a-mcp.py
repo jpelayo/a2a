@@ -118,7 +118,12 @@ from starlette.routing import Mount, Route
 # 0.4.0: no schema change. Every client's "you are behind" notice now names
 # the installer at GET /install instead of a per-harness curl line, and that
 # only reaches a copy that knows it is behind.
-VERSION = "0.4.0"
+# 0.5.0: who sent a message is the broker's call. The author of every write
+# is the agent the request names — no tool takes a `sender` any more — and
+# each agent is pinned to the one harness-directory client that first used
+# it (agents.owner_client_hash, added in place). Clients must send the new
+# X-A2A-Client header to claim anything, so every install has to update.
+VERSION = "0.5.0"
 
 # Storage is MariaDB (A2A_DB_HOST and friends, defined with the pool below).
 # A2A_DB_FILE survives as one thing only: where `migrate` starts looking for a
@@ -542,6 +547,11 @@ CREATE TABLE IF NOT EXISTS agents (
   -- NULL = unclaimed; the first token to act as this agent claims it, and
   -- afterwards only that token may (agent pinning).
   owner_token_hash  VARCHAR(64)  NULL,
+  -- The same rule one level down: sha256 of the X-A2A-Client key of the
+  -- harness-directory that first acted as this agent. A token is per USER,
+  -- so without this any of that user's harnesses could be any of their
+  -- agents. NULL = no client has claimed it yet.
+  owner_client_hash VARCHAR(64)  NULL,
   PRIMARY KEY (station_id, agent_id),
   KEY idx_agents_agent_id (agent_id),
   FOREIGN KEY (station_id) REFERENCES stations(station_id) ON DELETE CASCADE
@@ -739,8 +749,9 @@ CREATE TABLE IF NOT EXISTS agent_proposals (
 -- A denied TRANSFER request, and how long the refusal stands. Its own table
 -- rather than a column on agent_proposals for two reasons: that table's PK is
 -- (station_id, agent_id), so a denial parked there would block every OTHER
--- token from proposing the same name; and this file has no add-column
--- migration path, while a new table lands on an old volume by itself.
+-- token from proposing the same name; and a new table lands on an old
+-- volume by itself (the only other change allowed here is an additive,
+-- idempotent ALTER at the end of SCHEMA, as 0.5.0 makes).
 --
 -- Keyed by the REQUESTING token. Telling one client no says nothing about the
 -- next one, which may have a perfectly good reason to ask.
@@ -777,6 +788,13 @@ CREATE TABLE IF NOT EXISTS logs (
   KEY idx_logs_ts (ts),
   KEY idx_logs_station_ts (station, ts)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
+    # Additive and idempotent, so it runs on every start like everything
+    # above: a database made before 0.5.0 gains the column in place, one made
+    # since already has it from the CREATE. This is the ONLY kind of change
+    # allowed here — never a rename, a drop or a type change.
+    """
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS
+  owner_client_hash VARCHAR(64) NULL AFTER owner_token_hash;""",
 )
 
 
@@ -1054,7 +1072,9 @@ def _init_schema() -> None:
     """Create the schema if it is not there. Idempotent, runs at every start.
 
     There is no in-place migration path here any more, and that is the point of
-    the move. The sqlite build carried a stack of them — v1 station scoping,
+    the move — beyond one kind of statement: an additive, idempotent ALTER at
+    the end of SCHEMA (`ADD COLUMN IF NOT EXISTS`), which runs on every start
+    like the rest and changes nothing the second time. The sqlite build carried a stack of them — v1 station scoping,
     tokens-as-users, expiry columns, the receipts backfill — because every
     deployment upgraded its own file, in place, on boot. A MariaDB database is
     created by this DDL and filled either by use or, once, by `migrate`.
@@ -1164,6 +1184,11 @@ _current_denial: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _current_auth: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "a2a_current_auth", default=None
 )
+# sha256 of the X-A2A-Client key this request carried, or None. Never the key
+# itself: like a token, it is only ever compared by hash.
+_current_client: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "a2a_current_client", default=None
+)
 
 REGISTER_HINT = (
     "ask an operator to create it: "
@@ -1193,19 +1218,79 @@ def require_station() -> str:
     auth, agent = _current_auth.get(), _current_agent.get()
     if auth and agent:
         try:
-            sid = resolve_request_station(auth, agent)
+            sid = resolve_request_station(auth, agent, _current_client.get())
         except AgentDenied as e:
-            raise AuthRequired(f"{e}; {REGISTER_HINT}") from e
+            raise AuthRequired(_with_hint(str(e))) from e
         _current_station.set(sid)
         _current_denial.set(None)
         return sid
     reason = _current_denial.get() or "this request named no agent"
-    raise AuthRequired(f"{reason}; {REGISTER_HINT}")
+    raise AuthRequired(_with_hint(reason))
+
+
+def _with_hint(reason: str) -> str:
+    """A refusal, plus how to register — unless it already says what to do.
+
+    A client-pin refusal names its own fix (use your own agent, release it,
+    run the installer); appending "ask an operator to create it" would point
+    the reader at an agent that already exists."""
+    if "another client" in reason or "run the installer" in reason:
+        return reason
+    return f"{reason}; {REGISTER_HINT}"
 
 
 def current_agent() -> str | None:
     """The agent this request is acting as, if it named one."""
     return _current_agent.get()
+
+
+class NotYou(Exception):
+    """A request tried to write as an agent other than the one it names."""
+
+
+def _author(claimed: str | None = None) -> str:
+    """Who wrote this — always the agent the request names. Never a caller's
+    word for it.
+
+    Every write that records an author goes through here: channel posts, DMs,
+    shared files, broadcasts, bids, card edits. The author used to be a tool
+    argument (`sender`, `agent_id`) that the MODEL filled in, and nothing
+    compared it with the agent the request authenticated as — so a model in
+    one harness-directory could, and did, post as another agent. Now the
+    broker decides: the tools have no such argument, and a REST body that
+    still names an author must name the caller or is refused.
+
+    `claimed` is that body field, when there is one. Empty means "whoever I
+    am". A TARGET field — a member to add, an agent to propose — is not an
+    author and must never be passed here.
+    """
+    me = current_agent()
+    if not me:
+        raise AuthRequired(
+            "this request names no agent, so it can author nothing: send "
+            "X-A2A-Agent")
+    if claimed is not None and not isinstance(claimed, str):
+        raise NotYou(f"you are {me!r}: an author is a name, and {claimed!r} "
+                     f"is not one — leave it out, you are signed for")
+    if claimed and normalize_agent_id(claimed) != me:
+        log(f"sender.refused: {me!r} tried to write as {claimed!r}",
+            level="WARN", station=_station_name(_current_station.get()),
+            actor=me, event="sender.refused")
+        raise NotYou(
+            f"you are {me!r}: a message is always sent as the agent the "
+            f"request names, never as {claimed!r}")
+    return me
+
+
+def _station_name(station_id: str | None) -> str:
+    """The NAME a log line files a station under — `logs --station` matches
+    names, not ids. Never raises: it runs on the way to refusing something."""
+    if not station_id:
+        return ""
+    try:
+        return (STATIONS.get(station_id) or {}).get("name") or station_id
+    except Exception:
+        return station_id
 
 
 def require_auth() -> dict:
@@ -1294,14 +1379,16 @@ def realm_agent(auth: dict, agent_id: str) -> dict | None:
 
     Returns None when it doesn't exist there (which is also what a caller sees
     for an agent that exists only in a station they aren't granted). Raises if
-    it exists but is pinned to a different token.
+    it exists but is pinned to a different token — or to a different CLIENT:
+    every realm operation (bind, unbind, move, rename, adopt) goes through
+    here, and none of them may reach an agent another harness-directory owns.
     """
     granted = auth.get("stations") or []
     if not granted:
         return None
     ph = ",".join(["%s"] * len(granted))
     rows = CONN.execute(
-        f"SELECT station_id, owner_token_hash FROM agents "
+        f"SELECT station_id, owner_token_hash, owner_client_hash FROM agents "
         f"WHERE agent_id = %s AND station_id IN ({ph})",
         [agent_id, *granted],
     ).fetchall()
@@ -1315,22 +1402,94 @@ def realm_agent(auth: dict, agent_id: str) -> dict | None:
     owner = row["owner_token_hash"]
     if owner and owner != auth["token_hash"]:
         raise AgentDenied(f"agent {agent_id!r} is bound to another token")
+    if auth.get("token_hash"):
+        _client_gate(row["station_id"], agent_id, row["owner_client_hash"],
+                     _current_client.get(), claim=False)
     return row
 
 
-def resolve_request_station(auth: dict, agent_id: str) -> str:
+# --- the client pin ----------------------------------------------------------
+# A token is per USER, and one user runs many harnesses in many directories,
+# so the token pin above cannot tell two of them apart: any of them could act
+# as any of that user's agents, and a model in one did, sending as another.
+# Each harness-directory therefore sends its own key (X-A2A-Client, derived
+# on the client from a per-install secret and the project path), and an agent
+# is pinned to the first key that acts as it, exactly as it is pinned to the
+# first token. Deterministic, and decided here — never by a model.
+
+def client_hash(key: str) -> str | None:
+    """sha256 of a client key, the only form the broker keeps or compares."""
+    key = (key or "").strip()
+    return hashlib.sha256(key.encode()).hexdigest() if key else None
+
+
+def _client_gate(station_id: str, agent_id: str, owner: str | None,
+                 client: str | None, *, claim: bool) -> None:
+    """Refuse a request whose client is not the one this agent belongs to.
+
+    owner set,  same client       allowed
+    owner set,  no client key     refused: an install older than the broker
+    owner set,  other client      refused
+    owner NULL, client key        claimed for that client (when `claim`)
+    owner NULL, no client key     allowed, nothing claimed — an old client
+                                  keeps working until a new one claims it
+    """
+    if owner:
+        if client == owner:
+            return
+        station = _station_name(station_id)
+        log(f"client.mismatch: {agent_id!r} is held by client "
+            f"{owner[:8]}, refused {(client or 'none')[:8]}",
+            level="WARN", station=station, actor=agent_id,
+            event="client.mismatch")
+        if not client:
+            raise AgentDenied(
+                f"agent {agent_id!r} is held by a client that sends a client "
+                f"key; this one sends none, so it is older than the broker — "
+                f"run the installer: curl -fsSL <broker>/install | python3")
+        raise AgentDenied(
+            f"agent {agent_id!r} belongs to another client (another harness "
+            f"or directory). Use your own agent (whoami), or ask an operator "
+            f"to release it: a2a-mcp.py agent free {agent_id} --station "
+            f"{station}")
+    if not client or not claim:
+        return
+    # First come, first served — atomically: the IS NULL guard means two
+    # clients racing for one agent cannot both believe they won.
+    won = CONN.execute(
+        "UPDATE agents SET owner_client_hash = %s "
+        "WHERE station_id = %s AND agent_id = %s AND owner_client_hash IS NULL",
+        (client, station_id, agent_id),
+    ).rowcount
+    if won:
+        log(f"client.pin: {agent_id!r} now belongs to client {client[:8]}",
+            station=_station_name(station_id), actor=agent_id,
+            event="client.pin")
+        return
+    now = CONN.execute(
+        "SELECT owner_client_hash FROM agents "
+        "WHERE station_id = %s AND agent_id = %s",
+        (station_id, agent_id),
+    ).fetchone()
+    _client_gate(station_id, agent_id, (now or {}).get("owner_client_hash"),
+                 client, claim=False)
+
+
+def resolve_request_station(auth: dict, agent_id: str,
+                            client: str | None = None) -> str:
     """Map the agent a request names to the station it may act in.
 
     The token authenticates; the agent selects the tenant. An agent must exist
     (no auto-registration), must live in a station this token is granted, and
-    is pinned to the first token that claims it.
+    is pinned to the first token that claims it — and to the first CLIENT
+    (`client`, the hash of X-A2A-Client), see _client_gate.
     """
     granted = auth.get("stations") or []
     if not granted:
         raise AgentDenied("token has no station grants")
     ph = ",".join(["%s"] * len(granted))
     rows = CONN.execute(
-        f"SELECT station_id, owner_token_hash FROM agents "
+        f"SELECT station_id, owner_token_hash, owner_client_hash FROM agents "
         f"WHERE agent_id = %s AND station_id IN ({ph})",
         [agent_id, *granted],
     ).fetchall()
@@ -1344,6 +1503,8 @@ def resolve_request_station(auth: dict, agent_id: str) -> str:
     owner = row["owner_token_hash"]
     if owner and owner != auth["token_hash"]:
         raise AgentDenied(f"agent {agent_id!r} is bound to another token")
+    _client_gate(row["station_id"], agent_id, row.get("owner_client_hash"),
+                 client, claim=True)
     if not owner:
         try:
             CONN.execute(
@@ -2491,9 +2652,11 @@ class TokenRegistry:
             return 0
         with CONN:
             CONN.execute("DELETE FROM token_grants WHERE token_hash = %s", (h,))
+            # Its agents are free again — for any token, and so for any
+            # client: a client pin left behind would refuse the next holder.
             CONN.execute(
-                "UPDATE agents SET owner_token_hash = NULL "
-                "WHERE owner_token_hash = %s", (h,)
+                "UPDATE agents SET owner_token_hash = NULL, "
+                "owner_client_hash = NULL WHERE owner_token_hash = %s", (h,)
             )
             cur = CONN.execute(
                 "DELETE FROM tokens WHERE token_hash = %s", (h,)
@@ -2528,8 +2691,9 @@ class TokenRegistry:
                     "DELETE FROM token_grants WHERE token_hash = %s", (h,)
                 )
                 CONN.execute(
-                    "UPDATE agents SET owner_token_hash = NULL "
-                    "WHERE owner_token_hash = %s", (h,)
+                    "UPDATE agents SET owner_token_hash = NULL, "
+                    "owner_client_hash = NULL WHERE owner_token_hash = %s",
+                    (h,)
                 )
                 n += CONN.execute(
                     "DELETE FROM tokens WHERE token_hash = %s", (h,)
@@ -2732,7 +2896,7 @@ class AgentRegistry:
         sql = (
             "SELECT a.agent_id, a.station_id, s.name AS station_name, "
             "a.owner_token_hash, t.prefix AS owner_prefix, t.user AS owner_user, "
-            "a.created_at FROM agents a "
+            "a.owner_client_hash, a.created_at FROM agents a "
             "LEFT JOIN stations s ON s.station_id = a.station_id "
             "LEFT JOIN tokens t ON t.token_hash = a.owner_token_hash"
         )
@@ -2827,9 +2991,17 @@ class AgentRegistry:
         through `bind` would mean un-hashing something that cannot be
         un-hashed. Same SQL and the same CHANGED-rows return either way, so
         the two paths cannot drift.
+
+        A change of token releases the client pin too — the agent is going
+        to another user (or to nobody), whose harness claims it on first use;
+        kept, it would refuse the new holder forever. The client assignment
+        comes FIRST because MariaDB evaluates SET left to right: it must see
+        the token as it was.
         """
-        sql = "UPDATE agents SET owner_token_hash = %s WHERE agent_id = %s"
-        params: list = [token_hash, agent_id]
+        sql = ("UPDATE agents SET owner_client_hash = "
+               "IF(owner_token_hash <=> %s, owner_client_hash, NULL), "
+               "owner_token_hash = %s WHERE agent_id = %s")
+        params: list = [token_hash, token_hash, agent_id]
         if station_id:
             st = STATIONS.get(station_id)
             if not st:
@@ -2847,8 +3019,12 @@ class AgentRegistry:
         h = TOKENS._hash_of(token_or_prefix) if token_or_prefix else None
         if token_or_prefix and not h:
             raise KeyError(f"token {token_or_prefix!r} not found")
-        sql = "UPDATE agents SET owner_token_hash = %s"
-        params: list = [h]
+        # As in _bind_hash: a change of token releases the client pin, and the
+        # client assignment must come first to see the token as it was.
+        sql = ("UPDATE agents SET owner_client_hash = "
+               "IF(owner_token_hash <=> %s, owner_client_hash, NULL), "
+               "owner_token_hash = %s")
+        params: list = [h, h]
         if station_id:
             st = STATIONS.get(station_id)
             if not st:
@@ -2868,13 +3044,19 @@ class AgentRegistry:
             names.get(g, g) for g in (auth.get("stations") or [])
         ]
         mine = []
+        me = _current_client.get()
         for g in auth.get("stations") or []:
             for r in self.list_all(g):
+                held = r.get("owner_client_hash")
                 mine.append({
                     "agent_id": r["agent_id"],
                     "station": r.get("station_name") or r["station_id"],
                     "bound_to_me": r.get("owner_token_hash") == auth["token_hash"],
                     "bound": bool(r.get("owner_token_hash")),
+                    # Which harness-directory holds it: this one, another one
+                    # (so adopting it would be refused), or none yet.
+                    "client": (None if not held
+                               else "this" if held == me else "other"),
                 })
         here = None
         if agent_id:
@@ -2887,6 +3069,13 @@ class AgentRegistry:
             "registered": here is not None,
             "this_agent": here,
             "agents": mine,
+            # Why the broker will not act as `agent` for this request, verbatim
+            # — "belongs to another client", "bound to another token" — or
+            # None. A client puts this first in its status, because nothing
+            # else it could suggest will work until this is fixed. Only for an
+            # agent that EXISTS: "unknown agent" is what `registered: false`
+            # already says, and its fix is propose_me, which this would hide.
+            "refused": _current_denial.get() if here is not None else None,
         }
 
     def realm_register(
@@ -2912,13 +3101,29 @@ class AgentRegistry:
         row = realm_agent(auth, agent_id)
         if not row:
             raise KeyError(f"agent {agent_id!r} is not one of your agents")
-        self.bind(agent_id, None)
+        # THIS station's row only. This used to unpin every agent of the same
+        # name in every station first — including stations the token is not
+        # granted, whose agent any token granted there could then take.
         if bind:
+            # realm_agent has already refused another token's or another
+            # client's agent, so this pins it to the caller and keeps the
+            # caller's own client pin.
             with CONN:
                 CONN.execute(
                     "UPDATE agents SET owner_token_hash = %s "
                     "WHERE station_id = %s AND agent_id = %s",
                     (auth["token_hash"], row["station_id"], agent_id),
+                )
+        else:
+            # Releasing: the token pin AND the client pin, so another token's
+            # client can claim it — which is the point of unbinding. Both
+            # outright: bind(None) keeps a client pin when no token was set.
+            with CONN:
+                CONN.execute(
+                    "UPDATE agents SET owner_token_hash = NULL, "
+                    "owner_client_hash = NULL "
+                    "WHERE station_id = %s AND agent_id = %s",
+                    (row["station_id"], agent_id),
                 )
         return {"agent_id": agent_id, "bound": bind}
 
@@ -2927,7 +3132,9 @@ class AgentRegistry:
         if not row:
             raise KeyError(f"agent {agent_id!r} is not one of your agents")
         st = realm_station(auth, station)           # target must be granted too
-        self.move(agent_id, st["station_id"])
+        # From the row realm_agent found, so a same-named agent in a station
+        # this token cannot see is neither touched nor hinted at.
+        self.move(agent_id, st["station_id"], row["station_id"])
         return {"agent_id": agent_id, "station": st["name"]}
 
     def free(self, agent_id: str, station_id: str) -> dict:
@@ -2938,6 +3145,8 @@ class AgentRegistry:
         using it:
 
           owner_token_hash  cleared, so no token is pinned to it
+          owner_client_hash cleared, so no harness-directory is either — the
+                            next client to act as it claims it
           stream_cursors    cleared, so the next holder does not inherit a
                             delivery position and start mid-stream
 
@@ -2954,22 +3163,26 @@ class AgentRegistry:
             raise KeyError(f"station {station_id!r} not found")
         sid = st["station_id"]
         row = CONN.execute(
-            "SELECT owner_token_hash FROM agents "
+            "SELECT owner_token_hash, owner_client_hash FROM agents "
             "WHERE station_id = %s AND agent_id = %s", (sid, agent_id),
         ).fetchone()
         if not row:
             raise KeyError(f"agent {agent_id!r} not found in {st['name']}")
         with CONN:
             CONN.execute(
-                "UPDATE agents SET owner_token_hash = NULL "
+                "UPDATE agents SET owner_token_hash = NULL, "
+                "owner_client_hash = NULL "
                 "WHERE station_id = %s AND agent_id = %s", (sid, agent_id),
             )
             CONN.execute(
                 "DELETE FROM stream_cursors "
                 "WHERE station_id = %s AND agent_id = %s", (sid, agent_id),
             )
+        log(f"agent.free: {agent_id!r} released", station=st["name"],
+            actor=agent_id, event="agent.free")
         return {"agent_id": agent_id, "station_id": sid,
-                "was_held": bool(row["owner_token_hash"])}
+                "was_held": bool(row["owner_token_hash"]),
+                "was_client_held": bool(row.get("owner_client_hash"))}
 
     def rename(self, station_id: str, agent_id: str, new_id: str) -> dict:
         """Rename an agent inside its station, moving everything with it.
@@ -3174,7 +3387,7 @@ class ProposalRegistry:
     """
 
     def propose(self, station_id: str, agent_id: str, token_hash: str,
-                note: str = "") -> dict:
+                note: str = "", client_hash: str | None = None) -> dict:
         st = STATIONS.get(station_id)
         if not st:
             raise KeyError(f"station {station_id!r} not found")
@@ -3188,7 +3401,7 @@ class ProposalRegistry:
         # for a name nobody has, a TRANSFER is a request for one somebody does.
         # Deriving it means the two can never disagree about which this is.
         existing = CONN.execute(
-            "SELECT owner_token_hash FROM agents "
+            "SELECT owner_token_hash, owner_client_hash FROM agents "
             "WHERE station_id = %s AND agent_id = %s",
             (sid, agent_id),
         ).fetchone()
@@ -3196,7 +3409,13 @@ class ProposalRegistry:
         if existing:
             kind = "transfer"
             owner = existing["owner_token_hash"]
-            if not owner:
+            # Held by ANOTHER harness-directory — even under this same token,
+            # say a project opened from a new path. Connecting would be
+            # refused, so it is a transfer for an operator to approve, not
+            # something "already yours" or "unclaimed".
+            pinned = existing.get("owner_client_hash")
+            other_client = bool(pinned) and pinned != client_hash
+            if not owner and not other_client:
                 # Nobody holds it. resolve_request_station binds an unowned
                 # agent to the first token that uses it, so there is nothing
                 # for an operator to decide — asking would only add a step.
@@ -3204,7 +3423,7 @@ class ProposalRegistry:
                     f"agent {agent_id!r} exists in {st['name']} and is "
                     f"unclaimed — just connect as it and it becomes yours"
                 )
-            if owner == token_hash:
+            if owner == token_hash and not other_client:
                 raise ValueError(
                     f"agent {agent_id!r} in {st['name']} is already yours"
                 )
@@ -3390,6 +3609,14 @@ class ProposalRegistry:
                 # Rebind rather than add: the row is already there, and add()
                 # would collide on the composite key.
                 AGENTS._bind_hash(agent_id, holder, sid)
+                # And release the old holder's harness-directory: the token
+                # that won the name connects from its own client, which claims
+                # it on first use. Kept, it would refuse the winner forever.
+                CONN.execute(
+                    "UPDATE agents SET owner_client_hash = NULL "
+                    "WHERE station_id = %s AND agent_id = %s",
+                    (sid, agent_id),
+                )
                 out = {"agent_id": agent_id, "station_id": sid,
                        "kind": "transfer",
                        "taken_from": existing["owner_token_hash"]}
@@ -4433,7 +4660,8 @@ async def bind_me(agent_id: str = "") -> dict:
 
 @mcp.tool()
 async def unbind_me(agent_id: str = "") -> dict:
-    """Release an agent (default: this one) so another token may claim it."""
+    """Release an agent (default: this one) so another token — or another
+    harness-directory under this one — may claim it."""
     auth = require_auth()
     return await _db(
         lambda: AGENTS.realm_bind(auth, agent_id or current_agent() or "", False)
@@ -4473,7 +4701,6 @@ async def get_agent(agent_id: str) -> dict:
 
 @mcp.tool()
 async def update_agent(
-    agent_id: str,
     name: str | None = None,
     description: str | None = None,
     expertise: list[str] | None = None,
@@ -4481,7 +4708,12 @@ async def update_agent(
     system_prompt: str | None = None,
     metadata: dict | None = None,
 ) -> dict:
-    """Update profile fields. None = unchanged."""
+    """Update YOUR OWN card. None = unchanged.
+
+    There is no agent to name: it is always the agent this request is, so one
+    agent can never rewrite another's card.
+    """
+    me = _author()
     fields: dict = {}
     if name is not None:
         fields["name"] = name
@@ -4495,7 +4727,7 @@ async def update_agent(
         fields["system_prompt"] = system_prompt
     if metadata is not None:
         fields["metadata"] = metadata
-    return await AGENTS.update(require_station(), agent_id, **fields)
+    return await AGENTS.update(require_station(), me, **fields)
 
 
 @mcp.tool()
@@ -4584,11 +4816,14 @@ def _receipt(out: dict) -> dict:
 
 @mcp.tool()
 async def post_to_channel(
-    name: str, message: str, sender: str, expires_in: str | None = None,
+    name: str, message: str, expires_in: str | None = None,
     addressed: list[str] | None = None,
 ) -> dict:
     """Persist `message` in the channel transcript. No server-side fan-out —
     members read via get_channel / read_channel.
+
+    It is posted as YOU — the agent this session is. There is no sender to
+    pass: the broker signs every message with the agent the request names.
 
     EVERY member of the channel receives this, reads it and must ack it. That
     set is the `audience` and you do not choose it — a channel post never
@@ -4614,7 +4849,7 @@ async def post_to_channel(
     fit in the context of every agent that receives it.
     """
     return _receipt(await CHANNELS.post(
-        require_station(), name, sender, message, expires_in, addressed))
+        require_station(), name, _author(), message, expires_in, addressed))
 
 
 @mcp.tool()
@@ -4809,18 +5044,17 @@ async def read_dms(since: float | None = None, limit: int = 50) -> list[dict]:
 @mcp.tool()
 async def broadcast(
     problem: str,
-    sender: str,
     expertise: list[str] | None = None,
     projects: list[str] | None = None,
 ) -> dict:
-    """Post a help-wanted broadcast.
+    """Post a help-wanted broadcast, signed as you.
 
     Returns the broadcast id, status="open", and the list of candidate
     agent_ids matching the expertise/project filter. Candidates respond
     asynchronously via submit_bid.
     """
     return await BROADCASTS.create(
-        require_station(), problem, sender, expertise, projects
+        require_station(), problem, _author(), expertise, projects
     )
 
 
@@ -4843,19 +5077,53 @@ async def get_broadcast(broadcast_id: str) -> dict:
 
 
 @mcp.tool()
-async def submit_bid(
-    broadcast_id: str, agent_id: str, bid: str, pitch: str = ""
-) -> dict:
-    """Submit a bid on an open broadcast. `bid` is 'claim' or 'pass'."""
+async def submit_bid(broadcast_id: str, bid: str, pitch: str = "") -> dict:
+    """Submit YOUR bid on an open broadcast. `bid` is 'claim' or 'pass'."""
     return await BROADCASTS.submit_bid(
-        require_station(), broadcast_id, agent_id, bid, pitch
+        require_station(), broadcast_id, _author(), bid, pitch
     )
+
+
+async def _close_own_broadcast(broadcast_id: str) -> dict:
+    """Close a broadcast — only the agent that posted it may, while it exists.
+
+    Closing also acks it for every candidate who never answered, so a
+    stranger closing someone else's request would retire it from inboxes it
+    was still waiting in. A broadcast whose poster has since been REMOVED has
+    nobody left who could close it, though, and would sit open for the whole
+    retention period — so then anyone in the station may.
+    """
+    sid = require_station()
+    me = _author()
+
+    def _poster() -> tuple[dict | None, bool]:
+        row = CONN.execute(
+            "SELECT sender FROM broadcasts WHERE id = %s AND station_id = %s",
+            (broadcast_id, sid),
+        ).fetchone()
+        alive = bool(row) and CONN.execute(
+            "SELECT 1 FROM agents WHERE station_id = %s AND agent_id = %s",
+            (sid, row["sender"]),
+        ).fetchone() is not None
+        return row, alive
+
+    row, poster_exists = await _db(_poster)
+    if not row:
+        raise KeyError(f"broadcast {broadcast_id!r} not found")
+    if row["sender"] != me and poster_exists:
+        log(f"sender.refused: {me!r} tried to close {row['sender']!r}'s "
+            f"broadcast {broadcast_id}", level="WARN",
+            station=_station_name(sid), actor=me, event="sender.refused")
+        raise NotYou(
+            f"you are {me!r}: only {row['sender']!r}, who posted broadcast "
+            f"{broadcast_id!r}, can close it")
+    return await BROADCASTS.close(sid, broadcast_id)
 
 
 @mcp.tool()
 async def close_broadcast(broadcast_id: str) -> dict:
-    """Mark a broadcast as closed (no more bids accepted)."""
-    return await BROADCASTS.close(require_station(), broadcast_id)
+    """Mark a broadcast YOU posted as closed (no more bids accepted)."""
+    return await _close_own_broadcast(broadcast_id)
 
 
 # --- md_files ---------------------------------------------------------------
@@ -4893,19 +5161,36 @@ async def md_store(station_id: str, channel: str, sender: str, filename: str,
     sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def _persist() -> None:
-        CONN.execute(
-            """INSERT INTO md_files (uri, station_id, channel, sender,
-                   filename, content, sha256, size, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-               ON DUPLICATE KEY UPDATE
-                   sender = VALUES(sender),
-                   content = VALUES(content),
-                   sha256 = VALUES(sha256),
-                   size = VALUES(size),
-                   created_at = VALUES(created_at)""",
-            (uri, station_id, channel, sender, filename, content,
-             sha, size, time.time()),
-        )
+        # The channel first: a share to a channel that does not exist used to
+        # store (or overwrite) the file and only THEN fail on the post.
+        if channel:
+            CHANNELS._row(station_id, channel)           # KeyError -> 404
+        with CONN:
+            # Sharing a name again replaces it — for whoever shared it. For
+            # anyone else it would swap the text behind a message signed by
+            # its author, which is writing as them by another route. Locked,
+            # so two first shares of one name cannot both win.
+            prior = CONN.execute(
+                "SELECT sender FROM md_files WHERE station_id = %s AND uri = %s "
+                "FOR UPDATE", (station_id, uri),
+            ).fetchone()
+            if prior and prior["sender"] != sender:
+                raise NotYou(
+                    f"{uri} was shared by {prior['sender']!r}; only they can "
+                    f"replace it. Share yours under another filename.")
+            CONN.execute(
+                """INSERT INTO md_files (uri, station_id, channel, sender,
+                       filename, content, sha256, size, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE
+                       sender = VALUES(sender),
+                       content = VALUES(content),
+                       sha256 = VALUES(sha256),
+                       size = VALUES(size),
+                       created_at = VALUES(created_at)""",
+                (uri, station_id, channel, sender, filename, content,
+                 sha, size, time.time()),
+            )
 
     await _db(_persist)
 
@@ -4957,7 +5242,6 @@ async def md_get(station_id: str, uri: str) -> dict:
 @mcp.tool()
 async def share_md(
     channel: str,
-    sender: str,
     filename: str,
     content: str,
     note: str = "",
@@ -4966,9 +5250,10 @@ async def share_md(
 
     For anything too long to post: the channel gets a short message carrying
     the md:// URI, and whoever needs the text calls fetch_md on it. The caller
-    supplies the bytes — the server never reads from anyone's filesystem.
+    supplies the bytes — the server never reads from anyone's filesystem. It
+    is shared as you; there is no sender to pass.
     """
-    return _receipt(await md_store(require_station(), channel, sender,
+    return _receipt(await md_store(require_station(), channel, _author(),
                                    filename, content, note))
 
 
@@ -5268,17 +5553,34 @@ def _extract_bearer(scope) -> str | None:
 
 
 def _extract_agent(scope) -> str:
-    """Agent id from ?agent= (wins, used by /stream) else X-A2A-Agent."""
+    """Agent id from ?agent= (wins, used by /stream) else X-A2A-Agent.
+
+    The query is parsed exactly as Starlette parses it for the route —
+    decoded keys, and the LAST of repeated ones. It used to take the first
+    raw `agent=`, so `?%61gent=victim` or `?agent=me&agent=victim` was
+    checked here as one agent while /stream served the other."""
     qs = (scope.get("query_string") or b"").decode("latin-1", errors="ignore")
-    for part in qs.split("&"):
-        if part.startswith("agent="):
-            return normalize_agent_id(
-                urllib.parse.unquote_plus(part[len("agent="):])
-            )
+    found = [v for k, v in urllib.parse.parse_qsl(qs, keep_blank_values=True)
+             if k == "agent"]
+    if found:
+        return normalize_agent_id(found[-1])
     for k, v in scope.get("headers") or []:
         if k == AGENT_HEADER:
             return normalize_agent_id(v.decode("latin-1", errors="ignore"))
     return ""
+
+
+# Which harness-directory this request comes from. A header ONLY — never a
+# query parameter, so the key never lands in a proxy's access log.
+CLIENT_HEADER = b"x-a2a-client"
+
+
+def _extract_client(scope) -> str | None:
+    """sha256 of the request's X-A2A-Client key, or None without one."""
+    for k, v in scope.get("headers") or []:
+        if k == CLIENT_HEADER:
+            return client_hash(v.decode("latin-1", errors="ignore"))
+    return None
 
 
 async def _send_json(send, status: int, body: dict) -> None:
@@ -5323,14 +5625,18 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         agent = _extract_agent(scope)
+        client = _extract_client(scope)
         is_realm = path == "/me" or path.startswith("/me/")
         if AUTH_DISABLED:
+            # Dev only. Like the token pin, the client pin is not applied:
+            # nothing is authenticated here, so nothing can be owned.
             dev_auth = {
                 "token_hash": "", "user": "(auth disabled)",
                 "stations": [s["station_id"] for s in STATIONS.list()],
             }
             await self._run(
                 scope, receive, send, DEFAULT_STATION_ID, agent, None, dev_auth,
+                client,
             )
             return
         token = _extract_bearer(scope)
@@ -5356,7 +5662,7 @@ class AuthMiddleware:
             # caller can still reach /me and the realm tools to provision
             # itself. Every station-scoped operation then fails with `denial`.
             try:
-                sid = resolve_request_station(auth, agent)
+                sid = resolve_request_station(auth, agent, client)
             except AgentDenied as e:
                 denial = str(e)
         elif not is_realm:
@@ -5366,13 +5672,15 @@ class AuthMiddleware:
                 {"error": "agent name required: send X-A2A-Agent (or ?agent=)"},
             )
             return
-        await self._run(scope, receive, send, sid, agent, denial, auth)
+        await self._run(scope, receive, send, sid, agent, denial, auth, client)
 
-    async def _run(self, scope, receive, send, sid, agent, denial, auth):
+    async def _run(self, scope, receive, send, sid, agent, denial, auth,
+                   client=None):
         ctx = _current_station.set(sid)
         actx = _current_agent.set(agent or None)
         dctx = _current_denial.set(denial)
         authctx = _current_auth.set(auth)
+        cctx = _current_client.set(client)
         try:
             await self.app(scope, receive, send)
         finally:
@@ -5380,6 +5688,7 @@ class AuthMiddleware:
             _current_agent.reset(actx)
             _current_denial.reset(dctx)
             _current_auth.reset(authctx)
+            _current_client.reset(cctx)
 
 
 # ---------------------------------------------------------------------------
@@ -5738,7 +6047,19 @@ def build_app() -> Starlette:
         # revoked after connect must stop receiving, not run until disconnect.
         token = _extract_bearer(request.scope)
         revalidate = not AUTH_DISABLED and token is not None
+        # And the client it came from: a stream whose agent is released and
+        # claimed by another harness-directory must end, not keep delivering.
+        client = _current_client.get()
+        # The agent the middleware checked. The stream must serve THAT agent
+        # and no other: read independently here, a query the two parsed
+        # differently opened another agent's inbox — replayed in full, its
+        # stream slot taken, its pins claimed at the next re-check.
+        me = current_agent()
         agent_id = normalize_agent_id(request.query_params.get("agent") or "")
+        if agent_id and agent_id != me:
+            raise NotYou(
+                f"this request was authorised as {me!r}, so it cannot stream "
+                f"{agent_id!r}")
         json_mode = request.query_params.get("format") == "json"
         since_param = request.query_params.get("since")
         use_server_cursor = since_param is None
@@ -5820,11 +6141,15 @@ def build_app() -> Starlette:
                             a = TOKENS.resolve(token)
                             if not a:
                                 return False
-                            if not agent_id:
+                            # The station-wide feed was opened AS an agent
+                            # (the header) too, and must end like an agent
+                            # stream when that agent is freed or transferred.
+                            who = agent_id or me
+                            if not who:
                                 return station_id in (a.get("stations") or [])
                             try:
                                 return resolve_request_station(
-                                    a, agent_id
+                                    a, who, client
                                 ) == station_id
                             except AgentDenied:
                                 return False
@@ -6005,6 +6330,7 @@ def build_app() -> Starlette:
                 normalize_agent_id(body.get("agent_id") or ""),
                 auth["token_hash"],
                 (body.get("note") or "")[:200],
+                _current_client.get(),
             ))
         except PermissionError as e:
             return JSONResponse({"error": str(e)}, status_code=403)
@@ -6097,11 +6423,15 @@ def build_app() -> Starlette:
 
     async def update_agent_route(request: Request) -> JSONResponse:
         body = await request.json()
+        # Your own card only: the path names the agent, and it must be you —
+        # and so must the body, if it names one at all.
+        me = _author(request.path_params["agent_id"])
+        _author(body.pop("agent_id", None))
+        # The registry takes these positionally; arriving as keywords they
+        # were a TypeError (a 500), not an edit.
+        body.pop("station_id", None)
         try:
-            p = await AGENTS.update(
-                require_station(),
-                request.path_params["agent_id"], **body
-            )
+            p = await AGENTS.update(require_station(), me, **body)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         except KeyError as e:
@@ -6180,9 +6510,12 @@ def build_app() -> Starlette:
     async def post_message_route(request: Request) -> JSONResponse:
         body = await request.json()
         name = request.path_params["name"]
+        # The author is the request's agent. A body `sender` is optional —
+        # older clients send their own name — and refused if it is anyone else.
+        sender = _author(body.get("sender"))
         try:
             result = await CHANNELS.post(
-                require_station(), name, body["sender"], body["text"],
+                require_station(), name, sender, body["text"],
                 body.get("expires_in"), body.get("addressed"),
             )
         except ValueError as e:
@@ -6309,10 +6642,11 @@ def build_app() -> Starlette:
 
     async def send_dm_route(request: Request) -> JSONResponse:
         body = await request.json()
+        sender = _author(body.get("sender"))
         try:
             out = await DIRECT.send(
                 require_station(),
-                body.get("sender") or current_agent() or "",
+                sender,
                 body.get("to") or body.get("recipient") or "",
                 body.get("text") or body.get("message") or "",
                 body.get("expires_in"),
@@ -6343,11 +6677,12 @@ def build_app() -> Starlette:
 
     async def share_md_route(request: Request) -> JSONResponse:
         body = await request.json()
+        sender = _author(body.get("sender"))
         try:
             out = await md_store(
                 require_station(),
                 body.get("channel") or "",
-                body.get("sender") or current_agent() or "",
+                sender,
                 body.get("filename") or "",
                 body.get("content") or "",
                 body.get("note") or "",
@@ -6371,13 +6706,22 @@ def build_app() -> Starlette:
 
     async def create_broadcast_route(request: Request) -> JSONResponse:
         body = await request.json()
-        b = await BROADCASTS.create(
-            require_station(),
-            problem=body["problem"],
-            sender=body["sender"],
-            expertise=body.get("expertise") or None,
-            projects=body.get("projects") or None,
-        )
+        # Who first: a body naming another author is a 403 whatever else is
+        # wrong with it.
+        sender = _author(body.get("sender"))
+        if not body.get("problem"):
+            return JSONResponse({"error": "problem is required"},
+                                status_code=400)
+        try:
+            b = await BROADCASTS.create(
+                require_station(),
+                problem=body["problem"],
+                sender=sender,
+                expertise=body.get("expertise") or None,
+                projects=body.get("projects") or None,
+            )
+        except ValueError as e:      # the size cap, said to the sender
+            return JSONResponse({"error": str(e)}, status_code=400)
         return JSONResponse(b, status_code=201)
 
     async def list_broadcasts_route(request: Request) -> JSONResponse:
@@ -6404,11 +6748,13 @@ def build_app() -> Starlette:
 
     async def submit_bid_route(request: Request) -> JSONResponse:
         body = await request.json()
+        # The bidder is the request's agent; a body agent_id must be you.
+        bidder = _author(body.get("agent_id"))
         try:
             r = await BROADCASTS.submit_bid(
                 require_station(),
                 request.path_params["broadcast_id"],
-                body["agent_id"], body["bid"], body.get("pitch") or "",
+                bidder, body["bid"], body.get("pitch") or "",
             )
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -6418,10 +6764,7 @@ def build_app() -> Starlette:
 
     async def close_broadcast_route(request: Request) -> JSONResponse:
         try:
-            b = await BROADCASTS.close(
-                require_station(),
-                request.path_params["broadcast_id"],
-            )
+            b = await _close_own_broadcast(request.path_params["broadcast_id"])
         except KeyError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
         return JSONResponse(b)
@@ -6591,8 +6934,10 @@ def build_app() -> Starlette:
             rows = AGENTS.list_all(request.query_params.get("station"))
         except KeyError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
-        for r in rows:      # never expose the owning token's hash
+        for r in rows:      # never expose the owning token's or client's hash
             r.pop("owner_token_hash", None)
+            held = r.pop("owner_client_hash", None)
+            r["client_held"] = bool(held)
         return JSONResponse({"agents": rows})
 
     async def admin_add_agent(request: Request) -> JSONResponse:
@@ -6735,13 +7080,15 @@ def build_app() -> Starlette:
                     await collector
 
     async def _denied(_: Request, exc: Exception) -> JSONResponse:
-        """A station-scoped route ran without a station bound."""
+        """A station-scoped route ran without a station bound — or tried to
+        write as an agent other than the one it names (NotYou)."""
         return JSONResponse({"error": str(exc)}, status_code=403)
 
     return Starlette(
         routes=routes,
         middleware=[Middleware(AuthMiddleware)],
-        exception_handlers={AuthRequired: _denied, AgentDenied: _denied},
+        exception_handlers={AuthRequired: _denied, AgentDenied: _denied,
+                            NotYou: _denied},
         lifespan=lifespan,
     )
 
@@ -7024,11 +7371,15 @@ def _cli_agent(args: argparse.Namespace) -> int:
         except (KeyError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+        held = [w for w, h in (("token", out["was_held"]),
+                               ("client", out.get("was_client_held"))) if h]
         print(f"agent {out['agent_id']!r} freed"
-              f"{' (was held)' if out['was_held'] else ' (was already unheld)'}")
+              + (f" (was held by a {' and a '.join(held)})" if held
+                 else " (was already unheld)"))
         print("  the name, its unacked messages and its channel memberships "
               "are untouched;")
-        print("  any client announcing this id now claims it.")
+        print("  the next client (harness-directory) to act as it claims it —")
+        print("  stop the old one first, or it re-claims within a keepalive.")
         return 0
     if args.agent_cmd in ("bind", "unbind"):
         tok = args.token if args.agent_cmd == "bind" else None
@@ -7908,10 +8259,11 @@ class _Tui:
                                 row.get("station_name") or "")
         elif ch == "f" and row:
             out = AGENTS.free(row["agent_id"], row["station_id"])
+            held = out["was_held"] or out.get("was_client_held")
             self.msg = (
                 f"{row['agent_id']} freed — name, messages and memberships "
-                f"kept; any client may now claim it"
-                + (" (it was held)" if out["was_held"] else " (was already free)")
+                f"kept; the next client to act as it claims it"
+                + (" (it was held)" if held else " (was already free)")
             )
         elif ch == "x" and row:
             if self.confirm(f"remove agent {row['agent_id']!r}?"):

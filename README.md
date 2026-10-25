@@ -117,7 +117,7 @@ It is served by *your* broker, with that broker's address already in it, and
 needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 
 1. **It finds your harnesses** — Claude Code, OpenCode, Pi, Codex, Hermes — and
-   shows a checklist of what each one has: *installed 0.3.1 → 0.4.0*, *found,
+   shows a checklist of what each one has: *installed 0.4.0 → 0.5.0*, *found,
    not installed*, *not found*. Installed ones start ticked, so an update is
    just ENTER. The keys are the ones `hermes plugins` uses: ↑↓/j/k move,
    SPACE ticks, ENTER confirms, ESC cancels.
@@ -371,10 +371,33 @@ renamed. Renames apply to the push channel at once and to the tools in the
 **next session** (`/reload-plugins` keeps live connections, so it will not pick
 them up).
 
-**Two clients in one directory** start with the same default id, which means
-they share one inbox — delivery is a destructive read, so each message reaches
-whichever asks first. Two *different* harnesses part company for good once you
-rename one of them.
+**Two clients in one directory** start with the same default id. Since 0.5.0
+that no longer means a shared inbox: the first client to connect owns the
+agent, and the other is refused until it takes a name of its own (rename it,
+or have an operator add one and `rename_me` into it). Two *different*
+harnesses part company for good once you rename one of them.
+
+**Nobody can send as somebody else.** Every message is signed by the broker
+with the agent the request names — no tool takes a `sender`, so a model cannot
+type another agent's name into one. And every agent belongs to one
+harness-directory: each client sends a key of its own (`X-A2A-Client`),
+derived from a secret created once per install and the project path, and the
+broker pins the agent to the first key that uses it.
+
+| Harness | Secret the key is derived from |
+|---|---|
+| Claude Code | `$CLAUDE_PLUGIN_DATA/client.secret` |
+| OpenCode | `~/.local/share/opencode/a2a-client.secret` |
+| Pi | `~/.pi/agent/a2a-client.secret` |
+| Codex | `~/.codex/a2a-client.secret` |
+| Hermes | `<profile home>/a2a-client.secret` (one key per bot) |
+
+Another harness, directory or bot that tries to act as an agent it does not
+own gets a 403 naming the fix, on every route and on the push stream; its
+status tool says the same. Moving a project directory changes its key, so the
+agent then belongs to the old path: release it with `a2a-mcp.py agent free
+<id> --station <station>` and the next client to connect claims it — or
+`propose_me` it from the new path, which asks an operator for a transfer.
 
 **Two instances of the same harness, in the same directory**, cannot be told
 apart that way: the store is keyed by the directory, so a rename moves both.
@@ -624,7 +647,7 @@ from the container's tree, so a feature that looks missing is usually a
 container that was never rebuilt:
 
 ```bash
-curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.4.0","clients":"0.4.0"}
+curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.5.0","clients":"0.5.0"}
 docker compose exec a2a-mcp python3 /app/a2a-mcp.py --version
 ```
 

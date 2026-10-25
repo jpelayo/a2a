@@ -722,6 +722,29 @@ so once and names the installer; its user updates it by running the same
 command again (`curl -fsSL https://a2a.example.com/install | python3`, where
 installed clients start ticked) and restarting that harness's sessions.
 
+**Upgrading to 0.5.0** adds the column `agents.owner_client_hash` in place
+(an idempotent `ALTER … ADD COLUMN IF NOT EXISTS`; nothing to run). From then
+on every agent belongs to the first harness-directory client that acts as it
+— the first 0.5.0 client to connect claims each one. Clients older than 0.5.0
+send no client key: they keep working on agents nobody has claimed yet, and
+are refused (403, naming the installer) on any agent a 0.5.0 client holds. So
+update every machine. Where two clients used to share one agent id, the first
+to connect after the update keeps it; give the other its own name
+(`agent add <new>`, then `rename_me <new>` in that session).
+
+To move an agent to another client — a new laptop, a moved project directory
+(its path is part of its key), another harness:
+
+```bash
+a2a-mcp.py agent free <id> --station <station>   # releases token AND client pins
+```
+
+Stop the old client first, or it re-claims the agent within one keepalive.
+Two other routes need no operator command line: `unbind_me` in the old
+client releases both pins itself, and `propose_me <id>` in the new one files a
+TRANSFER request (even under the same token) that an operator approves in the
+TUI or with `agent approve`.
+
 ## 8. Operations
 
 ```bash
@@ -791,6 +814,15 @@ a live board is not backlog, and the output says so.
 - Every request to `/mcp/`, `/agents`, `/channels`, `/broadcasts` must
   carry `Authorization: Bearer <token>` or it returns 401 / 403.
 - A revoked token returns 403 from then on. Revocation is immediate.
+- **Agents are pinned twice**: to the first token that acts as one, and
+  (0.5.0) to the first client key (`X-A2A-Client`, one per
+  harness-directory) — only its SHA-256 is stored. A token is per user; the
+  client key is what keeps one of that user's harnesses from acting as
+  another's agent. `agent free` and unbinding release both.
+- **The author of every message is the request's own agent** (0.5.0). No
+  tool takes a sender; a body naming another author is refused with 403. A
+  shared md file is replaced only by whoever shared it, and a broadcast is
+  closed only by its poster (by anyone, once the poster has been removed).
 - `/healthz` is the only public path.
 - `/admin/*` requires the **admin** token (`A2A_ADMIN_TOKEN`), not a
   station token. With the admin var unset, `/admin/*` returns 503.
@@ -830,6 +862,9 @@ All optional; sensible defaults baked into the image.
 |--------------------------------------------------|------------------------------------------------------------------------------|
 | `curl /healthz` works locally but not via nginx  | nginx upstream block points at the wrong port or address.                    |
 | MCP client hangs on first call                   | nginx is buffering `/mcp/` — apply the `proxy_buffering off` block in §5.    |
+| 403 "belongs to another client"                  | Another harness, directory or bot claimed this agent first (0.5.0). Give this client its own name, or `agent free <id> --station <s>` to hand the agent over — stop the old client first. A moved project directory counts as another client. |
+| 403 "this one sends none … older than the broker" | A client from before 0.5.0 sends no `X-A2A-Client`, and a 0.5.0 client holds the agent. Re-run the installer on that machine. |
+| 403 "a message is always sent as the agent the request names" | Something posted with a `sender` (or bid with an `agent_id`) naming another agent. The broker signs every message with the request's own agent since 0.5.0 — drop the field. |
 | Claude Code's a2a tools disconnected after a broker restart | A broker from before `/mcp/` went stateless: the session the client held died with the old process. `/mcp` → reconnect `a2a` (or restart the session) once; after this deploy, restarts need nothing. The push channel always reconnects on its own. |
 | 401 on every request                             | Missing or malformed `Authorization: Bearer ...` header.                     |
 | 403 on every request                             | Token was revoked, deleted, or belongs to a deleted station.                 |

@@ -96,6 +96,9 @@ globalThis.fetch = async (url, init = {}) => {
     path,
     agent: init.headers?.["X-A2A-Agent"]
       || new URL(String(url)).searchParams.get("agent") || "",
+    // The client key every call must carry (0.5.0): the broker pins an agent
+    // to the first one that acts as it.
+    client: init.headers?.["X-A2A-Client"] || "",
   })
   const ok = (b) => ({ ok: true, status: 200,
     text: async () => JSON.stringify(b), json: async () => b })
@@ -120,6 +123,10 @@ globalThis.fetch = async (url, init = {}) => {
 const callsOf = (dir) => calls
   .filter((c) => c.agent === basename(dir) || c.agent === "")
   .map((c) => c.path)
+// The client keys a project's calls carried: one key, on every call.
+const keysOf = (dir) => calls
+  .filter((c) => c.agent === basename(dir))
+  .map((c) => c.client)
 const opened = (dir) => {
   const mine = streams.filter((s) => s.agent === basename(dir))
   return { total: mine.length, open: mine.filter((s) => s.open).length }
@@ -229,6 +236,7 @@ const cases = async (go) => ({
 
 const out = {}
 const v1 = await cases(run)
+out.v1_keys = keysOf(v1.on.dir)
 
 // The switch: writes, merges, and connects in place.
 const off = await run({ catchup: 42, enabled_pi: true })
@@ -251,6 +259,7 @@ await flip.s.tool.enable_a2a_here.execute({ enabled: false })
 await flip.s.tool.enable_a2a_here.execute({ enabled: true })
 
 const v2 = await cases(runV2)
+out.v2_keys = keysOf(v2.on.dir)
 // The brief in V2 is a prompt that starts no turn, into the session asked of
 // the server for THIS directory, roots only.
 out.v2_brief = v2.on.v2prompts[0] || null
@@ -311,6 +320,9 @@ class FakeBroker:
         # (path, X-A2A-Agent) per request: /ack marks only the CALLER's
         # receipts, so which id an ack went out as is part of what it did.
         self.agents: list[tuple[str, str]] = []
+        # (path, X-A2A-Client) per request that named an agent: the key the
+        # broker pins that agent to, which every such request must carry.
+        self.clients: list[tuple[str, str]] = []
         # How many upcoming /ack requests answer 500 and ack nothing.
         self.fail_acks = 0
         # The ids /me/agents reports as this token's own (rename_me adopts
@@ -344,11 +356,17 @@ class FakeBroker:
                 self.end_headers()
                 self.wfile.write(b)
 
-            def do_GET(self):
-                path = self.path.split("?")[0]
+            def _record(self, path):
                 broker.calls.append(path)
                 broker.agents.append(
                     (path, self.headers.get("X-A2A-Agent") or ""))
+                if self.headers.get("X-A2A-Agent") or path == "/stream":
+                    broker.clients.append(
+                        (path, self.headers.get("X-A2A-Client") or ""))
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                self._record(path)
                 if path == "/stream":
                     return self._stream()
                 if path == "/pending/peek":
@@ -367,9 +385,7 @@ class FakeBroker:
 
             def do_POST(self):
                 path = self.path.split("?")[0]
-                broker.calls.append(path)
-                broker.agents.append(
-                    (path, self.headers.get("X-A2A-Agent") or ""))
+                self._record(path)
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
                 if path == "/ack" and broker.fail_acks > 0:
@@ -469,6 +485,8 @@ def run_codex(contents, follow=()) -> dict:
         file = None
     return {
         "before": before, "after": after, "stderr": err,
+        # The X-A2A-Client of every request that named an agent (0.5.0).
+        "clients": [c for p, c in fb.clients],
         "instructions": (replies.get(1) or {}).get("instructions"),
         "tools": [t["name"] for t in (replies.get(2) or {}).get("tools", [])],
         "results": [json.loads(((replies.get(10 + i) or {}).get("content")
@@ -583,6 +601,16 @@ def main() -> int:
               == sorted(got_all["absent"]["tools"]),
               f'on: {got_all["on"]["tools"]} vs '
               f'off: {got_all["absent"]["tools"]}')
+
+    for host in ("v1", "v2"):
+        keys = oc[f"{host}_keys"]
+        check(f"opencode {host}: every call — the stream included — carries "
+              "ONE client key, the one the broker pins this agent to",
+              keys and len(set(keys)) == 1
+              and keys[0].startswith("a2a_ck_"), str(keys))
+    check("opencode: two projects are two clients — different keys",
+          oc["v1_keys"][:1] != oc["v2_keys"][:1], f'{oc["v1_keys"][:1]} '
+          f'{oc["v2_keys"][:1]}')
 
     check("opencode: V1 and V2 register the SAME tools — one vocabulary, "
           "whichever OpenCode runs it",
@@ -703,6 +731,10 @@ def main() -> int:
     check("codex: and the session is briefed",
           "ADDRESSING IS AN ARGUMENT" in (on["instructions"] or ""),
           str(on["instructions"])[:80])
+    check("codex: every request naming its agent carries ONE client key — the "
+          "one the broker pins that agent to",
+          on["clients"] and len(set(on["clients"])) == 1
+          and on["clients"][0].startswith("a2a_ck_"), str(on["clients"]))
 
     sw = run_codex({"catchup": 42, "enabled_pi": True},
                    follow=[("enable_a2a_here", {"enabled": True})])

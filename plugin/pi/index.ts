@@ -39,12 +39,14 @@
  * delivered — so a shared id splits one inbox between them at random with no
  * error anywhere. That is what the store prevents.
  */
-import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  appendFile, link, mkdir, readFile, rename, stat, unlink, writeFile,
+} from "node:fs/promises";
 // Sync, deliberately: the project switch has to be decided before
 // registerTool runs, and this extension's entry point is not async.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -77,8 +79,62 @@ const STORE = join(homedir(), ".pi", "agent", "a2a-identity.json");
 // back here, so an install that later gains an A2A_AGENT keeps its settings.
 const SETTINGS_LEGACY = join(homedir(), ".pi", "agent", "a2a.json");
 const LOG_LEGACY = join(homedir(), ".pi", "agent", "a2a.log");
+const CLIENT_SECRET = join(homedir(), ".pi", "agent", "a2a-client.secret");
+// Which sessions this client has briefed, kept across extension instances. Pi
+// replaces the instance on /new, /resume, /fork and /reload, and each new one
+// briefed the same session again — the instructions, and a check prompt that
+// starts a turn. Keyed by Pi's session id, which a resume reads back from the
+// session file's header, so a new process sees the same id. After a day the
+// instructions go in once more (no turn), so a session Pi has compacted does
+// not stay without them for long.
+const BRIEFS = join(homedir(), ".pi", "agent", "a2a-briefed.json");
+const BRIEF_REFRESH_MS = 24 * 3600_000;
+const BRIEF_KEEP_MS = 30 * 24 * 3600_000;
+const BRIEF_KEEP_MAX = 500;
 const CATCHUP_DEFAULT = 10;
 const READ_ON_INIT_DEFAULT = true;
+
+/** This client's key for the broker: one per harness-directory.
+ *
+ *  The broker pins each agent to the first client key that acts as it, so no
+ *  other harness or directory — and no model in one — can speak as an agent
+ *  this client owns. DERIVED, never stored per project: HMAC-SHA256 of
+ *  `scope` (`dir:<project>`, or `agent:<id>` when the id was chosen for the
+ *  process or at install) under one secret per install. The secret is
+ *  written whole to a private temp file and link()ed into place, which fails
+ *  if another process got there first — so two Pi sessions in one directory
+ *  never hold two keys. Throws when it cannot be had; the caller decides. */
+async function deriveClientKey(secretPath: string, scope: string): Promise<string> {
+  const crypto = await import("node:crypto");
+  let hex = "";
+  try {
+    hex = (await readFile(secretPath, "utf8")).trim();
+  } catch {
+    /* first run on this install */
+  }
+  if (!hex) {
+    await mkdir(dirname(secretPath), { recursive: true });
+    const tmp = `${secretPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await writeFile(tmp, crypto.randomBytes(32).toString("hex") + "\n",
+                      { mode: 0o600, flag: "wx" });
+      try {
+        await link(tmp, secretPath);
+      } catch (e: any) {
+        if (e?.code !== "EEXIST") throw e;   // someone else won; theirs is THE one
+      }
+    } finally {
+      await unlink(tmp).catch(() => {});
+    }
+    hex = (await readFile(secretPath, "utf8")).trim();
+  }
+  // Buffer.from silently drops what is not hex, so a damaged secret would
+  // still derive a key — just not this install's. Refuse it instead.
+  if (!/^[0-9a-f]{64}$/i.test(hex)) throw new Error(`damaged secret in ${secretPath}`);
+  const mac = crypto.createHmac("sha256", Buffer.from(hex, "hex"))
+    .update(scope).digest("base64url");
+  return "a2a_ck_" + mac.slice(0, 32);
+}
 
 /** A filename-safe form of an agent id.
  *
@@ -283,6 +339,24 @@ export default function (pi: ExtensionAPI) {
   let { key, explicit } = resolveKey();
   let name = key;
 
+  // Which harness-directory this is, for the broker's client pin. Decided
+  // here, at activation, from the same inputs as `explicit`, and computed on
+  // first use (the entry point is not async). Every request and the stream
+  // carry it; without one a client can claim no agent.
+  const CLIENT_SCOPE = explicit ? `agent:${key}` : `dir:${resolve(project)}`;
+  let clientKeyP: Promise<string> | null = null;
+  const clientHeader = async (): Promise<Record<string, string>> => {
+    clientKeyP ??= deriveClientKey(CLIENT_SECRET, CLIENT_SCOPE).catch((e) => {
+      log(`no client key, so this client can claim no agent: ${e}`);
+      return "";
+    });
+    const k = await clientKeyP;
+    // A failure is not cached: the next request tries again rather than
+    // staying keyless, and refused, for the rest of the session.
+    if (!k) clientKeyP = null;
+    return k ? { "X-A2A-Client": k } : {};
+  };
+
   // Frozen at activation rather than tracking `key`, so a rename mid-session
   // does not move the log out from under a tail -f.
   const STATE_SUFFIX = explicit ? `-${slug(key)}` : "";
@@ -412,6 +486,7 @@ export default function (pi: ExtensionAPI) {
       headers: {
         Authorization: `Bearer ${TOKEN}`,
         "X-A2A-Agent": key,
+        ...(await clientHeader()),
         ...(body ? { "content-type": "application/json" } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -422,6 +497,30 @@ export default function (pi: ExtensionAPI) {
   }
   const json = async (method: string, path: string, body?: unknown) =>
     JSON.parse(await api(method, path, body));
+
+  // --- stopping -------------------------------------------------------------
+  // Pi REPLACES this extension on /new, /resume, /fork and /reload: it sends
+  // session_shutdown to this instance, re-evaluates the module and runs the
+  // factory again with a fresh `pi` — after which this instance's `pi` throws
+  // if used. A pump left running streamed next to its replacement: two readers
+  // of one destructive-read inbox, this one handing its half to a dead `pi`,
+  // where nothing was acked and the replay window soon stopped offering it.
+  let stopped = false;
+  const halt = new AbortController();
+  /** setTimeout that ends early when the instance stops. */
+  const sleep = (ms: number) => new Promise<void>((resolve) => {
+    if (halt.signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      halt.signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    halt.signal.addEventListener("abort", done, { once: true });
+  });
+  // This session's id, from session_start's context. Empty when Pi gives
+  // none, and then nothing is remembered: the brief behaves as it always did.
+  let sessionId = "";
 
   // --- delivery state -------------------------------------------------------
   let briefed = false;
@@ -522,6 +621,10 @@ export default function (pi: ExtensionAPI) {
    *  renders it in Pi's own labelled block, so channel traffic stops looking
    *  like something they typed. */
   function handOff(text: string, id?: string) {
+    // Stopped: this instance's `pi` is stale and throws. Not ours to deliver
+    // any more — left unacked, the replacement's catch-up hands it over.
+    if (stopped) return;
+    const fresh = !briefed;
     const body = briefed ? text : `${instructions(name)}\n\n${text}`;
     briefed = true;
     try {
@@ -539,6 +642,8 @@ export default function (pi: ExtensionAPI) {
       log(`could not hand over to the session: ${e}`);
       return;
     }
+    // The instructions rode in with this message, so the session has them.
+    if (fresh) void rememberBrief();
     // Received means received: the session has it. Waiting for the model to
     // remember ack_messages is how an inbox fills up forever.
     if (id) toAck.add(id);
@@ -627,17 +732,73 @@ export default function (pi: ExtensionAPI) {
    *  Without this the brief rides on the first delivered message, so a quiet
    *  session is never told it is an a2a agent at all — the same gap that made
    *  OpenCode look oblivious. */
+  async function readBriefs(): Promise<Record<string, any>> {
+    try {
+      return JSON.parse(await readFile(BRIEFS, "utf8")) || {};
+    } catch {
+      return {};
+    }
+  }
+  /** "fresh": this session was briefed as this agent within a day. "stale":
+   *  as this agent, longer ago. null: never, as somebody else, or no id. */
+  async function briefState(): Promise<"fresh" | "stale" | null> {
+    if (!sessionId) return null;
+    const e = (await readBriefs())[sessionId];
+    if (!e || e.key !== key || e.name !== name) return null;
+    return Date.now() - (Number(e.at) || 0) < BRIEF_REFRESH_MS ? "fresh" : "stale";
+  }
+  async function rememberBrief() {
+    if (!sessionId) return;
+    const now = Date.now();
+    const tmp = `${BRIEFS}.${process.pid}.${now}.` +
+      Math.random().toString(16).slice(2);
+    try {
+      const kept = Object.entries(await readBriefs())
+        .filter(([sid, e]: [string, any]) =>
+          sid !== sessionId && now - (Number(e?.at) || 0) < BRIEF_KEEP_MS)
+        .sort((a: any, b: any) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
+        .slice(0, BRIEF_KEEP_MAX - 1);
+      // Whole or not at all: another Pi may be reading it. Two writing at once
+      // can drop one entry, which costs one extra brief.
+      await mkdir(dirname(BRIEFS), { recursive: true });
+      await writeFile(tmp, JSON.stringify(
+        Object.fromEntries([[sessionId, { key, name, at: now }], ...kept])) + "\n");
+      await rename(tmp, BRIEFS);
+    } catch (e) {
+      log(`could not remember the brief: ${e}`);
+    } finally {
+      await unlink(tmp).catch(() => {});
+    }
+  }
+
   async function briefSession() {
     if (briefed) return;
     try {
+      const state = await briefState();
+      if (state === "fresh") {
+        // A reload, a /resume, or `pi -c` on a session that already has all
+        // of this. Marked briefed so handOff does not prepend it either.
+        briefed = true;
+        log(`session ${sessionId} already briefed as ${name}; not again`);
+        return;
+      }
+      if (stopped) return;
       pi.sendMessage(
         { customType: "a2a", content: instructions(name), display: false },
         { triggerTurn: false, deliverAs: "followUp" },
       );
       briefed = true;
+      if (state === "stale") {
+        // A refresh, not a new start: this session has been through the check
+        // before, and what arrived since comes by catchUp().
+        await rememberBrief();
+        log(`re-briefed session ${sessionId}: a day since its last brief`);
+        return;
+      }
       // CATCHUP is already 0 when read_on_init is false, so this one gate
       // covers both spellings of "do not".
       const rooms = CATCHUP > 0 ? await myChannels() : [];
+      if (stopped) return;
       if (rooms.length) {
         // A real turn, deliberately: the agent visibly calls my_pending and
         // read_channel, so catching up is something you watch rather than
@@ -651,10 +812,69 @@ export default function (pi: ExtensionAPI) {
         log(`briefed${CATCHUP > 0 ? " — in no channels, nothing to check"
                                   : " (read_on_init off)"}`);
       }
+      await rememberBrief();
     } catch (e) {
       // Not fatal: handOff still prepends the brief to the first message that
       // arrives, which is how this worked before.
       log(`could not brief: ${e}`);
+    }
+  }
+
+  /** One message, from the stream or from catchUp(). False once this
+   *  instance has stopped: the message is not ours to deliver any more. */
+  function take(m: Msg): boolean {
+    if (!m?.text) return true;
+    if (stopped) return false;
+    // The broker replays unacked messages on every connection, and catchUp()
+    // hands over the same ones just before: deliver each once.
+    if (m.id && seen.has(m.id)) {
+      log(`skip #${m.channel} ${m.id} — already delivered`);
+      return true;
+    }
+    if (m.id) seen.add(m.id);
+    pumpState.delivered++;
+    pumpState.last = `#${m.channel}/${m.sender}`;
+    log(`deliver #${m.channel} from ${m.sender}`);
+    deliver(envelope(m), m.id);
+    return true;
+  }
+
+  /** Before each connection: everything the broker holds unacked for this
+   *  agent, however old.
+   *
+   *  The stream re-sends what it already handed out only within the broker's
+   *  replay window (ten minutes). A message an earlier instance took and
+   *  never acked — a /resume, a reload, a crash — would otherwise reach this
+   *  session only if the model thought to call my_pending. /pending/peek
+   *  reads WITHOUT marking (never /pending: that one acks what it returns),
+   *  in the stream's own shape, so each message goes through take() exactly
+   *  as if it had streamed. OpenCode and Hermes do the same. */
+  async function catchUp() {
+    let out: any;
+    try {
+      out = await json("GET", "/pending/peek?limit=50");
+    } catch (e) {
+      // 404 is a broker from before the route: the replay is all there is.
+      if (!/^404\b/.test(String((e as any)?.message || ""))) {
+        log(`catch-up failed: ${String(e).split("\n")[0]}`);
+      }
+      return;
+    }
+    let n = 0;
+    for (const m of out?.messages || []) {
+      if (!m || typeof m !== "object" || (m.id && seen.has(m.id))) continue;
+      // Outside the stream's try, so one bad message must not end the pump.
+      try {
+        if (!take(m)) return;
+        n++;
+      } catch (e) {
+        log(`could not catch up ${m.id || "a message"}: ${e}`);
+      }
+    }
+    if (n) log(`caught up ${n} pending message(s)`);
+    if (out?.has_more) {
+      log("more are pending than one catch-up takes; the rest come with the " +
+          "next connection, or through my_pending");
     }
   }
 
@@ -682,11 +902,22 @@ export default function (pi: ExtensionAPI) {
     }
     if (registered) await briefSession();
 
-    for (;;) {
+    while (!stopped) {
       let wait = RECONNECT_MS;
-      const url = `${URL_BASE}/stream?agent=${encodeURIComponent(key)}&format=json`;
+      if (registered) await catchUp();
+      if (stopped) break;
+      // The id this connection streams as. rename_me changes `key`, and a
+      // stream left on the old id would keep delivering that agent's mail —
+      // acked under the new id, which acks nothing.
+      const streamKey = key;
+      const url = `${URL_BASE}/stream?agent=${encodeURIComponent(streamKey)}&format=json`;
       try {
-        const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+        // The client key rides on the stream too: the broker re-checks it on
+        // every keepalive. The signal is what closes it on session_shutdown.
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${TOKEN}`, ...(await clientHeader()) },
+          signal: halt.signal,
+        });
         if (!res.ok) {
           const body = (await res.text()).slice(0, 200);
           if (res.status === 403) {
@@ -710,6 +941,7 @@ export default function (pi: ExtensionAPI) {
         const reader = res.body!.getReader();
         const dec = new TextDecoder();
         let buf = "";
+        let renamed = false;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -719,6 +951,12 @@ export default function (pi: ExtensionAPI) {
             const line = buf.slice(0, nl).trim();
             buf = buf.slice(nl + 1);
             pumpState.lastLine = Date.now();
+            // Checked on every line, keepalives included, so a rename is
+            // noticed within one tick.
+            if (key !== streamKey) {
+              renamed = true;
+              break;
+            }
             if (!line) continue; // keepalive
             let m: Msg;
             try {
@@ -726,22 +964,21 @@ export default function (pi: ExtensionAPI) {
             } catch {
               continue; // noise
             }
-            if (!m.text) continue;
-            if (m.id && seen.has(m.id)) {
-              log(`skip #${m.channel} ${m.id} — already delivered`);
-              continue;
-            }
-            if (m.id) seen.add(m.id);
-            pumpState.delivered++;
-            pumpState.last = `#${m.channel}/${m.sender}`;
-            log(`deliver #${m.channel} from ${m.sender}`);
-            deliver(envelope(m), m.id);
+            if (!take(m)) break;
+          }
+          if (renamed || stopped) {
+            await reader.cancel().catch(() => {});
+            break;
           }
         }
         pumpState.connected = false;
-        log("stream closed by server; reconnecting");
+        if (stopped) break;
+        log(renamed
+          ? `agent id changed ${streamKey} -> ${key}; reconnecting under it`
+          : "stream closed by server; reconnecting");
       } catch (e) {
         pumpState.connected = false;
+        if (stopped) break;
         pumpState.lastError = String(e);
         log(`stream error: ${e}`);
         if (!warned) {
@@ -749,8 +986,10 @@ export default function (pi: ExtensionAPI) {
           notify(`not receiving messages: ${String(e).slice(0, 120)}`);
         }
       }
-      await new Promise((r) => setTimeout(r, wait));
+      await sleep(wait);
     }
+    pumpState.connected = false;
+    log("stream closed: this extension instance was shut down");
   }
 
   // The human's Enter is in flight. This fires as the first awaited step of
@@ -778,8 +1017,28 @@ export default function (pi: ExtensionAPI) {
     void flushAcks();
   });
 
+  // This instance is being replaced (/new, /resume, /fork, /reload) or Pi is
+  // quitting. Stop everything it started: the stream closes, the pump ends,
+  // nothing more is handed to a `pi` that is about to go stale, and what was
+  // handed over is acked on the way out.
+  pi.on("session_shutdown", (event: any) => {
+    if (stopped) return;
+    stopped = true;
+    halt.abort();
+    log(`a2a stopping: ${event?.reason || "session ended"}`);
+    void flushAcks();
+  });
+
   let pumping = false;
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event: any, ctx: any) => {
+    // The id Pi resumes this session under — read back from the session
+    // file's header, so the same in a new process. What the brief is
+    // remembered by.
+    try {
+      sessionId = String(ctx?.sessionManager?.getSessionId?.() || "");
+    } catch {
+      sessionId = "";
+    }
     if (!URL_BASE || !TOKEN) {
       notify(`no ${!URL_BASE ? "broker url" : "token"}: reinstall with `
              + "your broker's installer: curl -fsSL <broker>/install | python3");
@@ -840,7 +1099,11 @@ export default function (pi: ExtensionAPI) {
     // In order: exist, then be reachable, then be healthy. Only the first
     // unmet condition is worth telling an agent about.
     let step: string | null = null;
-    if (!me.registered) {
+    if (me.refused) {
+      // First: another client holds this agent, or this install is too old
+      // to send a client key, and nothing else will work until that is fixed.
+      step = `the broker refuses to act as this agent: ${me.refused}`;
+    } else if (!me.registered) {
       step =
         "you are not registered in this station yet: call propose_me with one " +
         "line about this project, and an operator approves it with one " +
@@ -1281,7 +1544,18 @@ export default function (pi: ExtensionAPI) {
       // matter of what this client announces — there is nothing to rename, and
       // asking the broker would refuse (the name is taken, by us).
       const mine = (await json("GET", "/me/agents")).agents || [];
-      const exists = mine.some((x: { agent_id: string }) => x.agent_id === p.new_id);
+      const found = mine.find((x: { agent_id: string }) => x.agent_id === p.new_id);
+      const exists = !!found;
+      // Refused HERE, before anything is written: the broker refuses every
+      // request as an agent another harness-directory holds, and a store
+      // already pointing at it would leave this client stuck on it.
+      if (found?.client === "other" || (found?.bound && !found?.bound_to_me)) {
+        throw new Error(
+          `${p.new_id} belongs to another client (another harness, ` +
+          `directory or token), so this one cannot become it. Pick a new ` +
+          `name, or ask an operator to release it: a2a-mcp.py agent free ` +
+          `${p.new_id} --station <station>`);
+      }
       const out = exists
         ? { agent_id: p.new_id, was: key, adopted: true }
         : await json("PATCH", `/me/agents/${encodeURIComponent(key)}`,

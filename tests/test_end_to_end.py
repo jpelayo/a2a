@@ -179,6 +179,9 @@ def main() -> int:
 process.env.A2A_URL = {json.dumps(base)}
 process.env.A2A_TOKEN = "dev"
 process.env.A2A_AGENT = {json.dumps(OPENCODE_AGENT)}
+// The client secret lives under OpenCode's data dir: keep it in this run's
+// temp dir, never the real home.
+process.env.XDG_DATA_HOME = {json.dumps(str(tmp / "oc-data"))}
 const mod = await import({json.dumps(str(OPENCODE))})
 const seen = []
 const errors = []
@@ -200,7 +203,7 @@ const client = {{
                          time: {{ updated: 1 }} }}],
   }},
 }}
-const hooks = await mod.A2A({{ client, directory: "/tmp/acme-api" }})
+const hooks = await mod.default.server({{ client, directory: "/tmp/acme-api" }})
 // NO events are fed. session.idle fires only after a turn completes and
 // session.created never fires on a resume, so a client that needs either one
 // is a client that never speaks at boot — which is the bug this asserts is

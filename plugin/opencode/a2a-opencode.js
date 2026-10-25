@@ -105,6 +105,15 @@ const PROMPT_TIMEOUT_MS =
 // letting the events take over.
 const BRIEF_RETRY_MS = 2_000
 const BRIEF_GIVE_UP_MS = 30_000
+// A session is briefed once, and that is remembered ACROSS plugin instances:
+// OpenCode 2 recycles a project's instance about hourly, and each new one used
+// to brief the same session again — the hello, the instructions, and a check
+// prompt that starts a turn, every hour, with nothing to say. After a day the
+// instructions go in once more (no turn), so a session OpenCode has compacted
+// does not stay without them for long.
+const BRIEF_REFRESH_MS = 24 * 3600_000
+const BRIEF_KEEP_MS = 30 * 24 * 3600_000
+const BRIEF_KEEP_MAX = 500
 // V2 only: this client's own log file is capped, like Pi's. It is the one
 // record of what the client did, but it must not grow without bound on a
 // machine that runs OpenCode daily. The recent past is what diagnoses a hang.
@@ -464,6 +473,67 @@ async function core(host) {
     return null
   }
 
+  // --- the client key ------------------------------------------------------
+  // Which harness-directory this is. The broker pins each agent to the first
+  // client key that acts as it, so no other harness or directory — and no
+  // model in one — can speak as an agent this client owns. DERIVED, never
+  // stored per project: HMAC-SHA256 of the scope (`dir:<project>`, or
+  // `agent:<id>` when the id was chosen for the process or at install) under
+  // one secret per install. The secret is written whole to a private temp
+  // file and link()ed into place, which fails if another process got there
+  // first — so two OpenCode processes in one directory never hold two keys.
+  // In the DATA directory, beside the V2 log: V2 watches config and reloads
+  // plugins when it changes. Derived on FIRST USE, not at load: a project
+  // with a2a off makes no broker call, so it writes no secret either.
+  const CLIENT_SCOPE = explicit
+    ? `agent:${key}`
+    : `dir:${(await import("node:path")).resolve(directory || process.cwd())}`
+  async function clientKey() {
+    try {
+      const crypto = await import("node:crypto")
+      const root = `${DATA}/opencode`
+      const file = `${root}/a2a-client.secret`
+      await fs.mkdir(root, { recursive: true })
+      let hex = ""
+      try { hex = (await fs.readFile(file, "utf8")).trim() } catch {}
+      if (!hex) {
+        const tmp = `${root}/.a2a-client.secret.${process.pid}.` +
+          crypto.randomBytes(4).toString("hex")
+        try {
+          await fs.writeFile(tmp, crypto.randomBytes(32).toString("hex") + "\n",
+                             { mode: 0o600, flag: "wx" })
+          try {
+            await fs.link(tmp, file)
+          } catch (e) {
+            if (e?.code !== "EEXIST") throw e   // someone else won; theirs is THE one
+          }
+        } finally {
+          await fs.unlink(tmp).catch(() => {})
+        }
+        hex = (await fs.readFile(file, "utf8")).trim()
+      }
+      // Buffer.from silently drops what is not hex, so a damaged secret would
+      // still derive a key — just not this install's. Refuse it instead.
+      if (!/^[0-9a-f]{64}$/i.test(hex)) throw new Error(`damaged secret in ${file}`)
+      const mac = crypto.createHmac("sha256", Buffer.from(hex, "hex"))
+        .update(CLIENT_SCOPE).digest("base64url")
+      return "a2a_ck_" + mac.slice(0, 32)
+    } catch (e) {
+      log("error", `no client key, so this client can claim no agent: ${e}`)
+      return ""
+    }
+  }
+  // Every broker request carries it — the stream included, since the broker
+  // re-checks it on every keepalive. A failure is not cached: the next
+  // request tries again rather than staying keyless, and refused, for good.
+  let clientKeyP = null
+  async function clientHeader() {
+    clientKeyP ??= clientKey()
+    const k = await clientKeyP
+    if (!k) clientKeyP = null
+    return k ? { "X-A2A-Client": k } : {}
+  }
+
   // --- stopping --------------------------------------------------------------
   // Everything this instance starts has to be stoppable. V2 reloads a plugin
   // when its file changes — which is exactly what the installer does — and
@@ -502,6 +572,7 @@ async function core(host) {
       headers: {
         Authorization: `Bearer ${TOKEN}`,
         "X-A2A-Agent": key,
+        ...(await clientHeader()),
         ...(body ? { "content-type": "application/json" } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -704,6 +775,42 @@ async function core(host) {
    *  that the reset was protecting: a genuinely new session still gets its own
    *  brief, because its id is not in the Map. */
   const briefed = new Map()
+
+  // The same memo, kept on disk so it outlives this instance. In the DATA
+  // directory, beside the client secret — V2 watches config. Keyed by session,
+  // recording both the id this client SENDS and the name the broker resolved:
+  // a rename makes the entry stale for that one session, which then hears the
+  // new name, and nothing else is disturbed.
+  const BRIEFS = `${DATA}/opencode/a2a-briefed.json`
+  /** "fresh": briefed as this agent within a day. "stale": briefed as this
+   *  agent, longer ago. null: never, or as somebody else. */
+  async function briefState(id) {
+    const e = (await readJSON(BRIEFS))[id]
+    if (!e || e.key !== key || e.name !== name) return null
+    return Date.now() - (Number(e.at) || 0) < BRIEF_REFRESH_MS ? "fresh" : "stale"
+  }
+  async function rememberBrief(id) {
+    const now = Date.now()
+    const tmp = `${BRIEFS}.${process.pid}.${now}.` +
+      Math.random().toString(16).slice(2)
+    try {
+      const kept = Object.entries(await readJSON(BRIEFS))
+        .filter(([sid, e]) => sid !== id && now - (Number(e?.at) || 0) < BRIEF_KEEP_MS)
+        .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
+        .slice(0, BRIEF_KEEP_MAX - 1)
+      // Whole or not at all: another project's instance may be reading it.
+      // Two writing at once can drop one entry, which costs one extra brief.
+      await fs.mkdir(`${DATA}/opencode`, { recursive: true })
+      await fs.writeFile(tmp, JSON.stringify(
+        Object.fromEntries([[id, { key, name, at: now }], ...kept])) + "\n")
+      await fs.rename(tmp, BRIEFS)
+    } catch (e) {
+      log("error", `could not remember the brief: ${e}`)
+    } finally {
+      await fs.unlink(tmp).catch(() => {})
+    }
+  }
+
   function brief(id = sessionID) {
     if (!id || !registered) return Promise.resolve()
     if (children.has(id)) return Promise.resolve()
@@ -712,12 +819,25 @@ async function core(host) {
     if (!briefed.has(id)) {
       briefed.set(id, (async () => {
         try {
+          const state = await briefState(id)
+          if (state === "fresh") {
+            log("info", `${id} already briefed as ${name}; not again`)
+            return
+          }
           // Two messages, and the difference between them is the whole point.
           // The instructions are reference material: they arrive with noReply
           // so no turn is spent on them. The check is an instruction to act,
           // so it does NOT set noReply — it starts a turn, and the tool calls
           // it produces are the boot behaviour you can actually see.
           await say(instructions(name), { noReply: true }, id)
+          if (stopped) return
+          if (state === "stale") {
+            // A refresh, not a new start: this session has been through the
+            // check before, and what arrived since comes by catchUp().
+            await rememberBrief(id)
+            log("info", `re-briefed ${id}: a day since its last brief`)
+            return
+          }
           // CATCHUP is already 0 when read_on_init is false, so this one gate
           // covers both spellings of "do not".
           const rooms = CATCHUP > 0 ? await myChannels() : []
@@ -730,6 +850,7 @@ async function core(host) {
                         (CATCHUP > 0 ? " — in no channels, nothing to check"
                                      : " (read_on_init off)"))
           }
+          if (!stopped) await rememberBrief(id)
         } catch (e) {
           briefed.delete(id)         // let the next caller try again
           log("error", `could not brief: ${e}`)
@@ -879,6 +1000,74 @@ async function core(host) {
     return true
   }
 
+  /** One message, from the stream or from catchUp(). False when a2a went off,
+   *  or the instance stopped, before it could be handed over. */
+  function take(m) {
+    if (!m?.text) return true
+    // Off — or unloaded — between the broker sending this and us reading it.
+    // It is not ours to deliver any more: leave it unacked, and the broker
+    // hands it over again on the first connection after the project is back
+    // on. Codex does the same, for the same reason: delivery is a destructive
+    // read, and a message injected into a session that switched a2a off is
+    // one the user said not to receive.
+    if (!ENABLED || stopped) return false
+    // The broker replays every UNACKED message on the first fetch of each
+    // connection, and catchUp() hands over the same ones just before. So
+    // anything already handed to the session but not yet acked would be
+    // injected twice. Ack is still what retires it server-side; this only
+    // stops one process saying the same thing twice.
+    if (m.id && seen.has(m.id)) {
+      log("info", `skip #${m.channel} ${m.id} — already injected`)
+      return true
+    }
+    if (m.id) seen.add(m.id)
+    pumpState.delivered++
+    pumpState.last = `#${m.channel}/${m.sender}`
+    log("info", `deliver #${m.channel} from ${m.sender}`)
+    push(envelope(m), m.id)
+    return true
+  }
+
+  /** Before each connection: everything the broker holds unacked for this
+   *  agent, however old.
+   *
+   *  The stream re-sends what it already handed out only within the broker's
+   *  replay window (ten minutes). A message pushed to an instance that never
+   *  acked it — a reload, a crash, a broker restart — would otherwise reach
+   *  this session only if the model thought to call my_pending, and on a
+   *  resume it did not. /pending/peek reads WITHOUT marking (never /pending:
+   *  that one acks what it returns), in the stream's own shape, so each
+   *  message goes through take() exactly as if it had streamed: injected,
+   *  then acked. The Hermes plugin does the same before its stream. */
+  async function catchUp() {
+    let out
+    try {
+      out = await json("GET", "/pending/peek?limit=50")
+    } catch (e) {
+      // 404 is a broker from before the route: the replay is all there is.
+      if (!/^404\b/.test(String(e?.message || ""))) {
+        log("error", `catch-up failed: ${String(e).split("\n")[0]}`)
+      }
+      return
+    }
+    let n = 0
+    for (const m of out?.messages || []) {
+      if (!m || typeof m !== "object" || (m.id && seen.has(m.id))) continue
+      // Outside the stream's try, so one bad message must not end the pump.
+      try {
+        if (!take(m)) return
+        n++
+      } catch (e) {
+        log("error", `could not catch up ${m.id || "a message"}: ${e}`)
+      }
+    }
+    if (n) log("info", `caught up ${n} pending message(s)`)
+    if (out?.has_more) {
+      log("info", "more are pending than one catch-up takes; the rest come " +
+                  "with the next connection, or through my_pending")
+    }
+  }
+
   // --- the pump ------------------------------------------------------------
   // ONE pump per instance. Switching a project off and on again under a live
   // stream used to start a second one: two readers of one destructive-read
@@ -900,9 +1089,9 @@ async function core(host) {
         return
       }
 
-      if (HELLO) {
-        await notify(`connected as ${name} — ${URL_BASE}`)
-      }
+      // Said into the session by the boot loop below, which knows which one it
+      // is — and only to a session that has not heard it already.
+      log("info", `connected as ${name} — ${URL_BASE}`)
 
       // Brief without waiting to be told a session exists. This is the boot fix:
       // brief() used to run only on session.idle or session.created, and in 23
@@ -916,6 +1105,13 @@ async function core(host) {
           const sn = await currentSession()
           if (sn?.id) {
             sessionID = sn.id
+            // Once per session, not once per instance: V2 recycles this
+            // instance about hourly, and each one used to say it again into
+            // the same conversation.
+            if (HELLO && (await briefState(sn.id)) !== "fresh") {
+              await say(`[a2a] connected as ${name} — ${URL_BASE}`,
+                        { noReply: true }, sn.id)
+            }
             // An unregistered client has no channels to read and nothing to be
             // briefed about; the one useful thing it can do is tell its human
             // how to fix that. Said HERE rather than at the moment we found out,
@@ -937,17 +1133,23 @@ async function core(host) {
         }
       })()
 
-      const url = `${URL_BASE}/stream?agent=${encodeURIComponent(key)}&format=json`
       // Why a connection ended when WE ended it.
       const closed = () => stopped ? "stream closed: plugin unloaded"
-        : "stream closed: a2a is off in this project"
+        : !ENABLED ? "stream closed: a2a is off in this project"
+          : `stream closed: reconnecting as ${key}`
       while (ENABLED && !stopped) {
         let wait = RECONNECT_MS
+        if (registered) await catchUp()
+        if (!ENABLED || stopped) break
         const ctl = new AbortController()
         stream = ctl
+        // Built per connection from the CURRENT key. Built once, above the
+        // loop, it kept streaming as the old id after rename_me — the broker
+        // then refused it every 30s and the new id's messages never came.
+        const url = `${URL_BASE}/stream?agent=${encodeURIComponent(key)}&format=json`
         try {
           const res = await fetch(url, {
-            headers: { Authorization: `Bearer ${TOKEN}` },
+            headers: { Authorization: `Bearer ${TOKEN}`, ...(await clientHeader()) },
             signal: ctl.signal,
           })
           if (!res.ok) {
@@ -989,32 +1191,10 @@ async function core(host) {
               } catch {
                 continue // noise
               }
-              if (!m.text) continue
-              // Off — or unloaded — between the broker sending this and us
-              // reading it. It is not ours to deliver any more: close the
-              // stream and leave it unacked, and the broker hands it over
-              // again on the first connection after the project is back on.
-              // Codex does the same, for the same reason: delivery is a
-              // destructive read, and a message injected into a session that
-              // switched a2a off is one the user said not to receive.
-              if (!ENABLED || stopped) {
+              if (!take(m)) {
                 ctl.abort()
                 break
               }
-              // The broker replays every UNACKED message on the first fetch of
-              // each connection, and the stream reconnects every few minutes. So
-              // anything the agent read but never acked would be re-injected on
-              // every cycle. Ack is still what retires it server-side; this only
-              // stops one process saying the same thing twice.
-              if (m.id && seen.has(m.id)) {
-                log("info", `skip #${m.channel} ${m.id} — already injected`)
-                continue
-              }
-              if (m.id) seen.add(m.id)
-              pumpState.delivered++
-              pumpState.last = `#${m.channel}/${m.sender}`
-              log("info", `deliver #${m.channel} from ${m.sender}`)
-              push(envelope(m), m.id)
             }
             if (ctl.signal.aborted) break
           }
@@ -1085,7 +1265,12 @@ async function core(host) {
     // register, or to wait for a stream that will never open. Worded like
     // Codex's, so the answer does not depend on the harness.
     let step = null
-    if (!ENABLED) {
+    if (ENABLED && me.refused) {
+      // Before everything but the switch: another client holds this agent,
+      // or this install is too old to send a client key, and nothing else
+      // worth suggesting will work until that is fixed.
+      step = `the broker refuses to act as this agent: ${me.refused}`
+    } else if (!ENABLED) {
       step =
         `a2a is off in this project: ${PROJECT_FILE} does not say ` +
         `{"${ENABLE_KEY}": true}, so nothing is delivered here. That is the ` +
@@ -1527,7 +1712,18 @@ async function core(host) {
         // Asking the broker would refuse (the name is taken, by us), and if
         // it did not it would drag another agent's history onto this one.
         const mine = (await json("GET", "/me/agents")).agents || []
-        const exists = mine.some((x) => x.agent_id === a.new_id)
+        const found = mine.find((x) => x.agent_id === a.new_id)
+        const exists = !!found
+        // Refused HERE, before anything is written: the broker refuses every
+        // request as an agent another harness-directory holds, and a store
+        // already pointing at it would leave this client stuck on it.
+        if (found?.client === "other" || (found?.bound && !found?.bound_to_me)) {
+          throw new Error(
+            `${a.new_id} belongs to another client (another harness, ` +
+            `directory or token), so this one cannot become it. Pick a new ` +
+            `name, or ask an operator to release it: a2a-mcp.py agent free ` +
+            `${a.new_id} --station <station>`)
+        }
 
         let out
         if (exists) {
@@ -1544,6 +1740,9 @@ async function core(host) {
         await pin(settled)
         key = settled
         name = settled
+        // The live stream still asks for the old id: close it, and the pump
+        // reconnects under the new one on its next cycle (a few seconds).
+        stream?.abort()
         // Re-brief THIS session only: the model still believes the old name,
         // and the instructions carry it. Scoped to one id rather than
         // clearing the memo, because a blanket reset is exactly what used to

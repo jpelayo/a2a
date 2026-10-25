@@ -26,8 +26,22 @@ reaches whichever asked first — so that window is what the channel closes.
 
 Pure standard library, and it never raises: this runs inside a connection
 handshake, where refusing to answer costs the session its tools.
+
+THE CLIENT KEY. The agent id says who this client claims to be; the client
+key says which harness-directory is saying it. The broker pins each agent to
+the first key that acts as it, so no other harness or directory — and no
+model in one — can speak as an agent it does not own. The key is DERIVED, not
+stored per project: HMAC-SHA256 of a scope (`dir:<project>`, or `agent:<id>`
+when A2A_AGENT chose the id) under one secret per install, `client.secret`
+beside identity.json. The secret is created once, by whichever process gets
+there first — written whole to a private temp file, then link()ed into place,
+which fails if another process already won — so the headersHelper and the
+channel, starting together, can never end up with two different keys.
 """
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -35,6 +49,7 @@ import sys
 from pathlib import Path
 
 FILE = "identity.json"
+SECRET = "client.secret"
 
 
 def _store_path(store: str, create: bool = False) -> Path | None:
@@ -107,6 +122,58 @@ def resolve(project: str, store: str) -> str:
     return legacy_id(key)
 
 
+def _secret(store: str) -> bytes | None:
+    """This install's secret, created on first use. None if it cannot be had.
+
+    Race-free across processes without a lock: the secret is written whole to
+    a temp file only this process knows, then link()ed to its real name. link
+    refuses to replace an existing file, so exactly one process's secret
+    becomes THE secret and every other one reads it back.
+    """
+    if not store:
+        return None
+    try:
+        root = Path(store).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / SECRET
+        if not path.exists():
+            tmp = root / f".{SECRET}.{os.getpid()}.{secrets.token_hex(4)}"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(secrets.token_hex(32) + "\n")
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass                  # someone else won; theirs is THE one
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        secret = bytes.fromhex(path.read_text().strip())
+        # A damaged secret is no secret: a short key would still derive
+        # SOMETHING, and that something would not be this install's key.
+        return secret if len(secret) == 32 else None
+    except Exception:
+        return None
+
+
+def client_key(project: str, store: str, explicit: str = "") -> str:
+    """This client's key for the broker: one per harness-directory. '' if none.
+
+    `explicit` is an id chosen for the PROCESS (A2A_AGENT). It becomes the
+    scope instead of the directory, so two instances in one directory — the
+    supported way to run two agents there — are two clients."""
+    secret = _secret(store)
+    if not secret:
+        return ""
+    scope = (f"agent:{explicit}" if explicit
+             else f"dir:{os.path.abspath(project or os.getcwd())}")
+    mac = hmac.new(secret, scope.encode(), hashlib.sha256).digest()
+    return "a2a_ck_" + base64.urlsafe_b64encode(mac).decode().rstrip("=")[:32]
+
+
 def assign(project: str, store: str, agent_id: str) -> str:
     """Record the id this client owns. The only writer."""
     agent_id = (agent_id or "").strip()
@@ -132,12 +199,17 @@ def main() -> int:
     if args.cmd == "set":
         print(assign(args.project, args.store, args.value))
         return 0
-    agent = os.environ.get("A2A_AGENT") or resolve(args.project, args.store)
+    explicit = os.environ.get("A2A_AGENT") or ""
+    agent = explicit or resolve(args.project, args.store)
     if args.cmd == "header":
         # headersHelper contract: one JSON object of string pairs on stdout.
         # Authorization is NOT set here — a plugin's helper cannot read
         # ${user_config.*}, so the token stays in the static headers block.
-        print(json.dumps({"X-A2A-Agent": agent}))
+        headers = {"X-A2A-Agent": agent}
+        key = client_key(args.project, args.store, explicit)
+        if key:
+            headers["X-A2A-Client"] = key
+        print(json.dumps(headers))
     else:
         print(agent)
     return 0

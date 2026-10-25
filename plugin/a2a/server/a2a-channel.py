@@ -82,6 +82,43 @@ def _agent_id() -> str:
 KEY = _agent_id()
 NAME = KEY
 HELLO = os.environ.get("A2A_HELLO", "1") != "0"
+# Which harness-directory this is. The broker pins each agent to the first
+# client key that acts as it, so nothing else can speak as an agent this
+# client owns. Derived — this install's secret and the project, or A2A_AGENT —
+# identically here and in the headersHelper, so the tools and this channel
+# can never present two keys. See identity.client_key.
+_client_key_cache: list[str] = []
+
+
+def _client_key() -> str:
+    """This client's key, derived on first use. A failure is NOT cached: the
+    next request tries again, so a transient error (a store not yet created)
+    cannot leave this process keyless — and refused — for the whole session
+    while the headersHelper, deriving afresh, presents the real key."""
+    if not _client_key_cache:
+        key = _identity.client_key(
+            os.environ.get("A2A_AGENT_DIR") or os.getcwd(),
+            os.environ.get("A2A_IDENTITY_STORE", ""),
+            os.environ.get("A2A_AGENT") or "",
+        )
+        if not key:
+            return ""
+        _client_key_cache.append(key)
+    return _client_key_cache[0]
+
+
+def _headers(extra: dict | None = None) -> dict:
+    """Every broker request's headers: the token, who we are, which client.
+
+    One place, so no call can forget the client key — a request without it is
+    refused for any agent a client has already claimed."""
+    h = {"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY}
+    key = _client_key()
+    if key:
+        h["X-A2A-Client"] = key
+    if extra:
+        h.update(extra)
+    return h
 
 
 def _settings() -> dict:
@@ -133,10 +170,7 @@ def _resolve_name() -> str:
     refuses to start because the broker is slow is worse than a stale brief.
     """
     try:
-        req = urllib.request.Request(
-            f"{URL}/me",
-            headers={"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY},
-        )
+        req = urllib.request.Request(f"{URL}/me", headers=_headers())
         with urllib.request.urlopen(req, timeout=3) as resp:
             resolved = json.load(resp).get("agent") or KEY
         if resolved != KEY:
@@ -150,28 +184,30 @@ def _resolve_name() -> str:
         return KEY
 
 
-def _my_agents() -> list[str]:
-    """Agent ids this token may act as, across its granted stations."""
+def _my_agent_rows() -> list[dict]:
+    """The agents this token may act as, across its granted stations, each
+    with `client`: "this", "other" (another harness-directory holds it) or
+    None (nobody has claimed it yet)."""
     try:
-        req = urllib.request.Request(
-            f"{URL}/me/agents",
-            headers={"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY},
-        )
+        req = urllib.request.Request(f"{URL}/me/agents", headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return [a.get("agent_id") for a in json.load(resp).get("agents", [])]
+            return [a for a in json.load(resp).get("agents", [])
+                    if isinstance(a, dict)]
     except Exception as e:
         _log(f"could not list my agents ({e!r})")
         return []
+
+
+def _my_agents() -> list[str]:
+    """Agent ids this token may act as, across its granted stations."""
+    return [a.get("agent_id") for a in _my_agent_rows()]
 
 
 def _me_view() -> dict:
     """Identity as the BROKER sees it. Reachable while unregistered — which is
     exactly when an agent needs to ask."""
     try:
-        req = urllib.request.Request(
-            f"{URL}/me",
-            headers={"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY},
-        )
+        req = urllib.request.Request(f"{URL}/me", headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
             out = json.load(resp)
             return out if isinstance(out, dict) else {}
@@ -188,10 +224,7 @@ def _my_channels() -> list[str]:
     have told it why.
     """
     try:
-        req = urllib.request.Request(
-            f"{URL}/channels",
-            headers={"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY},
-        )
+        req = urllib.request.Request(f"{URL}/channels", headers=_headers())
         with urllib.request.urlopen(req, timeout=5) as resp:
             rows = (json.load(resp) or {}).get("channels") or []
         return sorted(c["name"] for c in rows
@@ -244,15 +277,25 @@ def _rename(new_id: str) -> tuple[bool, str]:
         return False, "new_id is required"
     if new_id == KEY:
         return True, f"already {new_id!r}"
-    if new_id in _my_agents():
+    existing = next((a for a in _my_agent_rows()
+                     if a.get("agent_id") == new_id), None)
+    if existing:
+        # Refused HERE, before anything is written: the broker would refuse
+        # every request as an agent another harness-directory holds, and a
+        # store already pointing at it would leave this client stuck on it.
+        if (existing.get("client") == "other"
+                or (existing.get("bound") and not existing.get("bound_to_me"))):
+            return False, (
+                f"{new_id!r} belongs to another client (another harness, "
+                f"directory or token), so this one cannot become it. Pick a "
+                f"new name, or ask an operator to release it: a2a-mcp.py "
+                f"agent free {new_id} --station <station>")
         return _adopt(new_id)
     try:
         req = urllib.request.Request(
             f"{URL}/me/agents/{urllib.parse.quote(KEY, safe='')}",
             data=json.dumps({"rename": new_id}).encode(),
-            headers={"Authorization": f"Bearer {TOKEN}",
-                     "X-A2A-Agent": KEY,
-                     "Content-Type": "application/json"},
+            headers=_headers({"Content-Type": "application/json"}),
             method="PATCH",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -295,9 +338,7 @@ def _propose(note: str = "") -> tuple[bool, str]:
         req = urllib.request.Request(
             f"{URL}/me/proposals",
             data=json.dumps({"agent_id": KEY, "note": note or ""}).encode(),
-            headers={"Authorization": f"Bearer {TOKEN}",
-                     "X-A2A-Agent": KEY,
-                     "Content-Type": "application/json"},
+            headers=_headers({"Content-Type": "application/json"}),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -365,9 +406,7 @@ def _flush_acks() -> None:
         req = urllib.request.Request(
             f"{URL}/ack",
             data=json.dumps({"ids": ids}).encode(),
-            headers={"Authorization": f"Bearer {TOKEN}",
-                     "X-A2A-Agent": KEY,
-                     "Content-Type": "application/json"},
+            headers=_headers({"Content-Type": "application/json"}),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10):
@@ -401,10 +440,7 @@ def _check_channels() -> None:
 
     def _get(path: str):
         """One GET, as this agent."""
-        req = urllib.request.Request(
-            f"{URL}{path}",
-            headers={"Authorization": f"Bearer {TOKEN}", "X-A2A-Agent": KEY},
-        )
+        req = urllib.request.Request(f"{URL}{path}", headers=_headers())
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.load(resp)
 
@@ -445,9 +481,11 @@ def _instructions(agent: str) -> str:
     "candidate for. The ‹WHO› opening the body is added by this client so a "
     "human can see who spoke; the sender attribute is the authoritative one, "
     "and the ‹…› mark is not part of what they wrote — do not repeat it when "
-    "you quote or reply. Respond with post_to_channel (name=the channel attribute, "
-    f'sender="{agent}"); for help-wanted requests use submit_bid with the '
-    "broadcast_id attribute; reply to a DM with send_dm. ping_me sends "
+    "you quote or reply. Respond with post_to_channel (name=the channel "
+    "attribute); for help-wanted requests use submit_bid with the "
+    "broadcast_id attribute; reply to a DM with send_dm. Your messages are "
+    f'signed for you as "{agent}" — there is no sender to pass, and you cannot '
+    "post as anyone else. ping_me sends "
     "yourself a DM to prove this channel is delivering."
     "\n\n"
     "ADDRESSING IS AN ARGUMENT, NOT PUNCTUATION. Two fields, and every "
@@ -725,9 +763,15 @@ def _handle(msg: dict) -> None:
             registered = bool(me.get("registered"))
             stations = me.get("stations") or []
 
-            # In order: exist, then be reachable, then be healthy. Only the
-            # first unmet condition is worth telling an agent about.
-            if not registered:
+            # In order: be allowed, exist, then be reachable, then be healthy.
+            # Only the first unmet condition is worth telling an agent about —
+            # and a refusal comes first, because nothing else will work until
+            # it is fixed (another client holds this agent, or this install
+            # is too old to send a client key).
+            refused = me.get("refused")
+            if refused:
+                step = f"the broker refuses to act as this agent: {refused}"
+            elif not registered:
                 step = ("you are not registered in this station yet: call "
                         "propose_me with one line about this project, and an "
                         "operator approves it with one keystroke — no restart")
@@ -938,9 +982,10 @@ def _pump() -> None:
         stream_key = KEY
         url = f"{URL}/stream?agent={urllib.parse.quote(stream_key)}&format=json"
         try:
-            req = urllib.request.Request(
-                url, headers={"Authorization": f"Bearer {TOKEN}"}
-            )
+            # The client key rides on the stream too: the broker re-checks it
+            # every keepalive, so a stream for an agent another client claims
+            # ends instead of delivering into the wrong session.
+            req = urllib.request.Request(url, headers=_headers())
             # STREAM_READ_TIMEOUT is the whole reason this channel recovers.
             # urlopen's timeout applies to EVERY read, not just the connect,
             # so a link that dies silently raises here instead of blocking

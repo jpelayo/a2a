@@ -75,11 +75,25 @@ def main() -> int:
         parsed = json.loads(raw)
     except ValueError:
         parsed = None
-    check("header prints one JSON object of string pairs",
-          isinstance(parsed, dict) and list(parsed) == ["X-A2A-Agent"]
-          and isinstance(parsed.get("X-A2A-Agent"), str), raw)
+    check("header prints one JSON object of string pairs: the agent, and the "
+          "client key the broker pins it to (0.5.0)",
+          isinstance(parsed, dict)
+          and sorted(parsed) == ["X-A2A-Agent", "X-A2A-Client"]
+          and all(isinstance(v, str) for v in parsed.values())
+          and parsed["X-A2A-Client"].startswith("a2a_ck_"), raw)
     check("the header carries exactly what get reports",
           parsed and parsed["X-A2A-Agent"] == run("get", store=a), raw)
+    check("the key needs a secret, not an identity: the handshake still writes "
+          "no identity.json…",
+          not (Path(a) / "identity.json").exists(),
+          "the helper wrote the identity store during a handshake")
+    secret = Path(a) / "client.secret"
+    check("…only the install's secret, private to this user",
+          secret.exists() and (secret.stat().st_mode & 0o777) == 0o600,
+          oct(secret.stat().st_mode) if secret.exists() else "no secret")
+    check("and the same key on every handshake — it is derived, not drawn",
+          json.loads(run("header", store=a)).get("X-A2A-Client")
+          == (parsed or {}).get("X-A2A-Client"), raw)
 
     # --- ownership ----------------------------------------------------------
     check("set returns the name it recorded",
@@ -110,6 +124,11 @@ def main() -> int:
     check("an unwritable/absent store still answers",
           run("get", store="/proc/nonexistent/nope") == DIRNAME,
           run("get", store="/proc/nonexistent/nope"))
+    bare = json.loads(run("header", store="/proc/nonexistent/nope") or "{}")
+    check("and the header still answers there, with no client key rather than "
+          "no header — the broker then treats it as an older client",
+          bare.get("X-A2A-Agent") == DIRNAME and "X-A2A-Client" not in bare,
+          str(bare))
 
     print()
     for f in fails:

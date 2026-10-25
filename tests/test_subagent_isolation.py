@@ -64,6 +64,9 @@ process.env.A2A_TOKEN = "dev"
 process.env.A2A_HELLO = "0"
 process.env.A2A_AGENT = %(agent)s
 process.env.HOME = %(home)s
+// The client secret lives under OpenCode's data dir: this HOME's, never the
+// real one, even when the real environment sets XDG_DATA_HOME.
+process.env.XDG_DATA_HOME = %(home)s + "/.local/share"
 
 const ROOT = %(root)s, CHILD = %(child)s
 const calls = []
@@ -104,7 +107,7 @@ const sessions = [
 ]
 
 const mod = await import(%(module)s)
-const plugin = await mod.A2A({
+const plugin = await mod.default.server({
   client: {
     app: { log: async () => {} },
     session: {

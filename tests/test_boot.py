@@ -56,6 +56,9 @@ process.env.A2A_URL = "http://broker.invalid"
 process.env.A2A_TOKEN = "dev"
 process.env.A2A_AGENT = %(agent)s
 process.env.A2A_HELLO = "0"
+// The client secret is created under OpenCode's data directory: keep it in
+// this test's temp dir, never the real home.
+process.env.XDG_DATA_HOME = %(data)s
 // The watchdog, shortened so the test does not sit through the real one.
 process.env.A2A_PROMPT_TIMEOUT_MS = "700"
 
@@ -131,7 +134,8 @@ const client = {
 }
 
 const mod = await import(%(module)s)
-await mod.A2A({ client, directory: %(project)s })
+// OpenCode 1.x's entry point; 2.x's setup() is driven by test_project_gate.
+await mod.default.server({ client, directory: %(project)s })
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 await sleep(1200)
@@ -157,6 +161,10 @@ def run(tmp: Path, registered: bool = True, member: bool = True) -> dict:
     (project / ".a2a.json").write_text('{"enabled_opencode": true}')
     harness.write_text(HARNESS % {
         "project": json.dumps(str(project)),
+        # One data dir per run: the plugin remembers which sessions it has
+        # briefed there, and a later run sharing it would be told "already
+        # briefed" — passing every "is not asked" check without testing it.
+        "data": json.dumps(str(tmp / f"data-{registered}-{member}")),
         "agent": json.dumps(AGENT),
         "module": json.dumps(str(OPENCODE)),
         "registered": "true" if registered else "false",
