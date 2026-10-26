@@ -27,6 +27,12 @@ What this pins, in two halves:
               terminal's agent and client headers; the inbound tools refuse
               without calling the broker; enable_a2a_here connects nothing.
 
+  derived id  a second run with NO A2A_AGENT, the id read from the identity
+              store as on a real install. The stored id was read only on the
+              way to the stream, so a helper that never went there signed as
+              the folder name — an agent the broker did not know. A run that
+              sets A2A_AGENT never consults the store and could not see it.
+
 Loads the REAL index.ts once per instance, as Pi does, against a fake broker.
 No database; needs node 22+ (TypeScript type stripping).
 """
@@ -93,8 +99,12 @@ globalThis.fetch = async (url, init = {}) => {
   const path = String(url).replace("http://broker.invalid", "")
   const method = init.method || "GET"
   calls.push({ method, path, headers: { ...(init.headers || {}) } })
-  if (path === "/me") return ok({ agent: "probe", registered: true, stations: ["s"] })
-  if (path === "/channels") return ok({ channels: [{ name: "ops", members: ["probe"] }] })
+  // /me answers as whoever asked: a fixed name here would paper over a client
+  // that asked as the wrong one.
+  const asked = (init.headers || {})["X-A2A-Agent"] || ""
+  if (path === "/me") return ok({ agent: asked, registered: true, stations: ["s"] })
+  if (path === "/channels")
+    return ok({ channels: [{ name: "ops", members: ["probe", "stored-id"] }] })
   if (path.startsWith("/stream")) return openStream(init.signal)
   // Every other route answers with something recognisable, so a test can
   // see the tool returned the broker's body and not something of its own.
@@ -173,6 +183,20 @@ const sends = async (p) => ({
 const status = async (p) => JSON.parse((await tool(p, "a2a_channel_status")).text)
 const out = {}
 
+// A DERIVED id: no A2A_AGENT, the name comes from ~/.pi/agent/a2a-identity.json
+// — what a real install runs as. The terminal reads it on its way to the
+// stream; the helper never goes there and must read it all the same.
+if (process.env.TEST_RUN === "derived") {
+  const T = await instance("ses_t", "tui")
+  out.t = { opened: T.opened, status: await status(T), sends: await sends(T) }
+  const H = await instance("ses_h", "print")
+  out.h = { opened: H.opened, status: await status(H), sends: await sends(H),
+            session: snap(H) }
+  out.stream_paths = calls.filter((c) => c.path.startsWith("/stream")).map((c) => c.path)
+  console.log("@@" + JSON.stringify(out))
+  process.exit(0)
+}
+
 // 1. A Pi that reports no mode: today's behaviour, tool by tool.
 const N = await instance("ses_n", null)
 out.n = { opened: N.opened, inbound: await inbound(N), sends: await sends(N),
@@ -236,10 +260,9 @@ process.exit(0)
 '''
 
 
-def main() -> int:
-    if not shutil.which("node"):
-        print("SKIP: node is not installed", file=sys.stderr)
-        return 2
+def run(derived: bool) -> dict | None:
+    """One harness run in a fresh HOME. `derived`: no A2A_AGENT, and the id
+    comes from the identity store, as on a real install."""
     work = Path(tempfile.mkdtemp(prefix="a2a-pisendonly-"))
     (work / "node_modules" / "typebox").mkdir(parents=True)
     (work / "node_modules" / "typebox" / "package.json").write_text(
@@ -254,17 +277,73 @@ def main() -> int:
     (work / "run.mjs").write_text(HARNESS)
     env = dict(os.environ, A2A_URL="http://broker.invalid", A2A_TOKEN="tok",
                A2A_AGENT="probe", A2A_HELLO="0", HOME=str(work))
-    for k in ("A2A_READ_ON_INIT", "A2A_CATCHUP"):
+    for k in ("A2A_READ_ON_INIT", "A2A_CATCHUP", "TEST_RUN"):
         env.pop(k, None)
+    if derived:
+        env.pop("A2A_AGENT")
+        env["TEST_RUN"] = "derived"
+        # Keyed by the client's `project`, which is process.cwd() — the REAL
+        # path (/private/var/… on macOS, not the /var/… tempfile hands back).
+        store = work / ".pi" / "agent" / "a2a-identity.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({os.path.realpath(work): "stored-id"}))
     proc = subprocess.run(["node", "run.mjs"], cwd=work, env=env,
                           capture_output=True, text=True, timeout=180)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("@@")), "")
     if not line:
-        print("FAIL the harness produced nothing")
+        print(f"FAIL the harness produced nothing (derived={derived})")
         print(proc.stdout[-1500:])
         print(proc.stderr[-1500:])
-        return 1
+        return None
     out = json.loads(line[2:])
+    out["folder"] = work.name
+    return out
+
+
+def ident(r: dict) -> dict:
+    """The identity a tool call went out under."""
+    hd = (r.get("calls") or [{}])[0].get("headers") or {}
+    return {k: hd.get(k) for k in ("Authorization", "X-A2A-Agent", "X-A2A-Client")}
+
+
+def verify_derived(out: dict) -> None:
+    folder = out["folder"]
+    t, h = out["t"], out["h"]
+    check("[derived id] the terminal streams as the STORED id, not the folder "
+          "name — the pump path reads the store as it always did",
+          t["opened"] == 1 and out["stream_paths"]
+          and all("agent=stored-id" in p for p in out["stream_paths"])
+          and t["status"].get("agent") == "stored-id",
+          f"streams={out['stream_paths']} status.agent={t['status'].get('agent')}")
+    check("[derived id] the helper reports the stored id too, and that it does "
+          "not receive",
+          h["status"].get("agent") == "stored-id"
+          and h["status"].get("receives") is False,
+          f"agent={h['status'].get('agent')} receives={h['status'].get('receives')} "
+          f"(folder is {folder!r})")
+    for name in ("send_dm", "post_to_channel"):
+        r, ref = h["sends"][name], t["sends"][name]
+        check(f"[derived id] the helper's {name} goes out as stored-id, with the "
+              "terminal's token and client key — never as the folder name, an "
+              "agent the broker does not know",
+              "error" not in r and ident(r)["X-A2A-Agent"] == "stored-id"
+              and ident(r) == ident(ref) and bool(ident(r)["X-A2A-Client"])
+              and folder not in json.dumps(r.get("calls")),
+              f"helper={ident(r)} terminal={ident(ref)}")
+    check("[derived id] and the helper still opens no stream",
+          h["opened"] == 0 and len(out["stream_paths"]) == 1
+          and not (h["session"]["turns"] or h["session"]["context"]),
+          f"opened={h['opened']} streams={out['stream_paths']}")
+
+
+def main() -> int:
+    if not shutil.which("node"):
+        print("SKIP: node is not installed", file=sys.stderr)
+        return 2
+    out = run(derived=False)
+    derived = run(derived=True)
+    if out is None or derived is None:
+        return 1
 
     routes = {
         "my_pending": ("GET", "/pending?limit=5"),
@@ -321,10 +400,6 @@ def main() -> int:
               out["t"]["after"]["turns"] + out["t"]["after"]["context"]
               + out["t"]["after"]["queued"]),
           json.dumps(out["t"]["after"])[:300])
-
-    def ident(r: dict) -> dict:
-        hd = (r.get("calls") or [{}])[0].get("headers") or {}
-        return {k: hd.get(k) for k in ("Authorization", "X-A2A-Agent", "X-A2A-Client")}
 
     for name, (method, path) in send_routes.items():
         r, ref = h["sends"][name], out["t"]["sends"][name]
@@ -385,6 +460,9 @@ def main() -> int:
     check("a helper's enable_a2a_here connects nothing",
           r["opened_at_start"] == 0 and r["opened_by_enable"] == 0
           and "error" not in r["result"], json.dumps(r)[:300])
+
+    # --- a derived id, as on a real install ------------------------------------------
+    verify_derived(derived)
 
     print()
     for f in fails:
