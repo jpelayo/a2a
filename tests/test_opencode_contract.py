@@ -138,6 +138,25 @@ def v2(src: Path, plugin: str) -> None:
           and "parentID: SessionID.pipe(optional)" in events,
           "packages/schema/src/session-*.ts changed")
 
+    # --- the instructions, in the system prompt ---------------------------------
+    # Added 2026-10-26 against `dev`: the plugin no longer posts its
+    # instructions into the conversation; the session "context" hook puts them
+    # in each model request's system prompt as a SystemPart {type: "text"}.
+    hooks = read(src, "packages/plugin/src/promise/session.ts")
+    messages = read(src, "packages/ai/src/schema/messages.ts")
+    check("sessions expose hook(\"context\", …) whose input carries a mutable "
+          "system: Array<SystemPart> — and the plugin registers it and pushes "
+          "into it",
+          re.search(r"\bcontext\??\s*:\s*SessionContext", hooks) is not None
+          and re.search(r"system\s*:\s*Array<SystemPart>", hooks) is not None
+          and 'ctx.session.hook("context"' in setup
+          and "input.system.push(" in setup,
+          "packages/plugin/src/promise/session.ts changed, or the plugin did")
+    check("a SystemPart is {type: \"text\", text} — what the plugin pushes",
+          'Schema.Literal("text")' in between(messages, "systemPartSchema", "})")
+          and '{ type: "text", text }' in setup,
+          "packages/ai/src/schema/messages.ts changed, or the plugin did")
+
 
 def v1(src: Path, plugin: str) -> None:
     index = read(src, "packages/opencode/src/plugin/index.ts")
@@ -153,6 +172,15 @@ def v1(src: Path, plugin: str) -> None:
           "not both" in shared and "tui" not in plugin.split(
               "export default", 1)[1],
           "")
+    hooks = read(src, "packages/plugin/src/index.ts")
+    server = between(plugin, "async function server(", "\nasync function setup(")
+    check("V1's experimental.chat.system.transform hands output.system: "
+          "string[] — and the plugin returns it and pushes the instructions",
+          '"experimental.chat.system.transform"' in hooks
+          and re.search(r"system\s*:\s*string\[\]", hooks) is not None
+          and '"experimental.chat.system.transform"' in server
+          and "output.system.push(" in server,
+          "packages/plugin/src/index.ts changed, or the plugin did")
 
 
 def main() -> int:

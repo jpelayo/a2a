@@ -18,11 +18,12 @@ the context filled and the terminal never came back.
 
 What this pins:
 
-  one brief        per session id, for the life of the process. The memo is a
-                   Map now; nothing may clear it wholesale.
+  no posted brief  the instructions are in the system prompt, never posted;
+                   the startup check is posted once. The memo is a Map; nothing
+                   may clear it wholesale.
   roots only       a session with parentID is a tool call the agent made. It
-                   never gets the brief and never gets a message — messages
-                   injected there were acked where no human could see them.
+                   never gets the instructions and never gets a message —
+                   messages injected there were acked where no human saw them.
   no storm         a thousand message.updated events cost zero injections.
   newest ≠ target  the subagent IS the most recently updated session while it
                    runs, which is exactly why "newest in this directory" was
@@ -145,7 +146,14 @@ for (let i = 0; i < 200; i++) {
 }
 await new Promise((r) => setTimeout(r, 400))
 
-console.log("@@" + JSON.stringify({ calls, afterBoot }))
+// What each session's system prompt carries from this plugin.
+const systemOf = async (sessionID) => {
+  const output = { system: [] }
+  await plugin["experimental.chat.system.transform"]?.({ sessionID, model: {} }, output)
+  return output.system
+}
+console.log("@@" + JSON.stringify({ calls, afterBoot,
+  system: { root: await systemOf(ROOT), child: await systemOf(CHILD) } }))
 process.exit(0)
 """
 
@@ -197,10 +205,15 @@ def main() -> int:
     to_root = [c for c in calls if c["id"] == ROOT]
     unknown = [c for c in calls if c["id"] not in (ROOT, CHILD)]
 
-    check("the instructions are injected exactly ONCE, after 200 rounds of "
-          "the event storm a running subagent produces",
-          len(briefs) == 1, f"{len(briefs)} briefs: {briefs}")
-    check("and the turn-starting check prompt exactly once too — it is what "
+    check("the instructions are never posted, not even after 200 rounds of "
+          "the event storm a running subagent produces — they live in the "
+          "system prompt", not briefs, f"{len(briefs)} briefs: {briefs}")
+    sysp = out.get("system") or {}
+    check("the root session's system prompt carries them, the subagent's does "
+          "not — instructions for somebody else are all its context is for",
+          any("You are a2a agent" in s for s in sysp.get("root") or [])
+          and not sysp.get("child"), str(sysp)[:200])
+    check("and the turn-starting check prompt exactly once — it is what "
           "used to feed itself, since the turn it starts emits more events",
           len(checks) == 1, f"{len(checks)} checks")
     check("nothing at all is said to the subagent session: it is a tool call, "
@@ -214,13 +227,8 @@ def main() -> int:
           any("does the root get this?" in c["text"] for c in calls
               if c["id"] == ROOT),
           str(calls))
-    check("the brief lands before the message, so the agent knows what the "
-          "message is when it arrives",
-          not calls or "You are a2a agent" in calls[0]["text"],
-          str(calls[:1]))
-    check("the instructions carry noReply — reference material must not spend "
-          "a model turn",
-          all(c["noReply"] for c in briefs), str(briefs))
+    check("the startup check lands before the message",
+          not calls or "Session start" in calls[0]["text"], str(calls[:1]))
 
     # The source contract: a blanket reset is what made this unbounded. Read
     # CODE only — the comments deliberately quote the old line to explain it.

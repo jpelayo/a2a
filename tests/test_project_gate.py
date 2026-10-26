@@ -170,6 +170,7 @@ const v2prompts = []
 const v2ctx = (d) => {
   const added = []
   const listed = []
+  const hooks = {}
   const ctx = {
     app: { name: "opencode", version: "2.1.3", channel: "latest" },
     location: { directory: d, project: { id: "p", directory: d, canonical: d } },
@@ -207,20 +208,29 @@ const v2ctx = (d) => {
         v2prompts.push(input)
         return { id: "msg_x" }
       },
+      // V2's model hooks: a name and a callback, returning a Registration.
+      hook: async (name, cb) => {
+        hooks[name] = cb
+        return { dispose: async () => { delete hooks[name] } }
+      },
     },
   }
-  return { ctx, added, listed }
+  return { ctx, added, listed, hooks }
 }
 const runV2 = async (contents) => {
   calls = []; prompts.length = 0; v2prompts.length = 0
   const d = project(contents)
-  const { ctx, added, listed } = v2ctx(d)
+  const { ctx, added, listed, hooks } = v2ctx(d)
   const cleanup = await plugin.setup(ctx)
   await settle()
   const tool = (n) => added.find((t) => t.name === n)
+  // What the context hook adds to a model request's system prompt here.
+  const input = { sessionID: "ses_x", system: [] }
+  if (hooks.context) await hooks.context(input)
   return { dir: d, cleanup, added, tool, listed: [...listed],
            tools: added.map((t) => t.name), calls: callsOf(d),
-           prompts: [...prompts], v2prompts: [...v2prompts] }
+           prompts: [...prompts], v2prompts: [...v2prompts],
+           hooked: Object.keys(hooks), system: input.system }
 }
 
 const cases = async (go) => ({
@@ -260,9 +270,12 @@ await flip.s.tool.enable_a2a_here.execute({ enabled: true })
 
 const v2 = await cases(runV2)
 out.v2_keys = keysOf(v2.on.dir)
-// The brief in V2 is a prompt that starts no turn, into the session asked of
-// the server for THIS directory, roots only.
-out.v2_brief = v2.on.v2prompts[0] || null
+// The instructions in V2 go into the system prompt through the session
+// "context" hook, never into the conversation.
+out.v2_hooked = v2.on.hooked
+out.v2_system_on = v2.on.system
+out.v2_system_off = v2.absent.system
+out.v2_posted = v2.on.v2prompts
 out.v2_listed = v2.on.listed[0] || null
 out.v2_tools = v2.on.added.map((t) => ({
   name: t.name, codemode: t.options?.codemode, input: t.input,
@@ -636,14 +649,19 @@ def main() -> int:
           and sorted(post["input"]["required"]) == ["name", "text"],
           str(post))
 
-    brief = oc["v2_brief"] or {}
-    check("opencode v2: the brief is a prompt that starts NO turn "
-          "(resume:false is V1's noReply), steered into the session the "
-          "server named",
-          brief.get("sessionID") == "ses_x" and brief.get("resume") is False
-          and brief.get("delivery") == "steer"
-          and "ADDRESSING IS AN ARGUMENT" in (brief.get("text") or ""),
-          str(brief)[:300])
+    on_sys = oc["v2_system_on"] or []
+    check("opencode v2: the instructions go into the system prompt through "
+          "the session context hook, as a {type: text} part — never posted "
+          "into the conversation",
+          "context" in (oc["v2_hooked"] or [])
+          and any(p.get("type") == "text"
+                  and "ADDRESSING IS AN ARGUMENT" in (p.get("text") or "")
+                  for p in on_sys)
+          and not any("ADDRESSING IS AN ARGUMENT" in (p.get("text") or "")
+                      for p in oc["v2_posted"] or []),
+          str(on_sys)[:200])
+    check("opencode v2: a project with a2a off adds nothing to the system "
+          "prompt either", not oc["v2_system_off"], str(oc["v2_system_off"])[:200])
     listed = oc["v2_listed"] or {}
     check("opencode v2: sessions are asked for by directory and roots only — "
           "V2 sessions carry location.directory, so V1's filter would pass "

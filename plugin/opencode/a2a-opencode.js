@@ -105,9 +105,6 @@ const PROMPT_TIMEOUT_MS =
 // letting the events take over.
 const BRIEF_RETRY_MS = 2_000
 const BRIEF_GIVE_UP_MS = 30_000
-// The brief file is pruned so it cannot grow without bound.
-const BRIEF_KEEP_MS = 30 * 24 * 3600_000
-const BRIEF_KEEP_MAX = 500
 // THIS PROCESS — not this plugin instance. The channel check runs when the CLI
 // starts, and the plugin lives in the CLI's process: OpenCode 1's own, or
 // OpenCode 2's per-launch server once its background service is disabled
@@ -767,52 +764,34 @@ async function core(host) {
     `then end your turn — the next message is pushed in on its own, `
     + `so there is nothing to wait for and nothing to poll.`
 
-  /** One brief per session id, for the life of the process.
+  /** The startup brief, one promise per session id, awaited by every caller.
    *
    *  This was a single `briefing` promise plus `briefing = null` wherever the
    *  target changed, and that reset is what made the plugin unusable: every
    *  retarget re-armed the brief, so two sessions taking turns to emit events
-   *  — which is exactly what a parent and its subagents do — injected the
-   *  instructions block over and over until the context was full. The turn
-   *  that checkPrompt starts emits more events, so it fed itself.
-   *
-   *  A Map keyed by id cannot do that. It also keeps the original property
-   *  that the reset was protecting: a genuinely new session still gets its own
-   *  brief, because its id is not in the Map. */
+   *  — which is exactly what a parent and its subagents do — injected over
+   *  and over. A Map keyed by id cannot do that. */
   const briefed = new Map()
 
-  // What has been briefed, kept on disk so it outlives this plugin instance —
-  // in the DATA directory, beside the client secret, since V2 watches config:
-  //   started   per agent key: the process that had the startup brief
-  //   sessions  per session: briefed as which key and name
-  // A file in any other shape reads as empty, so the next start briefs in full.
+  // Which process had the startup brief, per agent key, kept on disk so it
+  // outlives this plugin instance — in the DATA directory, beside the client
+  // secret, since V2 watches config. A file in any other shape reads as empty.
   const BRIEFS = `${DATA}/opencode/a2a-briefed.json`
-  async function readBriefs() {
-    const m = await readJSON(BRIEFS)
-    const obj = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {})
-    return { started: obj(m.started), sessions: obj(m.sessions) }
+  async function readStarted() {
+    const m = (await readJSON(BRIEFS)).started
+    return m && typeof m === "object" && !Array.isArray(m) ? m : {}
   }
-  async function remember(id, { startup = false } = {}) {
-    const now = Date.now()
-    const tmp = `${BRIEFS}.${process.pid}.${now}.` +
+  async function rememberStart() {
+    const tmp = `${BRIEFS}.${process.pid}.${Date.now()}.` +
       Math.random().toString(16).slice(2)
     try {
-      const { started, sessions } = await readBriefs()
-      const kept = Object.entries(sessions)
-        .filter(([sid, e]) => sid !== id && now - (Number(e?.at) || 0) < BRIEF_KEEP_MS)
-        .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
-        .slice(0, BRIEF_KEEP_MAX - 1)
-      const data = {
-        started: startup ? { ...started, [key]: PROC } : started,
-        sessions: Object.fromEntries([[id, { key, name, at: now }], ...kept]),
-      }
+      const started = { ...(await readStarted()), [key]: PROC }
       // Whole or not at all: another project's instance may be reading it.
-      // Two writing at once can drop one entry, which costs one extra brief.
       await fs.mkdir(`${DATA}/opencode`, { recursive: true })
-      await fs.writeFile(tmp, JSON.stringify(data) + "\n")
+      await fs.writeFile(tmp, JSON.stringify({ started }) + "\n")
       await fs.rename(tmp, BRIEFS)
     } catch (e) {
-      log("error", `could not remember the brief: ${e}`)
+      log("error", `could not remember the startup brief: ${e}`)
     } finally {
       await fs.unlink(tmp).catch(() => {})
     }
@@ -823,6 +802,43 @@ async function core(host) {
   // briefed at once cannot both run the check.
   let startupDone = null
   let startupTaken = false
+
+  // The instructions live in the SYSTEM PROMPT, never in the conversation:
+  // OpenCode 1's "experimental.chat.system.transform" hook and OpenCode 2's
+  // session "context" hook add them to every model request (see the two
+  // adapters). Posted as a message they were a ~70-line block that landed
+  // whenever a session first stirred — your first prompt in a new
+  // conversation, a reload, an old conversation reopened. Only this project's
+  // ROOT sessions get them: a subagent's session is a tool call with its own
+  // job, and another project's session belongs to another agent. Asked of the
+  // host with the same list currentSession() uses, and cached per session.
+  const ours = new Map()
+  async function isOurRoot(id) {
+    if (typeof id !== "string" || !id) return false
+    if (!ours.has(id)) {
+      try {
+        for (const s of await host.sessions()) {
+          learn(s)
+          if (typeof s?.id === "string") {
+            ours.set(s.id, !s.parentID &&
+              (!s.directory || !directory || s.directory === directory))
+          }
+        }
+      } catch (e) {
+        log("error", `could not list sessions: ${e}`)
+        return false
+      }
+      // Not in this project's list: not ours. Remembered, so a model request
+      // in someone else's session does not list sessions every time.
+      if (!ours.has(id)) ours.set(id, false)
+    }
+    return ours.get(id) === true && !children.has(id)
+  }
+  /** The instructions for this session's system prompt, or null. */
+  async function systemFor(sessionID) {
+    if (!ENABLED || stopped || !registered) return null
+    return (await isOurRoot(sessionID)) ? instructions(name) : null
+  }
 
   /** The channel check — the one part of a brief that starts a turn.
    *  CATCHUP is already 0 when read_on_init is false, so this one gate
@@ -848,39 +864,23 @@ async function core(host) {
       briefed.set(id, (async () => {
         let startup = false
         try {
-          startupDone ??= readBriefs().then((b) => sameProcess(b.started[key]))
-          const already = await startupDone
-          startup = !already && !startupTaken
-          if (startup) startupTaken = true
-          if (!startup) {
-            // Not a start: this process has had its startup brief. The
-            // session gets the instructions only if it lacks them — a new
-            // session, a rename — and never the check.
-            const e = (await readBriefs()).sessions[id]
-            if (e?.key === key && e?.name === name) {
-              log("info", `${id} already briefed as ${name}; not again`)
-              return
-            }
-            await say(instructions(name), { noReply: true }, id)
-            if (!stopped) await remember(id)
-            log("info", `briefed ${id}: instructions only — the channel check runs at startup`)
-            return
-          }
-          // The CLI started: the hello, the instructions and the check, as
-          // it always did. Two messages, and the difference between them is
-          // the whole point. The instructions are reference material: they
-          // arrive with noReply so no turn is spent on them. The check is an
-          // instruction to act, so it does NOT set noReply — it starts a
-          // turn, and the tool calls it produces are the boot behaviour you
-          // can actually see.
+          startupDone ??= readStarted().then((s) => sameProcess(s[key]))
+          startup = !(await startupDone) && !startupTaken
+          // Not a start — this process has had its startup brief: nothing.
+          // The instructions are in the system prompt, not posted.
+          if (!startup) return
+          startupTaken = true
+          // The CLI started: the hello, and the channel check. The hello is
+          // noReply, so no turn is spent on it. The check is an instruction
+          // to act, so it does NOT set noReply — it starts a turn, and the
+          // tool calls it produces are the boot behaviour you can see.
           if (HELLO) {
             await say(`[a2a] connected as ${name} — ${URL_BASE}`, { noReply: true }, id)
           }
-          await say(instructions(name), { noReply: true }, id)
           if (stopped) return
-          log("info", `briefed ${id} (startup)`)
+          log("info", `startup brief in ${id}`)
           await sendCheck(id)
-          if (!stopped) await remember(id, { startup: true })
+          if (!stopped) await rememberStart()
         } catch (e) {
           if (startup) startupTaken = false
           briefed.delete(id)         // let the next caller try again
@@ -955,23 +955,6 @@ async function core(host) {
   function push(text, id = "") {
     queue.push({ text, id })
     drain()
-  }
-
-  /** Say something to the human without spending a model turn on it.
-   *
-   *  session.prompt triggers a turn unless noReply is set, so routing status
-   *  through push() means "channel online" and every setup complaint costs a
-   *  model call and interrupts whatever the agent was doing. */
-  async function notify(message) {
-    log("info", message)
-    try {
-      const sn = await currentSession()
-      if (!sn?.id) return
-      sessionID = sn.id
-      await say(`[a2a] ${message}`, { noReply: true }, sn.id)
-    } catch (e) {
-      log("error", `could not notify: ${e}`)
-    }
   }
 
   // --- self-registration ---------------------------------------------------
@@ -1072,12 +1055,25 @@ async function core(host) {
       // is not set up yet — the two problems look identical from the outside
       // and it is worth being able to tell them apart.
       await checkVersion()
-      try {
-        if (!(await ensureRegistered())) return
-      } catch (e) {
-        log("error", `registration failed: ${e}`)
-        await notify(`could not reach ${URL_BASE}: ${e}`)
-        return
+      // A broker that cannot be reached — offline, waking from sleep, a
+      // redeploy — is logged and asked again, never posted into the session,
+      // and never the end of this client: it used to say so in the session and
+      // then give up, leaving a2a dead in this process until the next start.
+      let failing = false
+      for (;;) {
+        if (!ENABLED || stopped) return
+        try {
+          await ensureRegistered()
+          if (failing) log("info", `broker reachable again: ${URL_BASE}`)
+          break
+        } catch (e) {
+          if (!failing) {
+            log("error", `broker unreachable: ${e}; retrying every ` +
+                         `${RECONNECT_MS / 1000}s`)
+          }
+          failing = true
+          await sleep(RECONNECT_MS)
+        }
       }
 
       // Said into the session by the startup brief, which knows which one it is.
@@ -1729,17 +1725,15 @@ async function core(host) {
         // The live stream still asks for the old id: close it, and the pump
         // reconnects under the new one on its next cycle (a few seconds).
         stream?.abort()
-        // Re-brief THIS session only: the model still believes the old name,
-        // and the instructions carry it. Scoped to one id rather than
-        // clearing the memo, because a blanket reset is exactly what used to
-        // let the brief fire over and over.
-        briefed.delete(sessionID)
+        // Nothing to re-brief: the instructions are built for each model
+        // request from the current name (systemFor), so the next request
+        // already carries the new one.
         return JSON.stringify(out)
       },
     },
   }
 
-  return { tools, onEvent, stop, log, sleep }
+  return { tools, onEvent, stop, log, sleep, systemFor }
 }
 
 /** OpenCode V1: `server({client, directory})`, read from the default export
@@ -1764,6 +1758,14 @@ async function server({ client, directory }) {
   return {
     event: async ({ event }) => a2a.onEvent(event?.type, event?.properties || {}),
     tool: a2a.tools,
+    // The instructions, in the system prompt of each model request in this
+    // project's root sessions — never posted into the conversation. OpenCode
+    // 1's hook (packages/plugin/src/index.ts):
+    // (input: {sessionID?, model}, output: {system: string[]}).
+    "experimental.chat.system.transform": async (input, output) => {
+      const text = await a2a.systemFor(input?.sessionID)
+      if (text && Array.isArray(output?.system)) output.system.push(text)
+    },
   }
 }
 
@@ -1817,6 +1819,24 @@ async function setup(ctx) {
     }
   })
 
+  // The instructions, in the system prompt of each model request in this
+  // project's root sessions — never posted into the conversation. V2's
+  // session "context" hook hands each request's SessionContext, whose
+  // `system` is a mutable array of SystemPart, {type: "text", text}
+  // (packages/plugin/src/promise/session.ts, packages/ai/src/schema/
+  // messages.ts); registering returns a Registration with dispose().
+  let context = null
+  try {
+    if (typeof ctx.session?.hook !== "function") throw new Error("no session.hook")
+    context = await ctx.session.hook("context", async (input) => {
+      const text = await a2a.systemFor(input?.sessionID)
+      if (text && Array.isArray(input?.system)) input.system.push({ type: "text", text })
+    })
+  } catch (e) {
+    a2a.log("error", `no session context hook (${e}): the a2a instructions ` +
+                     `are not in the system prompt`)
+  }
+
   // V2 events are {type, data, location}. Map them onto the V1 shape onEvent
   // reads: session.created carries the new session's fields flat, with its id
   // as sessionID, so it becomes the session object learn() expects.
@@ -1842,6 +1862,7 @@ async function setup(ctx) {
 
   return () => {
     events.abort()
+    void Promise.resolve(context?.dispose?.()).catch(() => {})
     a2a.stop()
   }
 }

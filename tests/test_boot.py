@@ -135,7 +135,13 @@ const client = {
 
 const mod = await import(%(module)s)
 // OpenCode 1.x's entry point; 2.x's setup() is driven by test_project_gate.
-await mod.default.server({ client, directory: %(project)s })
+const hooks = await mod.default.server({ client, directory: %(project)s })
+// What the plugin adds to a model request's system prompt for this session.
+const systemOf = async () => {
+  const output = { system: [] }
+  await hooks["experimental.chat.system.transform"]?.({ sessionID: "ses_boot", model: {} }, output)
+  return output.system
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 await sleep(1200)
@@ -147,7 +153,7 @@ sessionExists = true
 await sleep(4000)   // the retry loop is 2s; allow one full turn of it
 
 console.log("@@" + JSON.stringify({
-  beforeSession, calls, prompts,
+  beforeSession, calls, prompts, system: await systemOf(),
 }))
 process.exit(0)
 """
@@ -192,10 +198,10 @@ def main() -> int:
     methods = {p["method"] for p in prompts}
 
     # --- it speaks with no events at all -----------------------------------
-    check("the brief is issued with ZERO events delivered — the client briefs "
-          "itself instead of waiting for session.idle, which only fires after "
-          "a turn, or session.created, which never fires on a resume",
-          any("a2a agent" in t for t in texts), json.dumps(texts)[:300])
+    check("the startup check is issued with ZERO events delivered — the client "
+          "acts on its own instead of waiting for session.idle, which only "
+          "fires after a turn, or session.created, which never fires on a resume",
+          any("Check your channels" in t for t in texts), json.dumps(texts)[:300])
 
     # --- and only through the call that returns ----------------------------
     check("only promptAsync is used — session.prompt does not return until the "
@@ -227,10 +233,13 @@ def main() -> int:
           bool(checks) and "my_pending" in checks[0]["text"]
           and "read_channel" in checks[0]["text"],
           json.dumps(checks[:1])[:300])
-    check("the instructions still arrive silently — reference material is not "
-          "worth a model call",
-          any(p["noReply"] and "a2a agent" in p["text"] for p in prompts),
-          json.dumps([p["noReply"] for p in prompts]))
+    check("the instructions are never posted into the conversation — a "
+          "~70-line block that landed whenever a session first stirred",
+          not any("You are a2a agent" in t for t in texts), json.dumps(texts)[:300])
+    check("they are in the system prompt instead, through OpenCode 1's "
+          "experimental.chat.system.transform",
+          any("You are a2a agent" in s for s in out.get("system") or []),
+          str(out.get("system"))[:200])
 
     # --- and the client reads no messages itself ---------------------------
     check("the PLUGIN never fetches channel messages — reading is receiving, "
@@ -261,8 +270,10 @@ def main() -> int:
           "being configured is the precondition for all of the above",
           bool(unreg)
           and not any(c.startswith("/channels") for c in unreg.get("calls", []))
-          and not any("You are a2a agent" in t for t in unreg_texts),
-          f"calls={unreg.get('calls')} texts={json.dumps(unreg_texts)[:300]}")
+          and not any("You are a2a agent" in t for t in unreg_texts)
+          and not unreg.get("system"),
+          f"calls={unreg.get('calls')} texts={json.dumps(unreg_texts)[:300]} "
+          f"system={str(unreg.get('system'))[:100]}")
     check("but its human is still told how to register it — going silent "
           "would leave the operator with nothing to act on",
           any("not a registered agent" in t for t in unreg_texts),
