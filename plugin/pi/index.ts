@@ -523,6 +523,19 @@ export default function (pi: ExtensionAPI) {
   // (`pi`, `pi -c`) and the only reason that runs the channel check;
   // "reload", "new", "resume" and "fork" happen inside a running Pi.
   let startReason = "startup";
+  // How Pi runs this session (`ctx.mode`, read at session_start): "tui",
+  // "rpc", "json" or "print". Pi binds "tui" for the terminal before
+  // session_start; any session nothing binds a UI to stays "print" — a helper
+  // Pi starts inside this process. Such a session SENDS as this agent and
+  // never receives: a second /stream for the same agent takes the broker's
+  // one stream (newest wins) and hands the terminal's mail to a session no
+  // human reads. Undefined (a Pi without modes), "tui" and "rpc" behave as
+  // they always did.
+  let uiMode: string | undefined;
+  const sendOnly = () => uiMode === "print" || uiMode === "json";
+  const SEND_ONLY = () =>
+    `a2a: this session sends as ${name} and does not receive — only the ` +
+    "terminal session reads or acks its inbox";
 
   // --- delivery state -------------------------------------------------------
   let briefed = false;
@@ -995,6 +1008,20 @@ export default function (pi: ExtensionAPI) {
     // A Pi that sends no reason predates it: treat the start as a launch,
     // which is what this client always did.
     startReason = String(event?.reason || "startup");
+    // Read first, before anything can return: the tools ask it too. The
+    // getter asserts the runner is active, hence the try.
+    try {
+      uiMode = typeof ctx?.mode === "string" ? ctx.mode : undefined;
+    } catch {
+      uiMode = undefined;
+    }
+    if (sendOnly()) {
+      // Nothing is injected here, not even a setup notice: no human reads
+      // this session. The send tools work; nothing connects.
+      log(`a2a sends only in this ${uiMode} session (no UI): no stream, `
+          + "no brief, no check — the terminal session receives");
+      return;
+    }
     // The id Pi resumes this session under — read back from the session
     // file's header, so the same in a new process. What the brief is
     // remembered by.
@@ -1072,6 +1099,9 @@ export default function (pi: ExtensionAPI) {
         "you are not registered in this station yet: call propose_me with one " +
         "line about this project, and an operator approves it with one " +
         "keystroke — no restart needed";
+    } else if (sendOnly()) {
+      // No stream here by design, so nothing to wait for.
+      step = null;
     } else if (!pumpState.connected) {
       step =
         "the push stream is not connected; it retries by itself, so wait — " +
@@ -1084,6 +1114,9 @@ export default function (pi: ExtensionAPI) {
         agent: name,
         station: stations.length === 1 ? stations[0] : stations.length ? stations : null,
         registered: !!me.registered,
+        // false in a session with no UI: it sends as this agent and the
+        // terminal session receives.
+        receives: !sendOnly(),
         channels: mine,
         push: {
           enabled: pumpState.connected,
@@ -1138,7 +1171,7 @@ export default function (pi: ExtensionAPI) {
       );
       // Live, in this session. The tools were registered whatever the switch
       // said, so there is nothing to wait for: connect under them.
-      const started = on && !ENABLED && !pumping;
+      const started = on && !ENABLED && !pumping && !sendOnly();
       ENABLED = on;
       if (started) {
         pumping = true;
@@ -1196,6 +1229,7 @@ export default function (pi: ExtensionAPI) {
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_id, p) {
+      if (sendOnly()) throw new Error(SEND_ONLY());
       const q = p.limit ? `?limit=${p.limit}` : "";
       return text(await api("GET",
         `/channels/${encodeURIComponent(p.name)}/messages${q}`));
@@ -1289,6 +1323,7 @@ export default function (pi: ExtensionAPI) {
       limit: Type.Optional(Type.Number()),
     }),
     async execute(_id, p) {
+      if (sendOnly()) throw new Error(SEND_ONLY());
       const q: string[] = [];
       if (p.since != null) q.push(`since=${p.since}`);
       if (p.limit != null) q.push(`limit=${p.limit}`);
@@ -1322,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
       "so ack what you take from it; pushed messages are acked for you.",
     parameters: Type.Object({ limit: Type.Optional(Type.Number()) }),
     async execute(_id, p) {
+      if (sendOnly()) throw new Error(SEND_ONLY());
       return text(await api("GET", `/pending${p.limit ? `?limit=${p.limit}` : ""}`));
     },
   });
@@ -1334,6 +1370,7 @@ export default function (pi: ExtensionAPI) {
       "you pulled with my_pending — pushed messages are already acked.",
     parameters: Type.Object({ ids: Type.Array(Type.String()) }),
     async execute(_id, p) {
+      if (sendOnly()) throw new Error(SEND_ONLY());
       return text(await api("POST", "/ack", { ids: p.ids }));
     },
   });
@@ -1434,6 +1471,7 @@ export default function (pi: ExtensionAPI) {
       "inbox.",
     parameters: Type.Object({}),
     async execute() {
+      if (sendOnly()) throw new Error(SEND_ONLY());
       return text(await api("POST", "/ack/all"));
     },
   });

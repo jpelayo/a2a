@@ -22,6 +22,12 @@ old `pi` "will throw if used"). Two things follow:
 This loads the REAL index.ts once per instance, as Pi does, against a fake
 broker whose stream hands each message to ONE open connection, as the real
 one does. No database; needs node 22+ (TypeScript type stripping).
+
+The whole scenario runs three times: with no `ctx.mode` (a Pi without modes),
+"tui" (the terminal) and "rpc" (a frontend). Each must pass every check, and
+"tui" and "rpc" must give the session, the acks, the brief memory and the
+broker exactly what no mode gives. Only a session with no UI ("print",
+"json") behaves differently — test_pi_send_only.py.
 """
 import json
 import os
@@ -38,7 +44,7 @@ INSTANCES = 7
 fails: list[str] = []
 
 
-def check(name: str, ok: bool, detail: str = "") -> None:
+def _check(name: str, ok: bool, detail: str = "") -> None:
     print(f"{'ok  ' if ok else 'FAIL'} {name}")
     if not ok:
         fails.append(f"{name}: {detail}")
@@ -126,6 +132,11 @@ function makePi() {
   }
   return { pi, st, emit }
 }
+// The run mode Pi reports (`ctx.mode`), or none at all: main() runs this
+// whole scenario once per mode a terminal or an RPC frontend has, and once
+// with none, and they must all behave identically.
+const MODE = process.env.TEST_MODE || ""
+const withMode = (c) => (MODE ? { ...c, mode: MODE } : c)
 const ctx = (id) => ({ sessionManager: { getSessionId: () => id } })
 const snap = (st) => ({ turns: [...st.turns], context: [...st.context],
                         queued: [...st.queued], staleCalls: st.staleCalls })
@@ -136,7 +147,7 @@ async function instance(id, reason, ctxOverride) {
   const p = makePi()
   const mod = await import(`./i${++n}.ts`)
   mod.default(p.pi)
-  await p.emit("session_start", { reason }, ctxOverride ?? ctx(id))
+  await p.emit("session_start", { reason }, withMode(ctxOverride ?? ctx(id)))
   await sleep(1200)
   return p
 }
@@ -154,7 +165,8 @@ const out = {}
 
 const A = await instance("ses_p", "startup")
 out.a = snap(A.st)
-out.memo = JSON.parse(readFileSync(MEMO, "utf8")).ses_p || null
+try { out.memo = JSON.parse(readFileSync(MEMO, "utf8")).ses_p || null }
+catch { out.memo = null }   // nothing briefed, nothing remembered
 out.a_closed = await shutdown(A, "reload")
 
 const B = await instance("ses_p", "reload")          // /reload: same session
@@ -210,10 +222,8 @@ def checks(s: dict) -> list[str]:
     return [t for t in everything(s) if "Check your channels" in t]
 
 
-def main() -> int:
-    if not shutil.which("node"):
-        print("SKIP: node is not installed", file=sys.stderr)
-        return 2
+def run(mode: str) -> dict | None:
+    """The whole scenario in a fresh HOME, with Pi reporting `mode` (or none)."""
     work = Path(tempfile.mkdtemp(prefix="a2a-piresume-"))
     (work / "node_modules" / "typebox").mkdir(parents=True)
     (work / "node_modules" / "typebox" / "package.json").write_text(
@@ -230,15 +240,26 @@ def main() -> int:
                A2A_AGENT="probe", A2A_HELLO="0", HOME=str(work))
     env.pop("A2A_READ_ON_INIT", None)
     env.pop("A2A_CATCHUP", None)
+    env.pop("TEST_MODE", None)
+    if mode:
+        env["TEST_MODE"] = mode
     proc = subprocess.run(["node", "run.mjs"], cwd=work, env=env,
                           capture_output=True, text=True, timeout=120)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("@@")), "")
     if not line:
-        print("FAIL the harness produced nothing")
+        print(f"FAIL the harness produced nothing (mode={mode or 'none'})")
         print(proc.stdout[-1500:])
         print(proc.stderr[-1500:])
-        return 1
-    out = json.loads(line[2:])
+        return None
+    return json.loads(line[2:])
+
+
+def verify(out: dict, mode: str) -> None:
+    """Every check of today's behaviour, against one mode's run."""
+    tag = f"[mode={mode or 'none'}] "
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        _check(tag + name, ok, detail)
 
     # --- the CLI starts -----------------------------------------------------------
     a = out["a"]
@@ -289,6 +310,52 @@ def main() -> int:
     f = out["f"]
     check("with no session id from Pi, the brief behaves exactly as before",
           len(briefs(f)) == 1 and len(checks(f)) == 1, json.dumps(f)[:300])
+
+
+# What a run must reproduce exactly, whatever mode Pi reports: everything the
+# session was given, what was acked, what was remembered, what was asked of
+# the broker.
+SAME = ("a", "a_closed", "b", "b_live", "a_stale_calls", "c", "c_acked", "e",
+        "f", "h", "i")
+
+
+def comparable(out: dict) -> dict:
+    d = {k: out.get(k) for k in SAME}
+    d["memo"] = {k: (out.get("memo") or {}).get(k) for k in ("key", "name")}
+    d["all_calls"] = sorted(out.get("all_calls") or [])
+    return d
+
+
+def main() -> int:
+    if not shutil.which("node"):
+        print("SKIP: node is not installed", file=sys.stderr)
+        return 2
+    # None: a Pi that reports no mode — what every test before this ran as.
+    # "tui": the terminal. "rpc": a frontend driving Pi. All three are a
+    # human's session and must behave exactly as Pi always did.
+    runs = {mode: run(mode) for mode in ("", "tui", "rpc")}
+    if any(v is None for v in runs.values()):
+        return 1
+    for mode, out in runs.items():
+        verify(out, mode)
+        print()
+    base = comparable(runs[""])
+    for mode in ("tui", "rpc"):
+        got = comparable(runs[mode])
+        diff = [k for k in base if base[k] != got[k]]
+        _check(f"mode={mode} gives the session, the acks, the brief memory and "
+               "the broker exactly what a Pi with no mode does — any difference "
+               "is a regression in normal Pi",
+               not diff,
+               "; ".join(f"{k}: none={json.dumps(base[k])[:150]} "
+                         f"{mode}={json.dumps(got[k])[:150]}" for k in diff))
+    # A comparison nobody has seen fail is not a gate: a session with no UI
+    # DOES behave differently (it only sends), so it must not compare equal.
+    headless = run("print")
+    _check("…and the comparison can tell: mode=print (no UI, sends only) does "
+           "NOT compare equal",
+           headless is not None and comparable(headless) != base,
+           "print compared equal — the equality check above proves nothing")
 
     print()
     for fl in fails:
