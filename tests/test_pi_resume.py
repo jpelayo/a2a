@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pi: one stream per process, a brief per session, nothing left behind.
+"""Pi: one stream per process, and the channel check at CLI startup only.
 
     python3 tests/test_pi_resume.py
 
@@ -7,18 +7,17 @@ Pi REPLACES its extensions on /new, /resume, /fork and /reload, inside one
 process (read from Pi 0.83.0: `AgentSessionRuntime.teardownCurrent` emits
 session_shutdown to the old instance; the loader re-imports the module through
 jiti with moduleCache:false and runs the factory again with a fresh `pi`; the
-old `pi` "will throw if used"). Three things followed from that here:
+old `pi` "will throw if used"). Two things follow:
 
   survivor   nothing listened for session_shutdown, so the old pump kept
              streaming next to its replacement — two readers of one
              destructive-read inbox — and handed its half to a dead `pi`,
              where nothing was acked and the replay window soon stopped
              offering it. That is a message lost on /resume.
-  re-brief   `briefed` lived in the instance, so every replacement briefed
-             the same session again: instructions, and a check that starts
-             a turn.
-  backlog    anything older than the replay window reached the session only
-             if the model called my_pending.
+  the check  with read_on_init on, the "check your channels" turn runs when
+             the user starts the CLI — `pi`, `pi -c`, session_start reason
+             "startup" — and at no other time. Inside a running Pi a session
+             gets the instructions only if it lacks them.
 
 This loads the REAL index.ts once per instance, as Pi does, against a fake
 broker whose stream hands each message to ONE open connection, as the real
@@ -34,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PI = HERE.parent / "plugin" / "pi" / "index.ts"
-INSTANCES = 9
+INSTANCES = 7
 
 fails: list[str] = []
 
@@ -55,7 +54,7 @@ const enc = (m) => new TextEncoder().encode(JSON.stringify(m) + "\n")
 const aborted = () => Object.assign(new Error("aborted"), { name: "AbortError" })
 
 // --- fake broker ---------------------------------------------------------------
-const broker = { peek404: false, peek: [], replay: [] }
+const broker = { replay: [] }
 let calls = []
 const allCalls = []
 let acked = []
@@ -92,11 +91,6 @@ globalThis.fetch = async (url, init = {}) => {
   calls.push(path); allCalls.push(path)
   if (path === "/me") return ok({ agent: "probe", registered: true, stations: ["s"] })
   if (path === "/channels") return ok({ channels: [{ name: "ops", members: ["probe"] }] })
-  if (path.startsWith("/pending/peek")) {
-    if (broker.peek404) return { ok: false, status: 404,
-      text: async () => "Not Found", json: async () => ({}) }
-    return ok({ agent_id: "probe", has_more: false, messages: broker.peek })
-  }
   if (path === "/ack") {
     acked.push(...(JSON.parse(init.body || "{}").ids || []))
     return ok({ ok: true })
@@ -171,21 +165,14 @@ out.b_live = snap(B.st)
 out.a_stale_calls = A.st.staleCalls
 await shutdown(B, "resume")
 
-broker.peek = [msg("m-aged", "aged-only-peek"), msg("m-both", "both-text")]
-broker.replay = [msg("m-both", "both-text")]
-const C = await instance("ses_p", "resume")          // /resume, with a backlog
+// /resume, inside Pi, into a session already briefed: nothing; the replay
+// still delivers what the stream holds.
+broker.replay = [msg("m-replay", "replayed-on-resume")]
+const C = await instance("ses_p", "resume")
 out.c = snap(C.st)
-out.c_calls = [...calls]
 out.c_acked = [...acked]
 await shutdown(C, "quit")
-broker.peek = []; broker.replay = []
-
-const memo = JSON.parse(readFileSync(MEMO, "utf8"))  // a day and an hour later
-memo.ses_p.at -= 25 * 3600 * 1000
-writeFileSync(MEMO, JSON.stringify(memo))
-const D = await instance("ses_p", "resume")
-out.d = snap(D.st)
-await shutdown(D, "new")
+broker.replay = []
 
 const E = await instance("ses_new", "new")           // /new: another session
 out.e = snap(E.st)
@@ -194,13 +181,6 @@ await shutdown(E, "quit")
 const F = await instance("", "startup", {})          // no session id given
 out.f = snap(F.st)
 await shutdown(F, "quit")
-
-broker.peek404 = true                                // an older broker
-const G = await instance("ses_p", "resume")
-out.g = snap(G.st)
-out.g_calls = [...calls]
-await shutdown(G, "quit")
-broker.peek404 = false
 
 // `pi -c` from the terminal: a LAUNCH, on a session the memory already has.
 const H = await instance("ses_p", "startup")
@@ -260,10 +240,10 @@ def main() -> int:
         return 1
     out = json.loads(line[2:])
 
-    # --- the first instance briefs, as always ----------------------------------
+    # --- the CLI starts -----------------------------------------------------------
     a = out["a"]
-    check("a new session gets the instructions as context and one channel "
-          "check that starts a turn, as before",
+    check("`pi` starts: the instructions as context and one channel check that "
+          "starts a turn, as before",
           len(briefs(a)) == 1 and any('You are a2a agent "' in c for c in a["context"])
           and len(checks(a)) == 1 and checks(a)[0] in a["turns"],
           json.dumps(a)[:400])
@@ -283,35 +263,17 @@ def main() -> int:
           "and a message handed there was never acked",
           out["a_stale_calls"] == 0, str(out["a_stale_calls"]))
 
-    # --- the catch-up ----------------------------------------------------------------
+    # --- inside a running Pi ---------------------------------------------------------
     c = out["c"]
     texts = everything(c)
-    check("on /resume, a message only /pending/peek still holds — the stream "
-          "would never offer it again — is delivered",
-          sum("aged-only-peek" in t for t in texts) == 1, json.dumps(texts)[:400])
-    check("one that the peek AND the stream's replay both return is delivered "
-          "once", sum("both-text" in t for t in texts) == 1, json.dumps(texts)[:400])
-    check("both are acked on hand-off, like any pushed message",
-          {"m-aged", "m-both"} <= set(out["c_acked"]), str(out["c_acked"]))
-    peek_at = next((i for i, x in enumerate(out["c_calls"])
-                    if x.startswith("/pending/peek")), -1)
-    stream_at = next((i for i, x in enumerate(out["c_calls"])
-                      if x.startswith("/stream")), -1)
-    check("the peek comes before the stream", 0 <= peek_at < stream_at,
-          str(out["c_calls"]))
-    check("and no brief rides along: the session already has it",
-          not briefs(c) and not checks(c), json.dumps(texts)[:400])
-    check("the acking /pending is never called — reading it would retire "
-          "messages with nothing on screen",
-          not any(x == "/pending" or x.startswith("/pending?")
-                  for x in out["all_calls"]), str(out["all_calls"]))
-
-    # --- a day later, a new session, no id, an older broker ----------------------
-    d = out["d"]
-    check("a day later the instructions go in once more, as context, with no "
-          "check and no turn",
-          len(briefs(d)) == 1 and not checks(d) and d["turns"] == [],
-          json.dumps(d)[:300])
+    check("/resume into a session already briefed: no brief, no check — and "
+          "the stream's replay still delivers what it holds, acked as always",
+          not briefs(c) and not checks(c)
+          and sum("replayed-on-resume" in t for t in texts) == 1
+          and "m-replay" in out["c_acked"], json.dumps(texts)[:400])
+    check("nothing reads the inbox behind the agent's back: no /pending, no "
+          "/pending/peek", not any(x.startswith("/pending") for x in out["all_calls"]),
+          str(out["all_calls"]))
     e = out["e"]
     check("/new — another session, inside Pi — gets the instructions, and no "
           "channel check: that runs when Pi is launched",
@@ -327,17 +289,12 @@ def main() -> int:
     f = out["f"]
     check("with no session id from Pi, the brief behaves exactly as before",
           len(briefs(f)) == 1 and len(checks(f)) == 1, json.dumps(f)[:300])
-    check("a broker without /pending/peek (404) still gets the stream, and "
-          "nothing is said about it",
-          any(x.startswith("/stream") for x in out["g_calls"])
-          and everything(out["g"]) == [],
-          f"{out['g_calls']} {json.dumps(out['g'])[:200]}")
 
     print()
     for fl in fails:
         print("FAIL", fl)
     print("FAILED" if fails else
-          "PASS — one stream per process, a brief per session, nothing left behind")
+          "PASS — one stream per process, and the channel check at CLI startup only")
     return 1 if fails else 0
 
 

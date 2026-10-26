@@ -879,6 +879,7 @@ All optional; sensible defaults baked into the image.
 | Installer: "the broker refused that token"       | The token is unknown or revoked (`/me` answered 403). Mint or check it in the TUI's tokens tab. |
 | Installer: a harness shows "not found"           | Neither its folder (`~/.claude`, `~/.config/opencode`, `~/.pi/agent`, `~/.codex`, `~/.hermes`) nor its binary on `PATH` exists for this user. |
 | OpenCode installs but never comes online         | Token grants several stations and the plugin refuses to guess; reinstall with `?station=<name>`. It says so in the session. |
+| OpenCode 2 does not check its channels when you start `opencode` | Its plugins run in the background service, which never sees a CLI start; the check runs only when the service starts. Run `opencode service set disabled true` once: each `opencode` then starts its own server and the check runs on every start. |
 | A message reaches only one of two harnesses      | Both are streaming the same agent id. Delivery is a destructive read; give each its own agent (`-oc` suffix). |
 | 502 Bad Gateway from a containerised proxy       | `127.0.0.1` from inside the proxy is the proxy itself. See §5.1.             |
 

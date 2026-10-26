@@ -87,7 +87,6 @@ const CLIENT_SECRET = join(homedir(), ".pi", "agent", "a2a-client.secret");
 // session file's header. Consulted only when Pi was NOT launched: a launch
 // (`pi`, `pi -c`) always briefs and checks.
 const BRIEFS = join(homedir(), ".pi", "agent", "a2a-briefed.json");
-const BRIEF_REFRESH_MS = 24 * 3600_000;
 const BRIEF_KEEP_MS = 30 * 24 * 3600_000;
 const BRIEF_KEEP_MAX = 500;
 const CATCHUP_DEFAULT = 10;
@@ -742,13 +741,11 @@ export default function (pi: ExtensionAPI) {
       return {};
     }
   }
-  /** "fresh": this session was briefed as this agent within a day. "stale":
-   *  as this agent, longer ago. null: never, as somebody else, or no id. */
-  async function briefState(): Promise<"fresh" | "stale" | null> {
-    if (!sessionId) return null;
+  /** Does this session already have the instructions, as this agent? */
+  async function hasBrief(): Promise<boolean> {
+    if (!sessionId) return false;
     const e = (await readBriefs())[sessionId];
-    if (!e || e.key !== key || e.name !== name) return null;
-    return Date.now() - (Number(e.at) || 0) < BRIEF_REFRESH_MS ? "fresh" : "stale";
+    return !!e && e.key === key && e.name === name;
   }
   async function rememberBrief() {
     if (!sessionId) return;
@@ -782,8 +779,7 @@ export default function (pi: ExtensionAPI) {
       // /new, /resume, /fork, all inside a running Pi) is not a launch: it
       // gets the instructions only if this session lacks them, and no check.
       const launch = startReason === "startup";
-      const state = launch ? null : await briefState();
-      if (state === "fresh") {
+      if (!launch && await hasBrief()) {
         // Typically a /reload: the session already has all of this. Marked
         // briefed so handOff does not prepend it either.
         briefed = true;
@@ -827,13 +823,12 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** One message, from the stream or from catchUp(). False once this
-   *  instance has stopped: the message is not ours to deliver any more. */
+  /** One message from the stream. False once this instance has stopped: the
+   *  message is not ours to deliver any more. */
   function take(m: Msg): boolean {
     if (!m?.text) return true;
     if (stopped) return false;
-    // The broker replays unacked messages on every connection, and catchUp()
-    // hands over the same ones just before: deliver each once.
+    // The broker replays unacked messages on every reconnect: deliver each once.
     if (m.id && seen.has(m.id)) {
       log(`skip #${m.channel} ${m.id} — already delivered`);
       return true;
@@ -844,45 +839,6 @@ export default function (pi: ExtensionAPI) {
     log(`deliver #${m.channel} from ${m.sender}`);
     deliver(envelope(m), m.id);
     return true;
-  }
-
-  /** Before each connection: everything the broker holds unacked for this
-   *  agent, however old.
-   *
-   *  The stream re-sends what it already handed out only within the broker's
-   *  replay window (ten minutes). A message an earlier instance took and
-   *  never acked — a /resume, a reload, a crash — would otherwise reach this
-   *  session only if the model thought to call my_pending. /pending/peek
-   *  reads WITHOUT marking (never /pending: that one acks what it returns),
-   *  in the stream's own shape, so each message goes through take() exactly
-   *  as if it had streamed. OpenCode and Hermes do the same. */
-  async function catchUp() {
-    let out: any;
-    try {
-      out = await json("GET", "/pending/peek?limit=50");
-    } catch (e) {
-      // 404 is a broker from before the route: the replay is all there is.
-      if (!/^404\b/.test(String((e as any)?.message || ""))) {
-        log(`catch-up failed: ${String(e).split("\n")[0]}`);
-      }
-      return;
-    }
-    let n = 0;
-    for (const m of out?.messages || []) {
-      if (!m || typeof m !== "object" || (m.id && seen.has(m.id))) continue;
-      // Outside the stream's try, so one bad message must not end the pump.
-      try {
-        if (!take(m)) return;
-        n++;
-      } catch (e) {
-        log(`could not catch up ${m.id || "a message"}: ${e}`);
-      }
-    }
-    if (n) log(`caught up ${n} pending message(s)`);
-    if (out?.has_more) {
-      log("more are pending than one catch-up takes; the rest come with the " +
-          "next connection, or through my_pending");
-    }
   }
 
   // --- the pump -------------------------------------------------------------
@@ -911,8 +867,6 @@ export default function (pi: ExtensionAPI) {
 
     while (!stopped) {
       let wait = RECONNECT_MS;
-      if (registered) await catchUp();
-      if (stopped) break;
       // The id this connection streams as. rename_me changes `key`, and a
       // stream left on the old id would keep delivering that agent's mail —
       // acked under the new id, which acks nothing.

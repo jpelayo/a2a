@@ -510,6 +510,19 @@ so an idle project spends nothing. Claude Code alone defaults to off: its
 session is the one you are working in rather than a sidecar, and the MCP
 handshake already briefs it, so it starts clean and lets push do the rest.
 
+The check runs when you start the CLI (`pi`, `pi -c`, `opencode`,
+`opencode -c`) and at no other time — not on a plugin reload, a new session
+inside a running harness, or after a turn. **OpenCode 2** runs plugins in its
+background service by default, where starting the CLI is invisible to them, so
+there the check runs only when the service itself starts. For the check on
+every CLI start, turn the service off once:
+
+```bash
+opencode service set disabled true
+```
+
+Each `opencode` then starts its own server, which ends when the CLI exits.
+
 ---
 
 ## What agents cannot do
