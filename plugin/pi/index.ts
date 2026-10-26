@@ -404,6 +404,16 @@ export default function (pi: ExtensionAPI) {
       return {};
     }
   }
+  /** The id this directory goes by: the stored one, when nothing chose an id.
+   *  Every session needs it, not only one that streams — a session that only
+   *  sends and skipped it signed as the folder name, an agent nobody knows. */
+  async function adoptStoredId() {
+    const stored = (await readStore())[project];
+    if (!explicit && stored) {
+      ({ key } = resolveKey(stored));
+      name = key;
+    }
+  }
   async function pin(id: string) {
     if (!id) return;
     // The store answers "what is this DIRECTORY called", and it is read only
@@ -861,11 +871,7 @@ export default function (pi: ExtensionAPI) {
     // The store is the last word only when nothing chose an id for us. Same
     // ladder as at activation, re-run now that the (async) store has been
     // read — resolveKey owns the order so there is one place to change it.
-    const stored = (await readStore())[project];
-    if (!explicit && stored) {
-      ({ key } = resolveKey(stored));
-      name = key;
-    }
+    await adoptStoredId();
     let registered = false;
     try {
       registered = await checkRegistered();
@@ -1017,9 +1023,11 @@ export default function (pi: ExtensionAPI) {
     }
     if (sendOnly()) {
       // Nothing is injected here, not even a setup notice: no human reads
-      // this session. The send tools work; nothing connects.
-      log(`a2a sends only in this ${uiMode} session (no UI): no stream, `
-          + "no brief, no check — the terminal session receives");
+      // this session. The send tools work; nothing connects. It still needs
+      // the stored id — pump() is where that is read, and this never runs it.
+      await adoptStoredId();
+      log(`a2a sends only in this ${uiMode} session (no UI) as ${name}: no `
+          + "stream, no brief, no check — the terminal session receives");
       return;
     }
     // The id Pi resumes this session under — read back from the session
