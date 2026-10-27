@@ -174,6 +174,37 @@ def main() -> int:
     check("HERMES_DESKTOP is what marks the app's own backend",
           "HERMES_DESKTOP" in desk, "")
 
+    # Cron: a job may send as the bot if whoever created it could. The plugin
+    # reads the running job through the plugin API and its creator from the
+    # job store's `origin`. Added 2026-10-27 against main.
+    cce = method(ctx, "current_cron_execution")
+    check("PluginContext.current_cron_execution exists — how a tool call "
+          "learns it is part of a cron run", cce is not None, "")
+    ei = tree(src, "cron/execution_identity.py")
+    ce = find(ei, ast.ClassDef, "CronExecution")
+    check("CronExecution carries job_id",
+          ce is not None and any(
+              isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "")
+              == "job_id" for n in ce.body), "")
+    jobs = tree(src, "cron/jobs.py")
+    gj = find(jobs, ast.FunctionDef, "get_job")
+    check("cron.jobs.get_job(job_id) exists", gj is not None
+          and params(gj)[:1] == ["job_id"],
+          f"params {params(gj) if gj else None}")
+    ja = src / "tools" / "cronjob_job_args.py"
+    ja_text = ja.read_text() if ja.is_file() else ""
+    origin_fn = (ja_text.split("def _origin_from_env", 1) + [""])[1][:3000]
+    for key in ("platform", "chat_id", "thread_id", "user_id"):
+        check(f"a job's origin records {key!r} from the creator's turn — what "
+              "the plugin compares with the route and the owner",
+              f'"{key}"' in origin_fn, "tools/cronjob_job_args.py")
+    tc = src / "hermes_cli" / "tools_config.py"
+    tc_text = tc.read_text() if tc.is_file() else ""
+    check("'a2a' is a default-off toolset — a cron job gets the tools only by "
+          "listing it in enabled_toolsets, as CLAUDE.md says",
+          re.search(r"_DEFAULT_OFF_TOOLSETS[^=]*=\s*\{[^}]*\"a2a\"", tc_text,
+                    re.S) is not None, "")
+
     # plugin.yaml: every key the plugin's manifest uses is one Hermes reads.
     manifest_src = ""
     for rel in ("hermes_cli/plugins.py", "hermes_cli/plugins_manifest.py",

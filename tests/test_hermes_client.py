@@ -106,15 +106,41 @@ session_context.session_is_messaging_surface = (
 gateway.session_context = session_context
 hermes_constants = types.ModuleType("hermes_constants")
 hermes_constants.get_hermes_home = lambda: _HOME.get()
+# Cron: the running job (PluginContext.current_cron_execution(), a
+# CronExecution with job_id) and the job store (cron.jobs.get_job), whose
+# `origin` is the chat a job was created in — None when created at the
+# machine (tools/cronjob_job_args.py _origin_from_env).
+_CRON: contextvars.ContextVar = contextvars.ContextVar("cron", default=None)
+JOBS: dict = {}
+cron_pkg = types.ModuleType("cron")
+cron_jobs = types.ModuleType("cron.jobs")
+cron_jobs.get_job = lambda job_id: JOBS.get(job_id)
+cron_pkg.jobs = cron_jobs
 sys.modules.update({"gateway": gateway,
                     "gateway.session_context": session_context,
-                    "hermes_constants": hermes_constants})
+                    "hermes_constants": hermes_constants,
+                    "cron": cron_pkg, "cron.jobs": cron_jobs})
 
 
 def in_turn(chat: dict, fn, *a, **kw):
     """Run fn as part of a gateway turn in `chat`."""
     def inner():
         _TURN.set(dict(chat))
+        return fn(*a, **kw)
+    return contextvars.copy_context().run(inner)
+
+
+# What Hermes's cron scope binds: platform, chat and user deliberately EMPTY
+# (cron/scheduler.py _CronRunScope), and the cron marker.
+CRON_TURN = {"platform": "", "chat_id": "", "chat_type": "", "thread_id": "",
+             "user_id": "", "scope_id": "", "HERMES_CRON_SESSION": "1"}
+
+
+def in_cron(job_id: str, fn, *a, **kw):
+    """Run fn as part of a cron run of job `job_id`."""
+    def inner():
+        _TURN.set(dict(CRON_TURN))
+        _CRON.set(types.SimpleNamespace(job_id=job_id, job_name=job_id))
         return fn(*a, **kw)
     return contextvars.copy_context().run(inner)
 
@@ -181,9 +207,20 @@ class Ctx:
     def _gateway_injection_allowed(self):
         return self.allowed
 
+    def current_cron_execution(self):
+        return _CRON.get()
+
     # -- driving it, as Hermes would --
     def call(self, tool, chat, args=None):
         out = in_turn(chat, self.tools[tool]["handler"], args or {})
+        try:
+            return json.loads(out)
+        except (TypeError, ValueError):
+            return out
+
+    def cron_call(self, tool, job_id, args=None):
+        """A tool call made by the agent of a cron run of `job_id`."""
+        out = in_cron(job_id, self.tools[tool]["handler"], args or {})
         try:
             return json.loads(out)
         except (TypeError, ValueError):
@@ -627,6 +664,7 @@ def main() -> int:
 
     served_artifact()
     desktop()
+    cron()
 
     print()
     for f in fails:
@@ -944,6 +982,132 @@ def served_artifact() -> None:
           len(c.tools) == 22 and inst.key == "bot1" and inst.key_valid,
           f"{len(c.tools)} tools, key {inst.key!r}")
     stop(c)
+
+
+SENDS = {"send_dm": "/dms", "post_to_channel": "/channels/ops/messages",
+         "share_md": "/md"}
+SEND_ARGS = {"name": "ops", "text": "from cron", "to": "peer",
+             "channel": "ops", "filename": "a.md", "content": "c"}
+INBOUND = ("my_pending", "read_dms", "read_channel", "ack_messages",
+           "ack_all", "join_channel")
+
+
+def origin(chat: dict) -> dict:
+    """A job's origin as Hermes records it from the creator's turn."""
+    return {"platform": chat["platform"], "chat_id": chat["chat_id"],
+            "chat_name": None, "thread_id": chat.get("thread_id") or None,
+            "user_id": chat.get("user_id") or None, "scope_id": None}
+
+
+def cron() -> None:
+    """A CRON JOB of the bot may SEND as the bot if whoever created it could.
+
+    Hermes runs a job with the session's chat and user deliberately empty,
+    so the route gate refuses it; the creator is the job's `origin` — the
+    chat it was created in, or None when created at the machine. Without the
+    creator check, anyone who can chat with the bot could schedule it to
+    speak on a2a as itself.
+    """
+    JOBS.clear()
+    JOBS.update({
+        "j-alice": {"id": "j-alice", "origin": origin(ALICE)},
+        "j-bob": {"id": "j-bob", "origin": origin(BOB)},
+        "j-alice-elsewhere": {"id": "j-alice-elsewhere",
+                              "origin": origin(ELSEWHERE)},
+        "j-machine": {"id": "j-machine", "origin": None},
+    })
+
+    def sends(ctx, fb, job):
+        """{tool: (out, [(path, agent)] it caused)}"""
+        r = {}
+        for t in SENDS:
+            before = len(fb.agents)
+            out = ctx.cron_call(t, job, SEND_ARGS)
+            r[t] = (out, fb.agents[before:])
+        return r
+
+    def went(r, agent="bot"):
+        return all("error" not in json.dumps(out)[:60]
+                   and calls == [(SENDS[t], agent)]
+                   for t, (out, calls) in r.items())
+
+    def refused(r):
+        return all(isinstance(out, dict) and "error" in out and not calls
+                   for out, calls in r.values())
+
+    # --- a messaging route: owner alice, in GROUP --------------------------
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot", config=ON)
+    start(mod, ctx)
+    until(lambda: "/stream" in fb.calls, 3)
+    streams, injected = fb.streams, len(ctx.injected)
+
+    r = sends(ctx, fb, "j-alice")
+    check("cron: a job alice (the owner) created in the route chat sends as "
+          "the bot — send_dm, post_to_channel and share_md reach the broker "
+          "under the bot's id", went(r), str(r))
+    r = sends(ctx, fb, "j-machine")
+    check("cron: so does a job created at the machine (no origin: the app, "
+          "the CLI)", went(r), str(r))
+    r = sends(ctx, fb, "j-bob")
+    check("cron: a job BOB created in the same group is refused, and nothing "
+          "reaches the broker — he cannot have the bot speak through a "
+          "schedule either", refused(r), str(r))
+    r = sends(ctx, fb, "j-alice-elsewhere")
+    check("cron: a job alice created in ANOTHER chat is refused",
+          refused(r), str(r))
+    r = sends(ctx, fb, "j-unknown")
+    check("cron: a job the store does not know is refused", refused(r), str(r))
+    ctx.current_cron_execution = None          # a Hermes without the API
+    r = sends(ctx, fb, "j-alice")
+    del ctx.current_cron_execution
+    check("cron: a Hermes with no current_cron_execution refuses, as before",
+          refused(r), str(r))
+
+    before = len(fb.agents)
+    inbound = {t: ctx.cron_call(t, "j-alice", {"ids": ["z"], "name": "ops"})
+               for t in INBOUND}
+    check("cron: even the owner's job cannot READ — my_pending, read_dms, "
+          "read_channel, the acks and join_channel refuse, and the broker "
+          "hears nothing: receiving stays with the route",
+          all(isinstance(v, dict) and "error" in v for v in inbound.values())
+          and fb.agents[before:] == [],
+          f"{inbound} {fb.agents[before:]}")
+    hooks = in_cron("j-alice", lambda: [
+        cb(session_id="c1", task_id="t", turn_id="u", user_message="hi",
+           conversation_history=[], is_first_turn=True, model="m",
+           platform="", parent_session_id=None, sender_id=None)
+        for cb in ctx.hooks.get("pre_llm_call", [])])
+    check("cron: nothing streams for it, nothing is injected, and its turn "
+          "gets no brief",
+          fb.streams == streams and len(ctx.injected) == injected
+          and all(h is None for h in hooks),
+          f"streams {streams}->{fb.streams} injected "
+          f"{injected}->{len(ctx.injected)} hooks={hooks}")
+    r = ctx.call("send_dm", BOB, SEND_ARGS)
+    check("cron: and outside cron nothing changed — bob in the group is still "
+          "refused", isinstance(r, dict) and "only the user" in str(r.get("error")),
+          str(r))
+    stop(ctx)
+    fb.close()
+
+    # --- an app route, from a process that delivers nothing (cron's) -------
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot", gateway=False, config=DESK_ON)
+    start(mod, ctx)
+    r = sends(ctx, fb, "j-machine")
+    check("cron, app route: a job created at the machine sends as the bot",
+          went(r), str(r))
+    r = sends(ctx, fb, "j-alice")
+    check("cron, app route: a job created in a messaging chat is refused — "
+          "an app route has no chat owner to vouch for it", refused(r), str(r))
+    check("cron, app route: and that process never opened a stream",
+          "/stream" not in fb.calls, str(fb.calls))
+    stop(ctx)
+    fb.close()
+    JOBS.clear()
 
 
 # The tests reach the object register() built through the hook it registered.

@@ -47,6 +47,12 @@ move the route or turn it off; while a2a is on in the app with no messaging
 owner, nobody in a chat can take it. Turns injected into a chat carry the
 owner's user id in their origin, which is why the bot can answer them.
 
+A CRON JOB of the bot may SEND (send_dm, post_to_channel, share_md) as the
+bot if whoever created it could: a job created by the owner in the route
+chat, or at the machine (the app, the CLI — no origin). Nothing else works in
+cron, and nothing streams there: receiving stays with the route. The job must
+list `a2a` in its enabled_toolsets — Hermes leaves it off for cron.
+
 NOTHING IS ACKED ON "SCHEDULED". inject_message returning True means a host
 accepted the request, not that a turn ran — the gateway re-checks
 authorization at dispatch and may still drop it, and a busy chat queues it.
@@ -528,6 +534,9 @@ def _quote(s):
 # chat (A2AHermes.gate) — except these two, which say what is wrong and make
 # the first pin.
 UNGATED = {"enable_a2a_here", "a2a_channel_status"}
+# What a cron job of the bot may use outside the route — sending only, and
+# only when whoever created the job could have (A2AHermes._cron_may_send).
+CRON_SENDS = {"send_dm", "post_to_channel", "share_md"}
 
 TOOLS = [
     ("enable_a2a_here",
@@ -937,7 +946,38 @@ class A2AHermes:
                     and str(self.owner.get("user_id") or "")
                     == here.get("user_id"))
 
-    def gate(self):
+    def _cron_may_send(self):
+        """May the cron job running this turn send as the bot? Only if
+        whoever created it could: anyone who can chat with the bot can ask it
+        to schedule a job, and without this a group member could have the bot
+        speak on a2a as itself — what the owner rule exists to stop.
+
+        Hermes leaves a cron turn's chat and user empty on purpose
+        (cron/scheduler.py), so the creator comes from the job: its `origin`
+        is the chat it was created in, and None when it was created at the
+        machine — the app, the CLI, the dashboard. Fails closed: any piece
+        missing (an older Hermes, an unknown job) refuses, as before."""
+        try:
+            probe = getattr(self.ctx, "current_cron_execution", None)
+            run = probe() if callable(probe) else None
+            job_id = getattr(run, "job_id", None)
+            if not job_id:
+                return False
+            from cron.jobs import get_job
+            job = get_job(job_id)
+        except Exception as e:
+            self.log(f"cron send refused: the running job could not be "
+                     f"read: {e!r}")
+            return False
+        if not isinstance(job, dict):
+            return False
+        origin = job.get("origin")
+        if not origin:
+            return True
+        return (isinstance(origin, dict) and self._is_owner(origin)
+                and same_chat(origin, self.route))
+
+    def gate(self, name=None):
         """Why the current turn may not use the a2a tools, or None.
 
         The security boundary is HERE, in every handler, and nowhere else:
@@ -949,6 +989,8 @@ class A2AHermes:
             return ("a2a is off for this bot. Its owner turns it on by asking "
                     "for it in the chat that should carry it ('enable a2a "
                     "here').")
+        if name in CRON_SENDS and self._cron_may_send():
+            return None
         if is_desktop(self.route):
             # The app is the bot's operator at its own machine; there is no
             # user id to own it by, and no outsider can type into it. What
@@ -973,7 +1015,7 @@ class A2AHermes:
         def handle(args, **kw):
             a = args if isinstance(args, dict) else {}
             if name not in UNGATED:
-                why = self.gate()
+                why = self.gate(name)
                 if why:
                     return json.dumps({"error": why})
             try:
