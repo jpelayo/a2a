@@ -665,6 +665,7 @@ def main() -> int:
     served_artifact()
     desktop()
     cron()
+    propose()
 
     print()
     for f in fails:
@@ -862,6 +863,58 @@ def _desktop_hosts() -> None:
         check(f"host: {label} → zero broker requests", fb.calls == [],
               str(fb.calls))
         stop(c)
+
+    # The backend is the process that SERVES the conversation, whatever its
+    # environment says: HERMES_DESKTOP alone left a backend started any other
+    # way holding the stream for nobody, and saying nothing about it.
+    os.environ["HERMES_DESKTOP"] = ""
+    fb.calls.clear()
+    c = Ctx("bot", gateway=False, tui=True, config=DESK_ON)
+    start(mod, c)
+    time.sleep(0.4)
+    check("host: the desktop injector with NO HERMES_DESKTOP and no turn of "
+          "the conversation yet → still nothing", fb.calls == [],
+          str(fb.calls))
+    c.turn(TUI, "s-tui")
+    time.sleep(0.4)
+    check("host: a terminal UI turn there does not make it the app's backend",
+          fb.calls == [], str(fb.calls))
+    c.turn(DESK, "s-desk")
+    check("host: a turn of the route conversation there DOES — the stream "
+          "opens at once", until(lambda: "/stream" in fb.calls, 3),
+          str(fb.calls))
+    held = ctx_inst(c).log_file.read_text().count(
+        "not streaming here: this process does not serve")
+    check("host: while it waited, it said why in the log — once, not on "
+          "every poll", held == 1, f"{held} lines")
+    stop(c)
+
+    # Hermes's session table in this process holding the conversation is
+    # the same fact, known before any turn: a backend restarted under an
+    # open conversation streams without waiting for someone to type.
+    fb.calls.clear()
+    srv = types.ModuleType("tui_gateway.server")
+    srv._sessions_lock = threading.Lock()
+    srv._sessions = {DESK["ui"]: {"session_key": DESK["session_key"]}}
+    pkg = types.ModuleType("tui_gateway")
+    pkg.server = srv
+    sys.modules.update({"tui_gateway": pkg, "tui_gateway.server": srv})
+    c = Ctx("bot", gateway=False, tui=True, config=DESK_ON)
+    start(mod, c)
+    check("host: the conversation in THIS process's session table, no turn "
+          "and no HERMES_DESKTOP → the stream opens",
+          until(lambda: "/stream" in fb.calls, 3), str(fb.calls))
+    stop(c)
+    _no_tui_gateway()
+
+    fb.calls.clear()
+    c = Ctx("bot", gateway=True, tui=False, config=DESK_ON)
+    start(mod, c)
+    c.turn(DESK, "s-gw")
+    time.sleep(0.4)
+    check("host: the GATEWAY, even with a route turn, never holds an app "
+          "route — it has no desktop injector", fb.calls == [], str(fb.calls))
+    stop(c)
     os.environ["HERMES_DESKTOP"] = "1"
     fb.close()
 
@@ -1108,6 +1161,90 @@ def cron() -> None:
     stop(ctx)
     fb.close()
     JOBS.clear()
+
+
+def propose() -> None:
+    """propose_me can name the station. A token that reaches two stations
+    cannot propose without it (the broker's 409 "name one with station"),
+    and the tool used to send {agent_id, note} and nothing else. Without a
+    station the body must stay exactly that. The other four clients are in
+    test_propose_station.py."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot", config=ON)
+    start(mod, ctx)
+    props = (ctx.tools["propose_me"]["schema"].get("parameters") or {}).get(
+        "properties") or {}
+    check("propose: the tool offers a station argument", "station" in props,
+          str(sorted(props)))
+    for args in ({"note": "n1", "station": "bots"}, {"note": "n2"},
+                 {"note": "n3", "station": None}):
+        ctx.call("propose_me", ALICE, args)
+    sent = [b for p, b in fb.bodies if p == "/me/proposals"]
+    check("propose: with a station, the body carries it",
+          sent[:1] == [{"agent_id": "bot", "note": "n1", "station": "bots"}],
+          str(sent))
+    check("propose: without one — absent or null — the body is exactly "
+          "{agent_id, note}, as before",
+          sent[1:] == [{"agent_id": "bot", "note": "n2"},
+                       {"agent_id": "bot", "note": "n3"}], str(sent))
+    stop(ctx)
+    fb.close()
+
+    # Signing up turns push on where it is asked, through enable_a2a_here
+    # and every rule it has — so the bot receives once it is approved.
+    def asked(fb):
+        return [b for p, b in fb.bodies if p == "/me/proposals"]
+
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot")                            # a2a off
+    start(mod, ctx)
+    out = ctx.call("propose_me", CLI, {"note": "from the cli"})
+    check("propose: off, from the CLI → refused as enabling there is: "
+          "nothing asked, still off",
+          isinstance(out, dict) and "error" in out and not asked(fb)
+          and ctx.config.get("enabled") is not True, f"{out} {asked(fb)}")
+    out = ctx.call("propose_me", ALICE, {"note": "hi"})
+    route = ctx.config.get("route") or {}
+    check("propose: off, alice in the group → a2a turned on THERE, alice "
+          "owns it, and the request is posted",
+          ctx.config.get("enabled") is True
+          and same_chat_keys(route, GROUP)
+          and ctx.config.get("owner") == {"platform": "x", "user_id": "alice"}
+          and asked(fb) == [{"agent_id": "bot", "note": "hi"}]
+          and "a2a" in out, f"{out} {route} {asked(fb)}")
+    check("propose: and the stream opens at once — it delivers the moment "
+          "the name is approved", until(lambda: "/stream" in fb.calls, 3),
+          str(fb.calls))
+    stop(ctx)
+    fb.close()
+
+    saved = os.environ.pop("HERMES_DESKTOP", None)
+    try:
+        fb = FakeBroker()
+        mod = load(fb.url)
+        ctx = Ctx("bot", gateway=False, tui=True)   # the app's backend
+        ctx.live_keys = {DESK["session_key"]}
+        start(mod, ctx)
+        out = ctx.call("propose_me", DESK, {"note": "app"})
+        check("propose: off, in an app conversation → that conversation is "
+              "the route, the request posted, the stream open — with no "
+              "HERMES_DESKTOP: the turn ran here",
+              ctx.config.get("route") == DESK_ROUTE
+              and asked(fb) == [{"agent_id": "bot", "note": "app"}]
+              and until(lambda: "/stream" in fb.calls, 3),
+              f"{out} {ctx.config.get('route')} {fb.calls}")
+        stop(ctx)
+        fb.close()
+    finally:
+        if saved is not None:
+            os.environ["HERMES_DESKTOP"] = saved
+
+
+def same_chat_keys(route: dict, chat: dict) -> bool:
+    return all(str(route.get(k) or "") == str(chat.get(k) or "")
+               for k in ("platform", "chat_id", "thread_id", "user_id"))
 
 
 # The tests reach the object register() built through the hook it registered.

@@ -15,7 +15,8 @@ What it does, in order:
   2. asks which to install or update (installed ones start ticked, so an
      update is ENTER);
   3. asks for the token when a selected client needs one (all but Claude
-     Code, whose token lives in its own /plugin screen);
+     Code, whose token lives in its own /plugin screen) — one for all of
+     them, or any of them its own (Hermes bots on another station's token);
   4. for Hermes, asks which bots (profiles), and an agent id for a profile
      whose name is no id (`default`);
   5. downloads everything, shows every file it will write, and waits for
@@ -260,16 +261,16 @@ def checklist_key(rows, cursor, key):
 # Talking to the broker
 # ---------------------------------------------------------------------------
 
-SECRET = {"token": ""}
+SECRET = {"tokens": []}       # every token typed, whichever harness it is for
 
 
 def redact(text):
     """Every line that leaves this program goes through here."""
-    t = SECRET["token"]
     text = str(text)
-    if t:
-        text = text.replace(t, "<token>")
-        text = text.replace(urllib.parse.quote(t, safe=""), "<token>")
+    for t in SECRET["tokens"]:
+        if t:
+            text = text.replace(t, "<token>")
+            text = text.replace(urllib.parse.quote(t, safe=""), "<token>")
     return text
 
 
@@ -392,13 +393,15 @@ class PlainUI:
     def notice(self, title, lines):
         self.say("", title, *lines)
 
-    def checklist(self, title, rows):
+    def checklist(self, title, rows, prompt="Numbers to install", note=""):
         while True:
             self.say("", f"{title}")
+            if note:
+                self.say(f"  {note}")
             for i, r in enumerate(rows, 1):
                 box = (G.check if r["checked"] else " ") if r["enabled"] else "-"
                 self.say(f"  {i}) [{box}] {r['label']}")
-            ans = self._line("Numbers to install, separated by spaces "
+            ans = self._line(f"{prompt}, separated by spaces "
                              "(ENTER keeps the ticked ones, q cancels): ")
             ans = ans.strip().lower()
             if ans in ("q", "quit", "esc"):
@@ -532,7 +535,7 @@ class CursesUI:
         self.scr.refresh()
         self._key()
 
-    def checklist(self, title, rows):
+    def checklist(self, title, rows, prompt=None, note=""):
         keys = (f"{G.updown}/j/k navigate  SPACE toggle  ENTER confirm  "
                 "ESC cancel")
         cursor = next((i for i, r in enumerate(rows) if r["enabled"]), 0)
@@ -542,6 +545,8 @@ class CursesUI:
             room = max(1, h - 5)
             top = min(max(top, cursor - room + 1), cursor)
             self._frame(title, keys)
+            if note:
+                self._put(3, 2, note, self.dim)
             for i, r in enumerate(rows[top:top + room]):
                 n = top + i
                 box = G.check if r["checked"] else " "
@@ -623,9 +628,11 @@ class CursesUI:
 # ---------------------------------------------------------------------------
 
 class Target:
-    def __init__(self, key, label, dest, before, profile="", agent=""):
+    def __init__(self, key, label, dest, before, profile="", agent="",
+                 token=("", None)):
         self.key, self.label, self.dest = key, label, dest
         self.before, self.profile, self.agent = before, profile, agent
+        self.token, self.me = token      # the token it is fetched with, its /me
         self.files = []          # [(absolute path, bytes, mode)]
         self.same = False        # every file already on disk, byte for byte
 
@@ -641,16 +648,17 @@ class Target:
             self.same = False
 
 
-def ask_token(ui):
+TOKEN_PROMPT = "Paste or type the token your operator gave you (a2a_st_...)"
+
+
+def ask_token(ui, title="Your a2a token", prompt=TOKEN_PROMPT):
     error = ""
     for _ in range(3):
-        token = ui.ask("Your a2a token",
-                       "Paste or type the token your operator gave you "
-                       "(a2a_st_...)", secret=True, error=error)
+        token = ui.ask(title, prompt, secret=True, error=error)
         if not token:
             error = "the token is empty"
             continue
-        SECRET["token"] = token
+        SECRET["tokens"].append(token)
         ui.status("checking the token with the broker...")
         try:
             me = check_token(token)
@@ -661,6 +669,36 @@ def ask_token(ui):
         error = "the broker refused that token (unknown or revoked)"
     raise SystemExit("a2a: the token was refused three times; nothing was "
                      "written. Ask your operator for a valid token.")
+
+
+def ask_tokens(ui, keys):
+    """{harness key: (token, /me)} for the selected harnesses that need one.
+
+    One token for all of them unless some get their own — Hermes bots on a
+    token for another station, say. Which token an installed copy carries is
+    never read back, so an update asks again, and a harness that had its own
+    must be given it again: the broker refuses an agent under any token but
+    the one it is bound to.
+    """
+    many = len(keys) > 1
+    first = ask_token(ui, prompt=TOKEN_PROMPT + (
+        "; it is for all of them, and next you can give any its own"
+        if many else ""))
+    out = {k: first for k in keys}
+    if not many:
+        return out
+    rows = [{"label": NAMES[k], "enabled": True, "checked": True}
+            for k in keys]
+    same = set(ui.checklist(
+        "Which harnesses use this token?", rows, prompt="Numbers that use it",
+        note="a harness keeps working only under the token its agent was "
+             "created with"))
+    for i, k in enumerate(keys):
+        if i not in same:
+            out[k] = ask_token(ui, f"Token for {NAMES[k]}",
+                               f"Paste or type the token for {NAMES[k]} "
+                               "(a2a_st_...)")
+    return out
 
 
 def ask_hermes(ui):
@@ -699,29 +737,31 @@ def ask_hermes(ui):
     return out
 
 
-def plan(selected, bots):
+def plan(selected, bots, tokens):
     targets = []
     for key in selected:
+        token = tokens.get(key, ("", None))
         if key == "hermes":
             for name, home, agent in bots:
                 targets.append(Target(
                     "hermes", f"Hermes bot '{name}'",
                     install_dir("hermes", home),
-                    installed_version("hermes", home), name, agent))
+                    installed_version("hermes", home), name, agent, token))
         else:
             # A starting id baked by an earlier install (?agent=) is kept.
             prior = (_baked_field(client_file(key), "agent") or ""
                      if key != "claude" else "")
             targets.append(Target(key, NAMES[key], install_dir(key),
-                                  installed_version(key), agent=prior))
+                                  installed_version(key), agent=prior,
+                                  token=token))
     return targets
 
 
-def download(ui, targets, token):
+def download(ui, targets):
     for t in targets:
         ui.status(f"downloading the {t.label} client...")
         try:
-            data = fetch(t.key, token, t.agent)
+            data = fetch(t.key, t.token, t.agent)
         except urllib.error.HTTPError as e:
             raise SystemExit(redact(
                 f"a2a: the broker would not serve the {t.label} client "
@@ -864,16 +904,26 @@ def _table(rows, indent="  "):
             + "  " + r[-1] for r in rows]
 
 
-def summary(targets, me, cmds):
-    """The confirmation screen: what will be written, and what will be asked."""
+def summary(targets, cmds):
+    """The confirmation screen: what will be written, and what will be asked.
+    One line per token — whose it is, which harnesses get it, its stations —
+    and never the token itself."""
     lines = []
-    if me is not None:
+    groups = {}
+    for t in targets:
+        if t.token:
+            names = groups.setdefault(t.token, (t.me or {}, []))[1]
+            if NAMES[t.key] not in names:
+                names.append(NAMES[t.key])
+    for me, names in groups.values():
         stations = me.get("stations") or []
-        lines.append(f"Token of {me.get('user') or '?'} {G.dash} stations: "
+        lines.append(f"Token of {me.get('user') or '?'} for "
+                     f"{', '.join(names)} {G.dash} stations: "
                      f"{', '.join(stations) if stations else 'none'}")
         if not stations:
             lines.append("  This token is in no station yet: your operator "
                          "has to grant it before any client can work.")
+    if groups:
         lines.append("")
     lines.append("Will be installed")
     lines += _table([[t.label, _change(t), _where(t)] for t in targets])
@@ -1018,9 +1068,8 @@ def main():
             picked = ui.checklist("Install or update a2a for which "
                                   "harnesses?", rows)
             selected = [rows[i]["key"] for i in picked]
-            token, me = "", None
-            if any(k != "claude" for k in selected):
-                token, me = ask_token(ui)
+            need = [k for k in selected if k != "claude"]
+            tokens = ask_tokens(ui, need) if need else {}
             bots = ask_hermes(ui) if "hermes" in selected else []
             if "hermes" in selected and not bots:
                 selected.remove("hermes")
@@ -1028,10 +1077,10 @@ def main():
                 ui.close()
                 print("a2a: nothing left to install.")
                 return 1
-            targets = plan(selected, bots)
-            download(ui, targets, token)
+            targets = plan(selected, bots, tokens)
+            download(ui, targets)
             cmds = setup_needed(targets)
-            if not ui.confirm("Ready to install", summary(targets, me, cmds)):
+            if not ui.confirm("Ready to install", summary(targets, cmds)):
                 raise Cancelled()
         finally:
             ui.close()

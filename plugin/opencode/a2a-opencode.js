@@ -1354,6 +1354,30 @@ async function core(host) {
     }
   }
 
+  // The project switch, for enable_a2a_here and for propose_me (signing up
+  // turns it on). Merge, never truncate: read_on_init, catchup or agent may
+  // be in the file, and answering a yes/no must not throw the rest away.
+  // This client's key only: the tool runs in one harness and cannot speak
+  // for the others sharing the directory.
+  async function setEnabled(on) {
+    const next = { ...(await readJSON(PROJECT_FILE)), [ENABLE_KEY]: on }
+    await fs.writeFile(PROJECT_FILE, JSON.stringify(next, null, 2) + "\n")
+    ENABLED = on
+    if (on) {
+      // Live, in this session. The tools were registered whatever the
+      // switch said, so there is nothing to wait for: connect under them.
+      // pump() is a no-op while one is already running, so saying "on"
+      // twice never opens a second stream.
+      void pump()
+      void drain()
+    } else {
+      // Off has to stop what is already running, not just what starts
+      // next: close the stream now. The pump sees the switch and exits,
+      // and anything unacked stays on the broker for when it is back on.
+      stream?.abort()
+    }
+  }
+
   const tools = {
     enable_a2a_here: {
       description:
@@ -1371,27 +1395,7 @@ async function core(host) {
       args: { enabled: { type: "boolean" } },
       async execute(a) {
         const on = a.enabled === true || String(a.enabled) === "true"
-        // Merge, never truncate: read_on_init, catchup or agent may be in
-        // here, and answering a yes/no must not throw the rest away.
-        // This client's key only: the tool runs in one harness and
-        // cannot speak for the others sharing the directory.
-        const next = { ...(await readJSON(PROJECT_FILE)), [ENABLE_KEY]: on }
-        await fs.writeFile(
-          PROJECT_FILE, JSON.stringify(next, null, 2) + "\n")
-        ENABLED = on
-        if (on) {
-          // Live, in this session. The tools were registered whatever the
-          // switch said, so there is nothing to wait for: connect under them.
-          // pump() is a no-op while one is already running, so saying "on"
-          // twice never opens a second stream.
-          void pump()
-          void drain()
-        } else {
-          // Off has to stop what is already running, not just what starts
-          // next: close the stream now. The pump sees the switch and exits,
-          // and anything unacked stays on the broker for when it is back on.
-          stream?.abort()
-        }
+        await setEnabled(on)
         return JSON.stringify({
           enabled: on,
           file: PROJECT_FILE,
@@ -1648,12 +1652,31 @@ async function core(host) {
         "already belongs to another client this becomes a TRANSFER " +
         "request, which moves that agent's channels and unacked messages " +
         "here if the operator agrees; a refused transfer bars asking " +
-        "again for a while, so ask once and wait rather than retrying.",
-      args: { note: optStr },
+        "again for a while, so ask once and wait rather than retrying. " +
+        "If your token reaches several stations, pass station. A request " +
+        "the broker accepts also turns a2a on for this project (as " +
+        "enable_a2a_here does), so this agent receives as soon as it is " +
+        "approved.",
+      args: { note: optStr, station: optStr },
       async execute(a) {
-        return await api("POST", "/me/proposals", {
+        const station = (a.station || "").trim()
+        // Throws on a refusal, so a request the broker did not take turns
+        // nothing on.
+        const out = await api("POST", "/me/proposals", {
           agent_id: key,
           note: a.note || "",
+          ...(station ? { station } : {}),
+        })
+        if (ENABLED) return out
+        await setEnabled(true)
+        let res
+        try { res = JSON.parse(out) } catch { res = { broker: out } }
+        if (!res || typeof res !== "object") res = { broker: res }
+        return JSON.stringify({
+          ...res,
+          enabled: true,
+          a2a: "on for this project: this agent receives as soon as the " +
+               "name is approved, with no restart",
         })
       },
     },

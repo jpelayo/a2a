@@ -1147,6 +1147,34 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  // The project switch, for enable_a2a_here and for propose_me (signing up
+  // turns it on).
+  async function setEnabled(on: boolean) {
+    // Merge, never truncate: read_on_init, catchup or agent may be in here,
+    // and answering a yes/no must not throw the rest away.
+    let current: Record<string, unknown> = {};
+    try {
+      current = JSON.parse(await readFile(PROJECT_FILE, "utf8")) || {};
+    } catch {
+      current = {};
+    }
+    // This client's key only: the tool runs in one harness and cannot
+    // speak for the others sharing the directory.
+    await writeFile(
+      PROJECT_FILE,
+      JSON.stringify({ ...current, [ENABLE_KEY]: on }, null, 2) + "\n",
+    );
+    // Live, in this session. The tools were registered whatever the switch
+    // said, so there is nothing to wait for: connect under them.
+    const started = on && !ENABLED && !pumping && !sendOnly();
+    ENABLED = on;
+    if (started) {
+      pumping = true;
+      await loadSettings();
+      pump();
+    }
+  }
+
   pi.registerTool({
     name: "enable_a2a_here",
     label: "a2a: use here",
@@ -1163,29 +1191,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ enabled: Type.Boolean() }),
     async execute(_id, p) {
       const on = p.enabled === true;
-      // Merge, never truncate: read_on_init, catchup or agent may be in here,
-      // and answering a yes/no must not throw the rest away.
-      let current: Record<string, unknown> = {};
-      try {
-        current = JSON.parse(await readFile(PROJECT_FILE, "utf8")) || {};
-      } catch {
-        current = {};
-      }
-      // This client's key only: the tool runs in one harness and cannot
-      // speak for the others sharing the directory.
-      await writeFile(
-        PROJECT_FILE,
-        JSON.stringify({ ...current, [ENABLE_KEY]: on }, null, 2) + "\n",
-      );
-      // Live, in this session. The tools were registered whatever the switch
-      // said, so there is nothing to wait for: connect under them.
-      const started = on && !ENABLED && !pumping && !sendOnly();
-      ENABLED = on;
-      if (started) {
-        pumping = true;
-        await loadSettings();
-        pump();
-      }
+      await setEnabled(on);
       return text(JSON.stringify({
         enabled: on,
         file: PROJECT_FILE,
@@ -1496,16 +1502,38 @@ export default function (pi: ExtensionAPI) {
       "client this becomes a TRANSFER request, which moves that agent's " +
       "channels and unacked messages here if the operator agrees; a refused " +
       "transfer bars asking again for a while, so ask once and wait rather " +
-      "than retrying.",
+      "than retrying. If your token reaches several stations, pass station. " +
+      "A request the broker accepts also turns a2a on for this project (as " +
+      "enable_a2a_here does), so this agent receives as soon as it is " +
+      "approved.",
     parameters: Type.Object({
       note: Type.Optional(Type.String({
         description: "one line for the operator on what this agent is",
       })),
+      station: Type.Optional(Type.String({
+        description: "the station to ask in, by name; needed only when your " +
+          "token reaches several (the error lists them)",
+      })),
     }),
-    async execute(a: { note?: string }) {
-      return text(await api("POST", "/me/proposals", {
+    async execute(_id, a: { note?: string; station?: string }) {
+      const station = (a.station || "").trim();
+      // Throws on a refusal, so a request the broker did not take turns
+      // nothing on.
+      const out = await api("POST", "/me/proposals", {
         agent_id: key,
         note: a.note || "",
+        ...(station ? { station } : {}),
+      });
+      if (ENABLED) return text(out);
+      await setEnabled(true);
+      let res: unknown;
+      try { res = JSON.parse(out); } catch { res = { broker: out }; }
+      if (!res || typeof res !== "object") res = { broker: res };
+      return text(JSON.stringify({
+        ...(res as Record<string, unknown>),
+        enabled: true,
+        a2a: "on for this project: this agent receives as soon as the name " +
+             "is approved, with no restart",
       }));
     },
   });

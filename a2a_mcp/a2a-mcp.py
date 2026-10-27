@@ -7488,8 +7488,10 @@ class _Tui:
                     "x delete · e purge empty · s ack all · c collect · ⏎ agents",
         "tokens":   "n new · g grant into station · v revoke · x delete · "
                     "z purge revoked · c collect",
-        "agents":   "a approve/transfer · n add · f free (claimable again) · "
-                    "m move · b bind · s ack all · x remove/reject · "
+        # A request is answered with one key, no y/N; new ones appear by
+        # themselves (run() looks every REFRESH_MS).
+        "agents":   "request: a approve · x reject (one key) · agent: n add · "
+                    "f free · m move · b bind · s ack all · x remove · "
                     "u unlock transfer · c collect",
         # Read-only on purpose. Everything here is history; the way to
         # change it is to do something that gets logged.
@@ -7520,7 +7522,33 @@ class _Tui:
         self.rows: list[dict] = []
 
     # --- data ------------------------------------------------------------
+    @staticmethod
+    def _row_key(r: dict | None) -> tuple | None:
+        """What a row IS, across reloads — never its position."""
+        if not r:
+            return None
+        return tuple(r.get(k) for k in ("kind", "station_id", "agent_id",
+                                         "name", "prefix", "segment", "id"))
+
     def load(self) -> None:
+        """Reload the tab, keeping the cursor on the ROW it was on. Requests
+        arrive at the top of the agents list while the screen is open (run()
+        refreshes on them), and a cursor kept by index would slide onto
+        another row — under a one-key approve."""
+        same = getattr(self, "_loaded_view", None) == self.view
+        keep = self._row_key(self.current()) if same and self.rows else None
+        self._load_rows()
+        if keep is not None:
+            for i, r in enumerate(self.rows):
+                if self._row_key(r) == keep:
+                    self.sel[self.view] = i
+                    break
+        self.sel[self.view] = max(
+            0, min(self.sel[self.view], len(self.rows) - 1)
+        )
+        self._loaded_view = self.view
+
+    def _load_rows(self) -> None:
         if self.view == "stations":
             self.rows = STATIONS.list()
             for r in self.rows:
@@ -8146,52 +8174,41 @@ class _Tui:
         # A proposal is not an agent: it cannot be moved, bound or freed,
         # because none of those things exist yet. Approve it or reject it.
         if row and row.get("kind") == "proposal":
+            # One key answers a request, no y/N: answering them is what this
+            # row is for, and the cursor cannot slide onto another row under
+            # the key (load() keeps it on the row it was on). The line below
+            # says exactly what was done.
             transfer = row.get("request") == "transfer"
             if ch == "a":
                 who = row.get("owner_prefix") or "?"
                 if transfer:
-                    # Say what changes hands. Ownership is the only column
+                    # Say what changed hands. Ownership is the only column
                     # that moves, but channels and receipts are keyed by
                     # agent_id, so the name keeps its memberships and its
-                    # unacked inbox and the new token inherits both. Right for
-                    # a replaced laptop, wrong for a name grab — and only the
-                    # person reading this line can tell those apart.
+                    # unacked inbox and the new token inherits both.
                     held = row.get("current_owner_prefix") or "?"
                     n = len(_pending_rows(row["station_id"], row["agent_id"],
                                           500))
-                    ok = self.confirm(
-                        f"TRANSFER {row['agent_id']!r} from {held} to {who}? "
-                        f"it keeps its channels and {n} unacked message(s); "
+                out = PROPOSALS.approve(row["station_id"], row["agent_id"])
+                if transfer:
+                    self.msg = (
+                        f"{out['agent_id']} transferred from {held} to {who} "
+                        f"— keeps its channels and {n} unacked message(s); "
                         f"{held} is refused from now on"
                     )
                 else:
-                    ok = self.confirm(
-                        f"approve {row['agent_id']!r} in "
-                        f"{row.get('station_name')} and bind it to {who}?"
-                    )
-                if ok:
-                    out = PROPOSALS.approve(row["station_id"], row["agent_id"])
-                    did = "transferred" if transfer else "approved and bound"
                     self.msg = (
-                        f"{out['agent_id']} {did} to {who} — its "
+                        f"{out['agent_id']} approved and bound to {who} — its "
                         f"client connects with no restart"
                     )
             elif ch == "x":
-                extra = (
-                    f" that token may not ask again for "
-                    f"{_short_duration(TRANSFER_LOCKTIME)}"
-                    if transfer else " (it expires on its own otherwise)"
-                )
-                if self.confirm(
-                    f"reject the request for {row['agent_id']!r}?{extra}"
-                ):
-                    out = PROPOSALS.reject(row["station_id"], row["agent_id"])
-                    self.msg = f"{row['agent_id']} rejected"
-                    if out.get("locked_until"):
-                        self.msg += (
-                            f" — locked "
-                            f"{_short_duration(TRANSFER_LOCKTIME)}; u lifts it"
-                        )
+                out = PROPOSALS.reject(row["station_id"], row["agent_id"])
+                self.msg = f"{row['agent_id']} rejected"
+                if out.get("locked_until"):
+                    self.msg += (
+                        f" — that token may not ask again for "
+                        f"{_short_duration(TRANSFER_LOCKTIME)}; u lifts it"
+                    )
             elif ch == "u":
                 n = PROPOSALS.unlock(row["station_id"], row["agent_id"])
                 self.msg = (f"{n} transfer lock(s) lifted" if n
@@ -8270,13 +8287,54 @@ class _Tui:
                 AGENTS.remove(row["agent_id"], row["station_id"])
                 self.msg = "agent removed"
 
+    # How long a keypress is waited for before looking for new name requests.
+    REFRESH_MS = 2000
+
+    def requests(self) -> dict:
+        """The live name requests, (station_id, agent_id) -> row. {} when
+        they cannot be read: a hiccup must not end the operator's session."""
+        try:
+            return {(p["station_id"], p["agent_id"]): p
+                    for p in PROPOSALS.list()}
+        except Exception:
+            return {}
+
+    def wait_key(self) -> int:
+        """The next key, or -1 after REFRESH_MS with none. Blocking again
+        straight after: ask(), pick() and getstr() must wait for the operator
+        as they always did, not give up on them after two seconds."""
+        self.scr.timeout(self.REFRESH_MS)
+        try:
+            return self.scr.getch()
+        finally:
+            self.scr.timeout(-1)
+
     def run(self) -> None:
         import curses
         curses.curs_set(0)
+        seen = self.requests()
+        reload = True
         while True:
-            self.load()
+            if reload:
+                self.load()
             self.draw()
-            c = self.scr.getch()
+            c = self.wait_key()
+            if c == -1:
+                # Nobody pressed anything: look for name requests, and
+                # redraw only when they changed — the other tabs are not
+                # re-queried every two seconds for nothing.
+                now = self.requests()
+                new = [now[k] for k in now if k not in seen]
+                reload = now.keys() != seen.keys()
+                seen = now
+                if new:
+                    names = ", ".join(
+                        f"{p['agent_id']} ({p.get('station_name') or '?'})"
+                        for p in new)
+                    self.msg = (f"new name request: {names} — tab 3 agents: "
+                                f"a approve · x reject")
+                continue
+            reload = True
             self.msg = ""
             if not self.act(c):
                 return

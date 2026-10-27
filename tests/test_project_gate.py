@@ -341,6 +341,10 @@ class FakeBroker:
         # The ids /me/agents reports as this token's own (rename_me adopts
         # one of these instead of renaming).
         self.me_agents: list[str] = []
+        # (path, JSON body) of every POST/PATCH/DELETE: what a tool SENT.
+        self.bodies: list[tuple[str, dict]] = []
+        # POST paths answered 409, the way the broker refuses a request.
+        self.refuse: set[str] = set()
         self.acked: list[str] = []
         self.unacked: list[dict] = []
         # Unacked but past the replay window: the stream never offers these
@@ -401,6 +405,15 @@ class FakeBroker:
                 self._record(path)
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                broker.bodies.append((path, body))
+                if path in broker.refuse:
+                    b = json.dumps({"error": "refused by the test"}).encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                    return
                 if path == "/ack" and broker.fail_acks > 0:
                     broker.fail_acks -= 1
                     self.send_response(500)

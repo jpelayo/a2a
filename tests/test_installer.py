@@ -34,6 +34,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SOURCE = ROOT / "plugin" / "installer" / "a2a-install.py"
 TOKEN = "a2a_st_TESTsecretTOKENvalue123"
+# A second user's token, in another station: what a harness given its own
+# token (Hermes bots on `bots`, say) is installed with.
+TOKEN2 = "a2a_st_TESTsecondTOKENforBOTS456"
 
 fails: list[str] = []
 
@@ -58,7 +61,9 @@ def load_broker():
     async def run_inline(fn):
         return fn()
     b._db = run_inline
-    b.TOKENS.resolve = lambda t: {"stations": ["s"]} if t == TOKEN else None
+    b.TOKENS.resolve = lambda t: ({"stations": ["s"]} if t == TOKEN else
+                                  {"stations": ["bots"]} if t == TOKEN2
+                                  else None)
     return b
 
 
@@ -99,6 +104,10 @@ class FakeBroker:
                     if auth == f"Bearer {TOKEN}":
                         code, body = 200, json.dumps(
                             {"user": "alice", "stations": ["s"],
+                             "agent": None, "registered": False}).encode()
+                    elif auth == f"Bearer {TOKEN2}":
+                        code, body = 200, json.dumps(
+                            {"user": "bob", "stations": ["bots"],
                              "agent": None, "registered": False}).encode()
                     else:
                         code, body = 403, b'{"error":"invalid or revoked token"}'
@@ -230,9 +239,12 @@ def pure():
         refused = True
     check("unpack refuses a member that climbs out of its folder", refused)
 
-    m.SECRET["token"] = TOKEN
+    m.SECRET["tokens"] = [TOKEN, TOKEN2]
     check("redact hides the token in anything printed",
           TOKEN not in m.redact(f"GET /install/pi/{TOKEN} failed"))
+    shown = m.redact(f"GET /install/pi/{TOKEN} and /install/hermes/{TOKEN2}")
+    check("redact hides EVERY token typed — one per harness is allowed",
+          TOKEN not in shown and TOKEN2 not in shown, shown)
 
 
 def main() -> int:
@@ -265,6 +277,7 @@ def main() -> int:
         code, out = run_installer(installer, home, bin_, cwd, [
             "all",          # harnesses
             TOKEN,          # token
+            "",             # ENTER: every harness uses it
             "all",          # hermes bots: default, bot1 (not "empty")
             "botd",         # agent id for the default profile
             "y",            # install
@@ -359,6 +372,7 @@ def main() -> int:
         code, out = run_installer(installer, home, bin_, cwd, [
             "",             # ENTER: the installed ones, already ticked
             TOKEN,
+            "",             # ENTER: every harness uses it
             "",             # ENTER: both bots, already installed
             "",             # ENTER: keep the default bot's id
             "y",
@@ -425,6 +439,68 @@ def main() -> int:
               "they are in your next steps" in out
               and "codex mcp add a2a" in out.split("Next steps", 1)[-1],
               out[-800:])
+
+        # --- one token for most, another for Hermes ---------------------------
+        m4 = root / "m4"
+        home, bin_, cwd, log = machine(m4)
+        broker.seen.clear()
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all",          # harnesses
+            TOKEN,          # the token for all of them…
+            "1 2 3",        # …but Hermes (row 4) gets its own
+            TOKEN2,         # Hermes's token
+            "all",          # bots
+            "botd",
+            "y",
+            "n",            # no commands: not what this case is about
+        ])
+        check("per harness: the installer finishes", code == 0, out[-1500:])
+        check("per harness: neither token appears in what it prints",
+              TOKEN not in out and TOKEN2 not in out, "token printed")
+        baked = {
+            "OpenCode": home / ".config" / "opencode" / "plugins"
+            / "a2a-opencode.js",
+            "Pi": home / ".pi" / "agent" / "extensions" / "a2a" / "index.ts",
+            "Codex": home / ".codex" / "a2a" / "a2a-codex.py",
+        }
+        check("per harness: OpenCode, Pi and Codex carry the first token",
+              all(p.is_file() and f'"token": "{TOKEN}"' in p.read_text()
+                  for p in baked.values()),
+              str({k: p.is_file() for k, p in baked.items()}))
+        bots = [home / ".hermes" / "plugins" / "a2a" / "__init__.py",
+                home / ".hermes" / "profiles" / "bot1" / "plugins" / "a2a"
+                / "__init__.py"]
+        check("per harness: both Hermes bots carry Hermes's own token, and "
+              "not the other",
+              all(p.is_file() and f'"token": "{TOKEN2}"' in p.read_text()
+                  and TOKEN not in p.read_text() for p in bots),
+              str([p.is_file() for p in bots]))
+        got = [p for p, _ in broker.seen if p.startswith("/install/hermes/")]
+        check("per harness: the Hermes clients were downloaded with that token",
+              got and all(p == f"/install/hermes/{TOKEN2}" for p in got),
+              str([p.replace(TOKEN, "<1>").replace(TOKEN2, "<2>")
+                   for p in got]))
+        check("per harness: /me checked each token naming no agent",
+              sum(1 for p, h in broker.seen if p == "/me"
+                  and not h.get("X-A2A-Agent")) == 2,
+              str([p for p, _ in broker.seen]))
+        check("per harness: the summary says whose token goes where, and its "
+              "stations",
+              "Token of alice for OpenCode, Pi, Codex" in out
+              and "Token of bob for Hermes" in out
+              and "stations: bots" in out, out[:2500])
+
+        # --- a refused SECOND token -------------------------------------------
+        m5 = root / "m5"
+        home, bin_, cwd, log = machine(m5)
+        before = snapshot(m5)
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all", TOKEN, "1 2 3",
+            "a2a_st_wrong1", "a2a_st_wrong2", "a2a_st_wrong3"])
+        check("per harness: three refusals of a harness's own token end it",
+              code != 0 and "refused" in out, out[-600:])
+        check("per harness: and nothing was written", snapshot(m5) == before,
+              str(set(snapshot(m5)) - set(before)))
 
         # --- a refused token ---------------------------------------------------
         m3 = root / "m3"

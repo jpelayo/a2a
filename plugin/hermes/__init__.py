@@ -36,7 +36,15 @@ ROUTE — and there are two kinds:
 Hermes loads this plugin into the CLI, the TUI, cron, kanban, the gateway and
 the app's backend alike, and only one of them can render a turn for a given
 route — so the stream is claimed ONLY by the gateway for a chat route and
-ONLY by the app's backend for an app route. The two never both hold it.
+ONLY by the app's backend for an app route. The two never both hold it. The
+app's backend is the process with the desktop injector where that
+conversation LIVES: HERMES_DESKTOP set, a turn of it run there, or Hermes's
+session table there holding it. The variable alone missed a backend started
+any other way, which then held the stream for nobody, silently; a process
+held back now says so in the log, once.
+
+SIGNING UP TURNS IT ON. propose_me with a2a off runs enable_a2a_here first,
+with all its rules, so the bot receives as soon as its name is approved.
 
 WHO MAY. "enable a2a here" in an app conversation is always allowed: the app
 is the bot's operator at its own machine. In a messaging chat the first user
@@ -86,6 +94,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -238,11 +247,18 @@ def _live_key(ui_session_id):
     from the desktop backend's own session table — private to Hermes, so best
     effort and read only. It is the one way to follow a key Hermes rotated
     after compressing before any turn shows it, which matters when the next
-    turn would only ever come from a2a itself. "" when it cannot tell."""
+    turn would only ever come from a2a itself. "" when it cannot tell.
+
+    Read only where Hermes already loaded the table: importing it fresh would
+    run a module that serves nothing here, and its table would be empty. That
+    also makes a non-empty answer the sign that THIS process holds the
+    conversation (`_desktop_backend`)."""
     if not ui_session_id:
         return ""
     try:
-        import tui_gateway.server as srv
+        srv = sys.modules.get("tui_gateway.server")
+        if srv is None:
+            return ""
         with srv._sessions_lock:
             s = srv._sessions.get(ui_session_id)
         return str(s.get("session_key") or "") if isinstance(s, dict) else ""
@@ -702,10 +718,12 @@ TOOLS = [
      "itself — it asks. If the name already belongs to another client this "
      "becomes a TRANSFER request, which moves that agent's channels and "
      "unacked messages here if the operator agrees; a refused transfer bars "
-     "asking again for a while, so ask once and wait rather than retrying.",
-     {"note": OPT_STR}, [],
-     lambda c, a: c.api_text("POST", "/me/proposals",
-                             {"agent_id": c.key, "note": a.get("note") or ""})),
+     "asking again for a while, so ask once and wait rather than retrying. "
+     "If your token reaches several stations, pass station. Asking also "
+     "turns a2a on here when it is off (as enable_a2a_here does, with the "
+     "same rules), so this bot receives as soon as it is approved.",
+     {"note": OPT_STR, "station": OPT_STR}, [],
+     lambda c, a: c.propose_me(a)),
 
     ("whoami",
      "Report the name the broker resolves this bot to, its station, and "
@@ -772,6 +790,9 @@ class A2AHermes:
         # stream stays closed, so the broker keeps new messages undelivered,
         # and a peek every PEEK_S (or a turn there) looks again.
         self._closed_since = None
+        # A turn of the route's app conversation ran in THIS process: then
+        # this is the process that serves it, whatever its environment says.
+        self._route_here = False
         self._resp = None
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -892,15 +913,35 @@ class A2AHermes:
         except Exception:
             return False
 
-    def _desktop_backend(self):
-        """Is this the desktop app's backend — the one place a turn pushed
-        into an app conversation can run?"""
+    def _tui_injector(self):
         mgr = getattr(self.ctx, "_manager", None)
         try:
-            tui = bool(getattr(mgr, "has_tui_message_injector", False))
+            return bool(getattr(mgr, "has_tui_message_injector", False))
         except Exception:
-            tui = False
-        return tui and _desktop_process()
+            return False
+
+    def _desktop_backend(self):
+        """Is this the process that serves the route's app conversation — the
+        one place a turn pushed into it can run? It needs Hermes's desktop
+        injector, and any one sign that the conversation lives HERE:
+        HERMES_DESKTOP (the app sets it on the backend it starts), a turn of
+        that conversation run in this process, or Hermes's session table in
+        this process holding it. Trusting the variable alone left a backend
+        started any other way holding nothing, silently. A `hermes --tui`
+        process never qualifies: its turns are not app turns, and its table
+        does not hold the app's conversation."""
+        if not self._tui_injector():
+            return False
+        if _desktop_process() or self._route_here:
+            return True
+        route = self.route or {}
+        return is_desktop(route) and bool(_live_key(route.get("ui_session_id")))
+
+    def _route_ran_here(self):
+        """A turn of the route conversation ran in this process."""
+        if not self._route_here:
+            self._route_here = True
+            self._wake.set()
 
     def _host_ok(self):
         """Can THIS process deliver into the route? Exactly one process can:
@@ -986,6 +1027,10 @@ class A2AHermes:
         easily as outside it.
         """
         if not self.enabled or not self.route:
+            if name == "propose_me":
+                # Signing up turns a2a on where it is asked, through
+                # enable_a2a_here and every check it makes (propose_me).
+                return None
             return ("a2a is off for this bot. Its owner turns it on by asking "
                     "for it in the chat that should carry it ('enable a2a "
                     "here').")
@@ -1001,6 +1046,7 @@ class A2AHermes:
                         f"({self._chat_label(self.route)}), and this is not "
                         f"it")
             self._follow(turn)
+            self._route_ran_here()
             return None
         here = _here()
         if not self._is_owner(here):
@@ -1094,6 +1140,10 @@ class A2AHermes:
                     self._set("owner", owner)
                 self._set("enabled", True)
                 self.route, self.owner, self.enabled = route, owner, True
+                # Asked from an app conversation: that turn runs here, so
+                # this process serves the new route. Elsewhere it is not
+                # known to (a chat route ignores it).
+                self._route_here = desk is not None
             else:
                 self._set("enabled", False)
                 self.enabled = False
@@ -1130,6 +1180,36 @@ class A2AHermes:
             body["expires_in"] = a["expires_in"]
         return _confirm(self.api_text(
             "POST", f"/channels/{_quote(a['name'])}/messages", body))
+
+    def propose_me(self, a):
+        """Ask an operator for this bot's id — and, when a2a is off, turn it
+        on HERE first, so the bot receives the moment it is approved. Turning
+        it on goes through enable_a2a_here and every refusal it makes (the
+        CLI, a turn with no user id, a chat while the app holds it): a
+        refused switch proposes nothing. With a2a already on, gate() has
+        held this to the route and its owner, and it only asks."""
+        turned_on = False
+        if not (self.enabled and self.route):
+            out = json.loads(self.enable_a2a_here({"enabled": True}))
+            if out.get("error"):
+                return json.dumps(out)
+            turned_on = True
+        body = {"agent_id": self.key, "note": a.get("note") or ""}
+        station = (a.get("station") or "").strip()
+        if station:
+            body["station"] = station
+        text = self.api_text("POST", "/me/proposals", body)
+        if not turned_on:
+            return text
+        try:
+            out = json.loads(text)
+        except ValueError:
+            out = {"broker": text}
+        if not isinstance(out, dict):
+            out = {"broker": out}
+        out["a2a"] = (f"on in {self._chat_label(self.route)}: this bot "
+                      "receives there as soon as the name is approved")
+        return json.dumps(out, ensure_ascii=False, indent=2)
 
     def rename_me(self, a):
         """Local AND remote: the bot's config has to move with the agent, or
@@ -1228,13 +1308,45 @@ class A2AHermes:
             return "injection"
         return None
 
+    def _say_held(self, block):
+        """One log line when a process that COULD deliver is held back, so a
+        bot that receives nothing says why instead of saying nothing. Only
+        where an injector exists: the CLI and cron load the plugin too, and
+        are never meant to stream."""
+        if block not in ("host", "injection"):
+            return
+        if not (self._gateway() or self._tui_injector()):
+            return
+        label = self._chat_label(self.route)
+        if block == "injection":
+            self.log("not streaming here: the gateway may not start turns for "
+                     "this plugin (plugins.entries.a2a.allow_gateway_injection)")
+        elif is_desktop(self.route) and not self._tui_injector():
+            self.log(f"not streaming here: {label} is delivered by the Hermes "
+                     f"app's backend, and this process has no desktop "
+                     f"injector")
+        elif is_desktop(self.route):
+            self.log(f"not streaming here: this process does not serve {label} "
+                     f"yet (HERMES_DESKTOP: "
+                     f"{'yes' if _desktop_process() else 'no'}); it starts "
+                     f"when a turn there runs here")
+        else:
+            self.log(f"not streaming here: {label} is delivered by the bot's "
+                     f"gateway, and this process is not it")
+
     def _pump_guard(self):
         """Hold the stream while — and only while — nothing blocks it."""
+        held = None
         while not self._stop.is_set():
-            if self.blocker():
+            block = self.blocker()
+            if block:
+                if block != held:
+                    held = block
+                    self._say_held(block)
                 self._wake.wait(GATE_POLL_S)
                 self._wake.clear()
                 continue
+            held = None
             try:
                 wait = self._pump()
             except Exception as e:
@@ -1487,6 +1599,7 @@ class A2AHermes:
             if not same_conversation(turn, self.route):
                 return None
             self._follow(turn)
+            self._route_ran_here()
             if self._closed_since is not None:
                 # A turn here means the conversation is open again.
                 self._closed_since = None

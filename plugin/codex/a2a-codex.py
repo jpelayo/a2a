@@ -1321,6 +1321,34 @@ def _enable_a2a_here(a):
     })
 
 
+def _propose_me(a):
+    """Ask an operator for this id, and — once the broker has taken the
+    request — turn a2a on for this project if it is off, so the session
+    receives as soon as the name is approved. A refused request turns
+    nothing on."""
+    body = {"agent_id": KEY, "note": a.get("note") or ""}
+    station = (a.get("station") or "").strip()
+    if station:
+        body["station"] = station
+    text = api_text("POST", "/me/proposals", body)
+    try:
+        out = json.loads(text)
+    except ValueError:
+        out = {"broker": text}
+    if not isinstance(out, dict):
+        out = {"broker": out}
+    if out.get("error") or _enabled.is_set():
+        return text
+    switched = json.loads(_enable_a2a_here({"enabled": True}))
+    if switched.get("error"):
+        out["a2a"] = switched["error"]
+    else:
+        out["enabled"] = True
+        out["a2a"] = ("on for this project: this session receives as soon "
+                      "as the name is approved, with no restart")
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
 def _status(a):
     quiet = (time.time() - _state["last_line"]) if _state["last_line"] else None
     stale = bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
@@ -1561,10 +1589,11 @@ TOOLS = [
      "by itself — it asks. If the name already belongs to another client this "
      "becomes a TRANSFER request, which moves that agent's channels and "
      "unacked messages here if the operator agrees; a refused transfer bars "
-     "asking again for a while, so ask once and wait rather than retrying.",
-     {"note": OPT_STR}, [],
-     lambda a: api_text("POST", "/me/proposals",
-                        {"agent_id": KEY, "note": a.get("note") or ""})),
+     "asking again for a while, so ask once and wait rather than retrying. "
+     "If your token reaches several stations, pass station. A request the "
+     "broker accepts also turns a2a on for this project (as enable_a2a_here "
+     "does), so this session receives as soon as it is approved.",
+     {"note": OPT_STR, "station": OPT_STR}, [], _propose_me),
 
     ("whoami",
      "Report the name the broker resolves this session to, its station, and "

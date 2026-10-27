@@ -327,17 +327,21 @@ def _rename(new_id: str) -> tuple[bool, str]:
     }, ensure_ascii=False, indent=2)
 
 
-def _propose(note: str = "") -> tuple[bool, str]:
+def _propose(note: str = "", station: str = "") -> tuple[bool, str]:
     """Ask an operator to register KEY.
 
     Reachable while unregistered — /me/* is exempt from the unknown-agent
     denial precisely so a client can provision itself, and this is the only
-    thing that makes proposing possible at all.
+    thing that makes proposing possible at all. `station` only when given:
+    the broker needs it once the token reaches several stations.
     """
+    body = {"agent_id": KEY, "note": note or ""}
+    if station:
+        body["station"] = station
     try:
         req = urllib.request.Request(
             f"{URL}/me/proposals",
-            data=json.dumps({"agent_id": KEY, "note": note or ""}).encode(),
+            data=json.dumps(body).encode(),
             headers=_headers({"Content-Type": "application/json"}),
             method="POST",
         )
@@ -735,7 +739,8 @@ def _handle(msg: dict) -> None:
                 "another client this becomes a TRANSFER request, which moves "
                 "that agent's channels and unacked messages here if the "
                 "operator agrees; a refused transfer bars asking again for a "
-                "while, so ask once and wait rather than retrying."
+                "while, so ask once and wait rather than retrying. If your "
+                "token reaches several stations, pass station."
             ),
             "inputSchema": {
                 "type": "object",
@@ -743,6 +748,11 @@ def _handle(msg: dict) -> None:
                     "type": "string",
                     "description": "one line for the operator on what this "
                                    "agent is",
+                }, "station": {
+                    "type": "string",
+                    "description": "the station to ask in, by name; needed "
+                                   "only when your token reaches several "
+                                   "(the error lists them)",
                 }},
             },
         }]}})
@@ -821,7 +831,9 @@ def _handle(msg: dict) -> None:
             _send({"jsonrpc": "2.0", "id": mid,
                    "result": {"content": [{"type": "text", "text": body}]}})
         elif params.get("name") == "propose_me":
-            ok, body = _propose((params.get("arguments") or {}).get("note", ""))
+            args = params.get("arguments") or {}
+            ok, body = _propose(args.get("note", ""),
+                                (args.get("station") or "").strip())
             _send({"jsonrpc": "2.0", "id": mid, "result": {
                 "isError": not ok,
                 "content": [{"type": "text", "text": body}]}})
