@@ -626,7 +626,8 @@ CREATE TABLE IF NOT EXISTS bids (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
     """
 
--- Direct messages: agent-to-agent inside one station. Kept out of channel
+-- Direct messages: agent-to-agent inside one station — or written into it
+-- from a LINKED station, signed "name@<that station>" (station_links). Kept out of channel
 -- transcripts so they are private to the two parties, and delivered by the
 -- same /stream push path. A DM to yourself is allowed on purpose: it is the
 -- end-to-end test for Claude Code channel delivery.
@@ -764,6 +765,25 @@ CREATE TABLE IF NOT EXISTS agent_transfer_denials (
   PRIMARY KEY (station_id, agent_id, token_hash),
   KEY idx_denials_until (denied_until),
   FOREIGN KEY (station_id) REFERENCES stations(station_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
+    """
+-- Two stations joined for DMs, BOTH ways: while a row exists, an agent on
+-- either side may send_dm(to="name@<other station>"). One row per pair, the
+-- ids stored ordered (station_a < station_b) so {A,B} cannot exist twice.
+-- Made by an operator only (station link, the TUI, /admin) — never by a token.
+--
+-- only_agents: NULL = every agent of both stations may use it; a JSON list of
+-- [station_id, agent_id] = only those. A list emptied because its agents left
+-- is [] and means NOBODY — it must never fall back to everyone.
+CREATE TABLE IF NOT EXISTS station_links (
+  station_a    VARCHAR(64)  NOT NULL,
+  station_b    VARCHAR(64)  NOT NULL,
+  only_agents  LONGTEXT     NULL,
+  created_at   DOUBLE       NOT NULL,
+  PRIMARY KEY (station_a, station_b),
+  KEY idx_links_b (station_b),
+  FOREIGN KEY (station_a) REFERENCES stations(station_id) ON DELETE CASCADE,
+  FOREIGN KEY (station_b) REFERENCES stations(station_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
     """
 -- Operational log and audit trail in one table, because the question that
@@ -2544,6 +2564,12 @@ class StationRegistry:
                 CONN.execute(
                     f"DELETE FROM {tbl} WHERE station_id = %s", (sid,)
                 )
+            # Its links go with it: the other station keeps its DMs, which
+            # are ordinary DMs there, but nothing may reach a deleted station.
+            CONN.execute(
+                "DELETE FROM station_links "
+                "WHERE station_a = %s OR station_b = %s", (sid, sid)
+            )
             cur = CONN.execute(
                 "DELETE FROM stations WHERE station_id = %s", (sid,)
             )
@@ -2553,6 +2579,199 @@ class StationRegistry:
 
 
 STATIONS = StationRegistry()
+
+
+class LinkRegistry:
+    """Station links: two stations joined for DMs, both ways.
+
+    A DM never leaves its station unless an OPERATOR has linked the two —
+    `station link`, the TUI's `l`, `/admin/stations/{s}/links`. A token can
+    never make one, exactly as it can never put itself on an allow list.
+    While a link exists, an agent on either side may send_dm(to="bob@B"); the
+    DM is written into B as an ordinary B DM, signed "alice@A", and Bob
+    answers "alice@A" the same way (DirectRegistry.send).
+
+    `only` is the one setting: None = every agent of both stations, or a list
+    of [station_id, agent_id] = only those, on either side. An agent that
+    leaves (removed, moved) is dropped from the list, and a list emptied that
+    way is [] — NOBODY, never everyone: a limit nobody is left on must not
+    turn into no limit.
+    """
+
+    @staticmethod
+    def _pair(x: str, y: str) -> tuple[str, str]:
+        return (x, y) if x < y else (y, x)
+
+    @staticmethod
+    def _station(id_or_name: str) -> dict:
+        st = STATIONS.get(id_or_name)
+        if not st:
+            raise KeyError(f"station {id_or_name!r} not found")
+        return st
+
+    @staticmethod
+    def _load(raw) -> list[list[str]] | None:
+        if raw is None:
+            return None
+        try:
+            out = json.loads(raw)
+        except ValueError:
+            return []
+        return [list(p) for p in out if isinstance(p, (list, tuple))
+                and len(p) == 2] if isinstance(out, list) else []
+
+    def _parse_only(self, only, a: dict, b: dict) -> list[list[str]] | None:
+        """`only` as given — None, "alice@A,bob@B", or a list of those strings
+        or of (station, agent) pairs — checked and stored as pairs. Every
+        agent must exist now: a typo fails here, not as a silent refusal on
+        the day someone tries to use the link."""
+        if only is None:
+            return None
+        items = only.split(",") if isinstance(only, str) else list(only)
+        items = [i.strip() if isinstance(i, str) else i for i in items]
+        items = [i for i in items if i]
+        if not items:
+            raise ValueError("only names nobody — leave it out to let everyone "
+                             "use the link")
+        out: list[list[str]] = []
+        for item in items:
+            if isinstance(item, str):
+                if "@" not in item:
+                    raise ValueError(f"{item!r}: write it as name@station")
+                aid, ref = item.rsplit("@", 1)
+            else:
+                ref, aid = item
+            st = STATIONS.get(ref)
+            if not st or st["station_id"] not in (a["station_id"],
+                                                  b["station_id"]):
+                raise ValueError(f"{item!r}: the station must be "
+                                 f"{a['name']} or {b['name']}")
+            aid = normalize_agent_id(aid)
+            if not CONN.execute(
+                "SELECT 1 FROM agents WHERE station_id = %s AND agent_id = %s",
+                (st["station_id"], aid),
+            ).fetchone():
+                raise KeyError(f"agent {aid!r} not found in {st['name']}")
+            pair = [st["station_id"], aid]
+            if pair not in out:
+                out.append(pair)
+        return out
+
+    @staticmethod
+    def names(only: list[list[str]] | None, names: dict[str, str]) -> list[str] | None:
+        """[station_id, agent] pairs as the "agent@station" an operator reads."""
+        if only is None:
+            return None
+        return [f"{aid}@{names.get(sid, sid)}" for sid, aid in only]
+
+    def link(self, x: str, y: str, only=None) -> dict:
+        """Link two stations, or replace the `only` of an existing link."""
+        a, b = self._station(x), self._station(y)
+        if a["station_id"] == b["station_id"]:
+            raise ValueError("a station cannot be linked to itself")
+        pairs = self._parse_only(only, a, b)
+        sa, sb = self._pair(a["station_id"], b["station_id"])
+        with CONN:
+            CONN.execute(
+                "INSERT INTO station_links (station_a, station_b, only_agents,"
+                " created_at) VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE"
+                " only_agents = VALUES(only_agents)",
+                (sa, sb, None if pairs is None else json.dumps(pairs),
+                 time.time()),
+            )
+        shown = self.names(pairs, {a["station_id"]: a["name"],
+                                   b["station_id"]: b["name"]})
+        who = "everyone" if shown is None else "only " + ", ".join(shown)
+        for st in (a, b):
+            log(f"link {a['name']} <-> {b['name']}: {who}",
+                event="link.add", station=st["name"])
+        return {"stations": [a["name"], b["name"]], "only": shown}
+
+    def unlink(self, x: str, y: str) -> int:
+        a, b = self._station(x), self._station(y)
+        sa, sb = self._pair(a["station_id"], b["station_id"])
+        with CONN:
+            n = CONN.execute(
+                "DELETE FROM station_links WHERE station_a = %s "
+                "AND station_b = %s", (sa, sb),
+            ).rowcount
+        if n:
+            for st in (a, b):
+                log(f"link {a['name']} <-> {b['name']} removed",
+                    event="link.rm", station=st["name"])
+        return n
+
+    def between(self, s1: str, s2: str) -> dict | None:
+        """The link joining two station ids, or None."""
+        sa, sb = self._pair(s1, s2)
+        row = CONN.execute(
+            "SELECT * FROM station_links WHERE station_a = %s "
+            "AND station_b = %s", (sa, sb),
+        ).fetchone()
+        if not row:
+            return None
+        return {"station_a": sa, "station_b": sb,
+                "only": self._load(row["only_agents"])}
+
+    @staticmethod
+    def allows(link: dict, station_id: str, agent_id: str) -> bool:
+        only = link.get("only")
+        return only is None or [station_id, agent_id] in only
+
+    def of(self, id_or_name: str) -> list[dict]:
+        """Every link of one station: the other side, and who may use it."""
+        st = self._station(id_or_name)
+        sid = st["station_id"]
+        names = {s["station_id"]: s["name"] for s in STATIONS.list()}
+        out = []
+        for row in CONN.execute(
+            "SELECT * FROM station_links WHERE station_a = %s "
+            "OR station_b = %s", (sid, sid),
+        ).fetchall():
+            other = row["station_b"] if row["station_a"] == sid \
+                else row["station_a"]
+            only = self._load(row["only_agents"])
+            out.append({"station_id": other, "name": names.get(other, other),
+                        "only": only, "only_names": self.names(only, names)})
+        out.sort(key=lambda r: r["name"])
+        return out
+
+    def forget_agent(self, station_id: str, agent_id: str,
+                     new_id: str | None = None) -> None:
+        """Keep `only` lists true when an agent changes: renamed (`new_id`)
+        its entries follow it; removed or moved away (None) they are dropped.
+        Runs inside the caller's `with CONN:`, so it commits or rolls back
+        with the change it follows."""
+        for row in CONN.execute(
+            "SELECT * FROM station_links WHERE (station_a = %s "
+            "OR station_b = %s) AND only_agents IS NOT NULL",
+            (station_id, station_id),
+        ).fetchall():
+            only = self._load(row["only_agents"])
+            if [station_id, agent_id] not in only:
+                continue
+            nxt = []
+            for p in only:
+                if p == [station_id, agent_id]:
+                    if new_id and [station_id, new_id] not in nxt:
+                        nxt.append([station_id, new_id])
+                elif p not in nxt:
+                    nxt.append(p)
+            CONN.execute(
+                "UPDATE station_links SET only_agents = %s "
+                "WHERE station_a = %s AND station_b = %s",
+                (json.dumps(nxt), row["station_a"], row["station_b"]),
+            )
+
+    def linked_ids(self, station_id: str) -> list[str]:
+        return [r["station_b"] if r["station_a"] == station_id
+                else r["station_a"] for r in CONN.execute(
+                    "SELECT station_a, station_b FROM station_links "
+                    "WHERE station_a = %s OR station_b = %s",
+                    (station_id, station_id)).fetchall()]
+
+
+LINKS = LinkRegistry()
 
 
 class TokenRegistry:
@@ -2963,6 +3182,9 @@ class AgentRegistry:
                 "DELETE FROM stream_cursors WHERE station_id = %s AND agent_id = %s",
                 (old, agent_id),
             )
+            # It no longer lives in `old`, so a link that named it there no
+            # longer can.
+            LINKS.forget_agent(old, agent_id)
         return True
 
     def bind(
@@ -3062,6 +3284,21 @@ class AgentRegistry:
         if agent_id:
             match = [a for a in mine if a["agent_id"] == agent_id]
             here = match[0] if match else None
+        # Where this agent may DM outside its station: each linked station,
+        # whether it may use the link, and whom it reaches there — "everyone"
+        # or the names the link lists. Never the other station's roster.
+        links = []
+        st = STATIONS.get(here["station"]) if here else None
+        for ln in (LINKS.of(st["station_id"]) if st else []):
+            only = ln["only"]
+            links.append({
+                "station": ln["name"],
+                "send_as": "name@" + ln["name"],
+                "may_use": LINKS.allows(ln, st["station_id"], agent_id),
+                "reach": "everyone" if only is None else [
+                    f"{aid}@{ln['name']}" for sid, aid in only
+                    if sid == ln["station_id"]],
+            })
         return {
             "user": auth.get("user") or "",
             "stations": granted,
@@ -3069,6 +3306,7 @@ class AgentRegistry:
             "registered": here is not None,
             "this_agent": here,
             "agents": mine,
+            "links": links,
             # Why the broker will not act as `agent` for this request, verbatim
             # — "belongs to another client", "bound to another token" — or
             # None. A client puts this first in its status, because nothing
@@ -3257,6 +3495,17 @@ class AgentRegistry:
                         (new_id, sid, agent_id),
                     )
                 _rewrite_member_lists(sid, agent_id, new_id)
+                # Across links: its entries in `only`, and the "old@A" it
+                # signed DMs with in the linked stations — a reply to the old
+                # string would now be refused as nobody.
+                LINKS.forget_agent(sid, agent_id, new_id)
+                for other in LINKS.linked_ids(sid):
+                    CONN.execute(
+                        "UPDATE dms SET sender = %s "
+                        "WHERE station_id = %s AND sender = %s",
+                        (f"{new_id}@{st['name']}", other,
+                         f"{agent_id}@{st['name']}"),
+                    )
         return {"agent_id": new_id, "was": agent_id,
                 "station_id": sid, "renamed": renaming}
 
@@ -3332,6 +3581,7 @@ class AgentRegistry:
                     (sid, agent_id),
                 )
                 _rewrite_member_lists(sid, agent_id, None)
+                LINKS.forget_agent(sid, agent_id)
                 # transcripts.sender and dms.sender are deliberately untouched:
                 # they record what was said, and deleting an agent does not
                 # unsay it. message_addressees is left for the same reason —
@@ -4479,8 +4729,16 @@ class DirectRegistry:
         self, station_id: str, sender: str, recipient: str, text: str,
         expires_in: str | float | None = None,
     ) -> dict:
-        """Deliver a DM. Sender and recipient must both live in this station;
-        sender == recipient is allowed (self-test)."""
+        """Deliver a DM. The sender must live in this station; the recipient
+        too, unless it is "name@station" for a station LINKED to this one
+        (LinkRegistry). sender == recipient is allowed (self-test).
+
+        A recipient that exists here is local, whatever it contains — so an
+        agent whose name has an "@" in it keeps receiving exactly as before.
+        Across a link the DM is written into the OTHER station, signed
+        "sender@<this station>", and from then on it is an ordinary DM there:
+        delivered, acked, expired and collected by that station alone. Nothing
+        is kept here."""
         sender = normalize_agent_id(sender)
         recipient = normalize_agent_id(recipient)
         if not sender:
@@ -4491,42 +4749,85 @@ class DirectRegistry:
             raise ValueError("empty message")
         check_size(text, MAX_MESSAGE_SIZE, "this DM")
 
-        def _check() -> None:
-            for who in {sender, recipient}:
-                row = CONN.execute(
-                    "SELECT 1 FROM agents WHERE station_id = %s AND agent_id = %s",
-                    (station_id, who),
-                ).fetchone()
-                if not row:
-                    raise KeyError(
-                        f"agent {who!r} is not in this station"
-                    )
+        def _here(sid: str, who: str) -> bool:
+            return CONN.execute(
+                "SELECT 1 FROM agents WHERE station_id = %s AND agent_id = %s",
+                (sid, who),
+            ).fetchone() is not None
 
-        await _db(_check)
+        def _route() -> dict:
+            """Where this DM is written, signed by whom, for whom."""
+            if not _here(station_id, sender):
+                raise KeyError(f"agent {sender!r} is not in this station")
+            if _here(station_id, recipient) or "@" not in recipient:
+                if not _here(station_id, recipient):
+                    raise KeyError(f"agent {recipient!r} is not in this station")
+                return {"station_id": station_id, "sender": sender,
+                        "recipient": recipient}
+            name, ref = recipient.rsplit("@", 1)
+            name = normalize_agent_id(name)
+            if not name:
+                raise ValueError("no recipient given before the @")
+            own = STATIONS.get(station_id) or {"station_id": station_id,
+                                               "name": station_id}
+            target = STATIONS.get(ref)
+            if target and target["station_id"] == station_id:
+                if not _here(station_id, name):
+                    raise KeyError(f"agent {name!r} is not in this station")
+                return {"station_id": station_id, "sender": sender,
+                        "recipient": name}
+            link = LINKS.between(station_id, target["station_id"]) \
+                if target else None
+            if not link:
+                # The same words whether or not that station exists: an
+                # unlinked station is none of this agent's business.
+                raise KeyError(
+                    f"no link from {own['name']} to {ref}: a DM leaves its "
+                    f"station only when an operator links the two")
+            if not LINKS.allows(link, station_id, sender):
+                raise KeyError(f"you are not on the link to {target['name']}")
+            if not _here(target["station_id"], name) or not LINKS.allows(
+                    link, target["station_id"], name):
+                raise KeyError(
+                    f"agent {name!r} is not reachable in {target['name']}")
+            return {"station_id": target["station_id"],
+                    "sender": f"{sender}@{own['name']}", "recipient": name,
+                    "from": own["name"], "to": target["name"]}
+
+        route = await _db(_route)
+        dest = route["station_id"]
         now = time.time()
         entry = {
             "id": str(uuid.uuid4()), "ts": now,
             "sender": sender, "recipient": recipient, "text": text,
             "expires_at": _expiry_from(expires_in, now),
         }
+        if dest != station_id:
+            entry["station"] = route["to"]
 
         def _persist() -> None:
             CONN.execute(
                 "INSERT INTO dms (id, station_id, sender, recipient, text,"
                 " ts, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (entry["id"], station_id, sender, recipient, text,
+                (entry["id"], dest, route["sender"], route["recipient"], text,
                  entry["ts"], entry["expires_at"]),
             )
             # Audience of a DM is exactly one agent — including when that is
             # the sender itself, which is what makes ping_me a real end-to-end
             # test rather than a no-op.
             _write_receipts(
-                station_id, entry["id"], "dm", entry["ts"], [recipient],
+                dest, entry["id"], "dm", entry["ts"], [route["recipient"]],
                 entry["expires_at"],
             )
 
         await _db(_persist)
-        _wake_station(station_id)
+        _wake_station(dest)
+        if dest != station_id:
+            # Who and where, never what: the text is the two parties' alone.
+            for st in (route["from"], route["to"]):
+                log(f"dm {route['sender']} -> {route['recipient']}@"
+                    f"{route['to']} over the link", event="link.dm",
+                    station=st, actor=sender)
         return {"dm": entry, "delivered_to": recipient}
 
     async def inbox(
@@ -4968,11 +5269,13 @@ async def ack_all() -> dict:
 
 @mcp.tool()
 async def send_dm(to: str, message: str, expires_in: str | None = None) -> dict:
-    """Send a private message to one agent in your station.
+    """Send a private message to one agent in your station — or in a linked one.
 
     Unlike post_to_channel this does not go into any channel transcript — only
     the recipient receives it, pushed to their session. `to` is the other
-    agent's id (see list_agents).
+    agent's id (see list_agents), or name@station for an agent in a station
+    linked to yours (my_realm lists the links). A DM from another station
+    arrives signed name@station: reply to exactly that.
 
     `expires_in` is how long this is worth reading — "10m", "2h", "7d", or
     seconds. Leave it alone unless the message has a real shelf life: the
@@ -6831,11 +7134,38 @@ def build_app() -> Starlette:
 
     async def admin_show_station(request: Request) -> JSONResponse:
         try:
-            return JSONResponse(
-                STATIONS.allowed(request.path_params["id_or_name"])
-            )
+            out = STATIONS.allowed(request.path_params["id_or_name"])
+            out["links"] = [
+                {"station": ln["name"], "only": ln["only_names"]}
+                for ln in LINKS.of(out["station_id"])
+            ]
+            return JSONResponse(out)
         except KeyError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
+
+    async def admin_station_links(request: Request) -> JSONResponse:
+        """Link this station with another for DMs (POST, again to change
+        `only`), or unlink them (DELETE). Body: {"station": B, "only":
+        ["alice@A", …] | null}; null or absent = everyone."""
+        station = request.path_params["id_or_name"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        other = (body or {}).get("station")
+        if not other:
+            return JSONResponse({"error": "give 'station': the other station"},
+                                status_code=400)
+        try:
+            if request.method == "DELETE":
+                return JSONResponse(
+                    {"unlinked": LINKS.unlink(station, other)})
+            return JSONResponse(LINKS.link(station, other, body.get("only")),
+                                status_code=201)
+        except KeyError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
 
     async def admin_messages(request: Request) -> JSONResponse:
         """What is in a station, and what is holding it.
@@ -7041,6 +7371,7 @@ def build_app() -> Starlette:
     routes.append(Route("/admin/stations/{id_or_name}", admin_delete_station, methods=["DELETE"]))
     routes.append(Route("/admin/stations/{id_or_name}", admin_show_station, methods=["GET"]))
     routes.append(Route("/admin/stations/{id_or_name}/allow", admin_station_allow, methods=["POST", "DELETE"]))
+    routes.append(Route("/admin/stations/{id_or_name}/links", admin_station_links, methods=["POST", "DELETE"]))
     routes.append(Route("/admin/stations/{id_or_name}/screen", admin_screen_station, methods=["POST"]))
     routes.append(Route("/admin/stations/{id_or_name}/messages", admin_messages, methods=["GET"]))
     routes.append(Route("/admin/stations/{id_or_name}/messages", admin_mark_messages, methods=["POST"]))
@@ -7244,6 +7575,28 @@ def _cli_station(args: argparse.Namespace) -> int:
         print(f"agents:   {len(agents)}")
         for a in agents:
             print(f"  {a['agent_id']}")
+        links = LINKS.of(info["station_id"])
+        print(f"links:    {len(links)}")
+        for ln in links:
+            who = ("everyone" if ln["only_names"] is None
+                   else ", ".join(ln["only_names"]) or "nobody (its agents left)")
+            print(f"  <-> {ln['name']:<20} {who}")
+        return 0
+    if args.station_cmd in ("link", "unlink"):
+        try:
+            if args.station_cmd == "unlink":
+                n = LINKS.unlink(args.id_or_name, args.other)
+                print(f"{args.id_or_name} and {args.other} unlinked" if n
+                      else f"{args.id_or_name} and {args.other} were not linked")
+                return 0 if n else 1
+            out = LINKS.link(args.id_or_name, args.other, args.only)
+        except (KeyError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        a, b = out["stations"]
+        print(f"{a} <-> {b} linked for "
+              + ("everyone" if out["only"] is None
+                 else "only " + ", ".join(out["only"])))
         return 0
     if args.station_cmd == "purge":
         empty = [
@@ -7485,7 +7838,8 @@ class _Tui:
         # operator is looking at, the useful label is what it DOES. A key
         # nobody recognises is a key nobody presses.
         "stations": "n new · g grant token · v revoke grant · o open/close · "
-                    "x delete · e purge empty · s ack all · c collect · ⏎ agents",
+                    "l link stations · x delete · e purge empty · s ack all · "
+                    "c collect · ⏎ agents",
         "tokens":   "n new · g grant into station · v revoke · x delete · "
                     "z purge revoked · c collect",
         # A request is answered with one key, no y/N; new ones appear by
@@ -7554,6 +7908,7 @@ class _Tui:
             for r in self.rows:
                 r["agents"] = len(AGENTS.list_all(r["station_id"]))
                 r["allowed"] = len(STATIONS.allowed(r["station_id"])["tokens"])
+                r["links"] = [ln["name"] for ln in LINKS.of(r["station_id"])]
         elif self.view == "tokens":
             self.rows = TOKENS.list(include_revoked=True)
         elif self.view == "messages":
@@ -7658,7 +8013,9 @@ class _Tui:
         if self.view == "stations":
             access = "*open " if r.get("open") else "closed"
             return (f"{r['name'][:26]:<26} {access:<7} "
-                    f"{r['allowed']:>3} tokens  {r['agents']:>3} agents")
+                    f"{r['allowed']:>3} tokens  {r['agents']:>3} agents"
+                    + (f"  ↔ {', '.join(r['links'])}" if r.get("links")
+                       else ""))
         if self.view == "tokens":
             status = ("revoked" if r.get("revoked_at")
                       else ("used" if r.get("last_used_at") else "fresh"))
@@ -7989,6 +8346,8 @@ class _Tui:
                 self.msg = f"{STATIONS.disallow(row['station_id'], p)} revoked"
         elif ch == "s" and row:
             self.screen_confirm(row["station_id"], None, row["name"])
+        elif ch == "l" and row:
+            self.link_station(row)
         elif ch == "e":
             empty = [
                 s for s in STATIONS.list()
@@ -8003,6 +8362,108 @@ class _Tui:
                 self.msg = f"{len(empty)} purged"
         elif ch in ("\n", "\r") and row:
             self.view, self.msg = "agents", f"station {row['name']}"
+
+    def pick_many(self, title: str, items: list[tuple], chosen=()) -> list | None:
+        """pick() with toggles: space ticks or unticks a row, ⏎ saves, esc
+        cancels (None, nothing changes). Saving with nothing ticked is
+        refused, so an empty list is never made by hand — on a link, empty
+        means nobody, and that is what agents leaving produce, not a choice."""
+        import curses
+        if not items:
+            self.msg = f"nothing to pick for {title}"
+            return None
+        wanted = set(chosen)
+        on = {k for k, _ in items if k in wanted}
+        i, note = 0, ""
+        while True:
+            h, w = self.scr.getmaxyx()
+            self.scr.erase()
+            self.scr.addnstr(0, 0, f" {title} — space tick · ⏎ save · esc cancel",
+                             w - 1, curses.A_BOLD)
+            page = max(1, h - 3)
+            off = self.offset(i, len(items), page)
+            for n, (k, label) in enumerate(items[off:off + page]):
+                box = "☑" if k in on else "☐"
+                self.scr.addnstr(2 + n, 2, f"{box} {label}".ljust(w - 4), w - 4,
+                                 curses.A_REVERSE if off + n == i else 0)
+            foot = note or (f" {len(on)} ticked"
+                            + (f" · {i + 1} of {len(items)}"
+                               if len(items) > page else ""))
+            self.scr.addnstr(h - 1, 0, foot, w - 1)
+            self.scr.refresh()
+            c = self.scr.getch()
+            note = ""
+            if c in (27, ord("q")):
+                return None
+            if c in (curses.KEY_UP, ord("k")):
+                i = max(0, i - 1)
+            elif c in (curses.KEY_DOWN, ord("j")):
+                i = min(len(items) - 1, i + 1)
+            elif c == ord(" "):
+                on ^= {items[i][0]}
+            elif c in (curses.KEY_ENTER, 10, 13):
+                if not on:
+                    note = " tick at least one, or choose everyone"
+                    continue
+                return [k for k, _ in items if k in on]
+
+    def link_station(self, row: dict) -> None:
+        """`l` on a station: link it with another for DMs, change who may use
+        the link, or unlink. A station picker, then an agent picker —
+        nothing is typed."""
+        here = row["name"]
+        stations = {s["station_id"]: s for s in STATIONS.list()}
+        links = {ln["station_id"]: ln for ln in LINKS.of(row["station_id"])}
+        items = []
+        for sid, s in stations.items():
+            if sid == row["station_id"]:
+                continue
+            ln = links.get(sid)
+            tag = ("" if ln is None
+                   else "✓ linked · everyone" if ln["only"] is None
+                   else f"✓ linked · {len(ln['only'])} agent(s)" if ln["only"]
+                   else "✓ linked · nobody (its agents left)")
+            items.append((sid, f"{s['name'][:26]:<26} {tag}"))
+        other = self.pick(f"link {here} with which station?", items)
+        if not other:
+            return
+        there = stations[other]["name"]
+        ln = links.get(other)
+        if ln is None:
+            how = self.pick(f"{here} ↔ {there}: who may use the link?",
+                            [("everyone", "everyone in both stations"),
+                             ("choose", "choose agents…")])
+        else:
+            how = self.pick(f"{here} ↔ {there}",
+                            [("choose", "change agents…"),
+                             ("everyone", "everyone in both stations"),
+                             ("unlink", "unlink")])
+        if how == "unlink":
+            if self.confirm(f"unlink {here} and {there}? "
+                            f"delivered messages stay"):
+                LINKS.unlink(row["station_id"], other)
+                self.msg = f"{here} and {there} unlinked"
+            return
+        if how == "everyone":
+            only = None
+        elif how == "choose":
+            agents = [
+                ((s["station_id"], a["agent_id"]),
+                 f"{a['agent_id'][:40]:<40} {s['name']}")
+                for s in (row, stations[other])
+                for a in AGENTS.list_all(s["station_id"])
+            ]
+            only = self.pick_many(
+                f"{here} ↔ {there}: who may use the link?", agents,
+                [tuple(p) for p in (ln or {}).get("only") or []])
+            if only is None:
+                return
+        else:
+            return
+        out = LINKS.link(row["station_id"], other, only)
+        self.msg = (f"{here} ↔ {there} linked for everyone"
+                    if out["only"] is None
+                    else f"{here} ↔ {there}: only {', '.join(out['only'])}")
 
     def act_messages(self, ch: str, row: dict | None) -> None:
         if ch == "s":
@@ -8624,6 +9085,7 @@ EXPECTED_TABLES = (
     "broadcasts", "bids", "dms", "md_files", "message_receipts",
     "message_addressees",
     "stream_cursors", "agent_proposals", "agent_transfer_denials", "logs",
+    "station_links",
 )
 
 
@@ -9018,6 +9480,8 @@ MIGRATION_TABLES = (
     # which both the copy and the verify tolerate by skipping unknown tables —
     # it is here so backup/restore carries locks rather than dropping them.
     "agent_transfer_denials",
+    # Follows stations, both of its parents; absent from any sqlite source.
+    "station_links",
     # AFTER transcripts, which it references: restore walks this tuple in
     # order, so a row here inserted before its parent would fail the FK.
     "message_addressees",
@@ -9904,6 +10368,21 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="(only mode supported; kept explicit)")
     st_purge.add_argument("--yes", action="store_true", default=False)
     st_purge.set_defaults(func=_cli_station)
+    st_link = st_sub.add_parser(
+        "link", help="join two stations for DMs, both ways "
+                     "(send_dm to name@station); again to change --only"
+    )
+    st_link.add_argument("id_or_name")
+    st_link.add_argument("other")
+    st_link.add_argument(
+        "--only", default=None,
+        help="only these agents may use it, either side: alice@A,bob@B "
+             "(default: everyone)")
+    st_link.set_defaults(func=_cli_station)
+    st_unlink = st_sub.add_parser("unlink", help="remove a station link")
+    st_unlink.add_argument("id_or_name")
+    st_unlink.add_argument("other")
+    st_unlink.set_defaults(func=_cli_station)
 
     tk = sub.add_parser("token", help="manage user tokens")
     tk_sub = tk.add_subparsers(dest="token_cmd", required=True)

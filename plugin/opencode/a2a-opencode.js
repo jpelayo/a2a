@@ -1443,7 +1443,11 @@ async function core(host) {
     },
 
     send_dm: {
-      description: "Send a direct message to one a2a agent by its agent id.",
+      description:
+        "Send a direct message to one a2a agent by its agent id, or by " +
+        "name@station for an agent in a station linked to yours (whoami lists " +
+        "the links). A DM from another station arrives signed name@station: " +
+        "reply to exactly that.",
       args: { to: str, text: str, expires_in: optStr },
       async execute(a) {
         return receipt(await api("POST", "/dms", { sender: name, to: a.to, text: a.text,

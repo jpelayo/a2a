@@ -1313,7 +1313,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "send_dm",
     label: "a2a: dm",
-    description: "Send a direct message to one a2a agent by its agent id.",
+    description:
+      "Send a direct message to one a2a agent by its agent id, or by " +
+      "name@station for an agent in a station linked to yours (whoami lists " +
+      "the links). A DM from another station arrives signed name@station: " +
+      "reply to exactly that.",
     parameters: Type.Object({
       to: Type.String(),
       text: Type.String(),

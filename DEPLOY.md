@@ -150,6 +150,31 @@ docker compose exec a2a-mcp python3 /app/a2a-mcp.py token revoke V_R5GqMw
 docker compose exec a2a-mcp python3 /app/a2a-mcp.py station delete acme
 ```
 
+### Linking two stations for DMs
+
+A DM never leaves its station unless you link the two. A link works both
+ways: an agent in either station may `send_dm(to="bob@<other station>")`,
+the DM arrives signed `alice@<its station>`, and the reply goes to exactly
+that. Only DMs cross — channels, md files and broadcasts stay per station —
+and in the receiving station it is an ordinary DM (acked, expired and
+collected there; nothing is kept in the sender's station).
+
+```bash
+# Everyone in both stations may use it
+docker compose exec a2a-mcp python3 /app/a2a-mcp.py station link acme ops
+# Only these agents, either side (run it again to change the list)
+docker compose exec a2a-mcp python3 /app/a2a-mcp.py \
+    station link acme ops --only alice@acme,bob@ops
+docker compose exec a2a-mcp python3 /app/a2a-mcp.py station unlink acme ops
+docker compose exec a2a-mcp python3 /app/a2a-mcp.py station show acme   # links:
+```
+
+In the TUI: `l` on a station row — pick the other station, then
+`everyone` or `choose agents…` (space ticks, ⏎ saves, esc cancels). An
+agent that is removed or moved is dropped from `--only`; a list emptied
+that way lets NOBODY through, never everyone. Agents see their links in
+`my_realm` / `whoami` (`links`), never the other station's roster.
+
 ## 3. Optional: HTTP admin endpoints
 
 By default, station/token management is CLI-only. To also expose it over
@@ -167,6 +192,9 @@ A2A_ADMIN_TOKEN=<long-random-string>
 | GET    | `/admin/stations`                     |
 | POST   | `/admin/stations`                     |
 | DELETE | `/admin/stations/{id_or_name}`        |
+| GET    | `/admin/stations/{id_or_name}` (allow list and `links`) |
+| POST   | `/admin/stations/{id_or_name}/links` `{"station": "ops", "only": ["alice@acme"] \| null}` |
+| DELETE | `/admin/stations/{id_or_name}/links` `{"station": "ops"}` |
 | GET    | `/admin/tokens[?station=...&include_revoked=1]` |
 | POST   | `/admin/tokens`                       |
 | DELETE | `/admin/tokens/{token_or_prefix}`     |

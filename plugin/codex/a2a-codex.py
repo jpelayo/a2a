@@ -1456,7 +1456,10 @@ TOOLS = [
                                f"/messages{_q(limit=a.get('limit'))}")),
 
     ("send_dm",
-     "Send a direct message to one a2a agent by its agent id.",
+     "Send a direct message to one a2a agent by its agent id, or by "
+     "name@station for an agent in a station linked to yours (whoami lists "
+     "the links). A DM from another station arrives signed name@station: "
+     "reply to exactly that.",
      {"to": STR, "text": STR, "expires_in": OPT_STR}, ["to", "text"],
      lambda a: _confirm(api_text("POST", "/dms", {
          "sender": NAME, "to": a["to"], "text": a.get("text") or "",

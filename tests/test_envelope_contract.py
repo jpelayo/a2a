@@ -95,7 +95,7 @@ def codex_envelopes() -> list[str]:
     return [mod.envelope(MSG), mod.envelope(ROOM)]
 
 
-def node_envelopes(path: Path) -> list[str]:
+def node_envelopes(path: Path, msgs: tuple | None = None) -> list[str]:
     """Both envelopes from a JS/TS client's REAL envelope().
 
     The builders are module-private, so the function's source is lifted out
@@ -121,10 +121,10 @@ def node_envelopes(path: Path) -> list[str]:
         '.replace(/</g, "&lt;").replace(/>/g, "&gt;")'
         '.replace(/"/g, "&quot;");\n'
     )
+    calls = ", ".join(f"envelope({json.dumps(m)})" for m in (msgs or (MSG, ROOM)))
     driver = (
         f'{prelude}{body}\n'
-        f'console.log("@@" + JSON.stringify(['
-        f'envelope({json.dumps(MSG)}), envelope({json.dumps(ROOM)})]));\n'
+        f'console.log("@@" + JSON.stringify([{calls}]));\n'
     )
     tmp = Path(tempfile.mkdtemp(prefix="a2a-env-")) / f"drive{path.suffix}"
     tmp.write_text(driver)
@@ -212,6 +212,28 @@ def main() -> int:
           "— that id is what acks it",
           hx.ENVELOPE_ID.findall(h_named) == ["m1"],
           str(hx.ENVELOPE_ID.findall(h_named)))
+
+    # --- a DM over a station link: the sender is "name@station" --------------
+    # The broker signs a DM that crossed a link as "alice@A", and the reply is
+    # send_dm(to=<that sender>) — so every client must hand the string over
+    # exactly as it came, with nothing parsing the "@".
+    LINKED = dict(MSG, kind="dm", channel="dm", id="m9", sender="alice@A",
+                  audience=["bob"], addressed=["bob"])
+    content, meta = claude_notify(LINKED)
+    check("link: claude passes the sender through verbatim",
+          meta.get("sender") == "alice@A"
+          and content == "‹alice@A› your turn", f"{content!r} {meta}")
+    spec = importlib.util.spec_from_file_location("a2a_codex_l", CODEX)
+    cl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cl)
+    rendered = {"codex": cl.envelope(LINKED), "hermes": hx.envelope(LINKED),
+                "opencode": node_envelopes(OPENCODE, (LINKED,))[0],
+                "pi": node_envelopes(PI, (LINKED,))[0]}
+    for label, env in rendered.items():
+        check(f"link: {label} renders sender=\"alice@A\" untouched",
+              'sender="alice@A"' in env and 'channel="dm"' in env, env)
+    check("link: all four render the linked DM byte-identically",
+          len(set(rendered.values())) == 1, str(rendered))
 
     # --- posting returns a receipt, not the message back ---------------------
     # The broker echoes the whole post. Handed to a model that is a copy of the
