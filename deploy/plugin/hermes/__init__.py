@@ -370,10 +370,11 @@ class _Hold:
 
 
 def _dashboard_server():
-    """Hermes's session server when THIS process is a dashboard (`hermes
-    dashboard` / `hermes serve`: hermes_cli.web_server_app is loaded and the
-    session handlers are installed), else None. Not `hermes --tui`, the
-    gateway, cron or the CLI. Read from sys.modules only, never imported."""
+    """Hermes's session server where a dashboard's modules are loaded
+    (hermes_cli.web_server_app, and the session handlers installed), else
+    None. Read from sys.modules only, never imported. Not proof by itself: a
+    messaging gateway that mounts the dashboard has them too, and only the
+    desktop injector (_hold_wanted) says the app's conversations live here."""
     if "hermes_cli.web_server_app" not in sys.modules:
         return None
     srv = sys.modules.get("tui_gateway.server")
@@ -420,6 +421,28 @@ def _held_record(srv, transport):
         if _carries(record, transport):
             return sid, record
     return None, None
+
+
+# Hermes imports a dashboard plugin's api file under this name
+# (web_server_dashboard.py: f"hermes_dashboard_plugin_{plugin['name']}").
+WAKER_MODULE = "hermes_dashboard_plugin_a2a"
+
+
+def _waker_status():
+    """A copy of the waker's last pass (dashboard/api.py STATUS), when it
+    runs in THIS process; None elsewhere. Read only."""
+    status = getattr(sys.modules.get(WAKER_MODULE), "STATUS", None)
+    if not isinstance(status, dict):
+        return None
+    out = {}
+    for k, v in list(status.items()):
+        if isinstance(v, (int, float)) and k.endswith(("_at", "started",
+                                                       "_pass")) and v:
+            v = iso_utc(v)
+        elif isinstance(v, (list, dict)):
+            v = type(v)(v)
+        out[k] = v
+    return out
 
 
 # --- the doctor ------------------------------------------------------------------
@@ -1080,12 +1103,17 @@ class A2AHermes:
             return
         ctx.register_hook("pre_llm_call", self.pre_llm_call)
         ctx.on_unload(self.stop)
-        threads = [(self._pump_guard, "pump"), (self._ack_loop, "ack")]
-        # The hold only ever runs in a dashboard, which imports
-        # hermes_cli.web_server_app before any profile's plugins load there.
-        # The CLI, the gateway, a TUI and cron get no extra thread.
-        if "hermes_cli.web_server_app" in sys.modules:
-            threads.append((self._hold_loop, "hold"))
+        # The hold thread starts in EVERY process and decides on each tick:
+        # it can tell a dashboard only once the dashboard is up. `hermes
+        # serve` loads the launch profile's plugins BEFORE it imports its web
+        # server (hermes_cli/main.py: _dashboard_prepare_runtime runs
+        # discover_plugins, then `from hermes_cli.web_server import
+        # start_server`), so a check made here said "not a dashboard" there
+        # and the default bot never held its conversation. Elsewhere — the
+        # gateway, the CLI, cron — it never gets past one sys.modules lookup
+        # per GATE_POLL_S: no desktop injector exists there.
+        threads = [(self._pump_guard, "pump"), (self._ack_loop, "ack"),
+                   (self._hold_loop, "hold")]
         for target, label in threads:
             t = threading.Thread(target=self._home_ctx.copy().run,
                                  args=(target,), daemon=True,
@@ -2552,6 +2580,8 @@ class A2AHermes:
                     "error": self.hold["error"],
                     "frames": self._holdT.frames if self._holdT else 0,
                     "dashboard": _dashboard_server() is not None,
+                    # The dashboard part's last pass, in this process.
+                    "waker": _waker_status(),
                 },
                 "chat": self._chat_label(self.route) if self.route else None,
             },

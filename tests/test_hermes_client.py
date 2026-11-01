@@ -1804,9 +1804,69 @@ def hold() -> None:
     app keeps a bot's loaded only while it shows or uses that bot."""
     try:
         _hold()
+        _hold_late()
         _hold_elsewhere()
     finally:
         _no_dashboard()
+
+
+def _hold_late() -> None:
+    """`hermes serve` loads the launch profile's plugins BEFORE it imports its
+    web server (hermes_cli/main.py: _dashboard_prepare_runtime runs
+    discover_plugins, then `from hermes_cli.web_server import start_server`),
+    and the desktop injector comes later still (the dashboard's lifespan). So
+    the default bot's plugin is born in a process that does not look like a
+    dashboard yet; it must hold its conversation once it does. A plugin that
+    decided at load never held it — that was a real deploy."""
+    _no_dashboard()
+    fb = FakeBroker()
+    mod = load(fb.url)
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    ctx = Ctx("bot", gateway=False, tui=False, state=dict(DESK_ON))
+    start(mod, ctx, home)
+    inst = ctx_inst(ctx)
+    time.sleep(0.3)
+    check("late: loaded before the dashboard's modules exist, it loads "
+          "nothing yet", inst._holdT is None and not inst.hold["held"],
+          str(inst.hold))
+    srv = dashboard(home)          # web_server imported, session server up
+    ctx.live_keys = _TableKeys(srv)
+    time.sleep(0.3)
+    check("late: the modules are there but the desktop injector is not "
+          "(startup not finished): still nothing", srv.resumes == [],
+          str(srv.resumes))
+    ctx._manager.has_tui_message_injector = True     # the lifespan ran
+    check("late: once the dashboard has finished starting, it holds its "
+          "conversation — the plugin did not decide at load",
+          until(lambda: len(srv.resumes) == 1 and inst.hold["held"]),
+          f"{srv.resumes} {inst.hold}")
+    st = ctx.call("a2a_channel_status", DESK)
+    check("doctor: push.hold.waker is null where no waker ran",
+          "waker" in st["push"]["hold"]
+          and st["push"]["hold"]["waker"] is None, str(st["push"]["hold"]))
+    waker = types.ModuleType("hermes_dashboard_plugin_a2a")
+    waker.STATUS = {"passes": 1, "woken": ["bot"], "skipped": [],
+                    "errors": {"x": "RuntimeError: y"}, "waited": "ready",
+                    "ready_at": time.time(), "note": None}
+    sys.modules["hermes_dashboard_plugin_a2a"] = waker
+    try:
+        w = ctx.call("a2a_channel_status", DESK)["push"]["hold"]["waker"]
+    finally:
+        sys.modules.pop("hermes_dashboard_plugin_a2a", None)
+    check("doctor: push.hold.waker reports the waker's last pass in this "
+          "process — its errors included, its times as UTC",
+          isinstance(w, dict) and w["woken"] == ["bot"]
+          and w["errors"] == {"x": "RuntimeError: y"}
+          and str(w["ready_at"]).endswith("Z") and w["waited"] == "ready",
+          str(w))
+    held = inst._holdT
+    st = ctx.call("a2a_channel_status", DESK, {"fix": True})
+    check("doctor: fix=true leaves a healthy hold exactly as it was",
+          inst._holdT is held and inst.hold["held"] and len(srv.resumes) == 1
+          and not st.get("fixed"), f"{st.get('fixed')} {srv.resumes}")
+    stop(ctx)
+    fb.close()
+    _no_dashboard()
 
 
 def _hold() -> None:

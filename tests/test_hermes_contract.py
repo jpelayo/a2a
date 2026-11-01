@@ -27,8 +27,104 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CLIENT = HERE.parent / "deploy" / "plugin" / "hermes" / "__init__.py"
 MANIFEST = HERE.parent / "deploy" / "plugin" / "hermes" / "plugin.yaml"
+API = HERE.parent / "deploy" / "plugin" / "hermes" / "dashboard" / "api.py"
 
 fails: list[str] = []
+
+
+def real_scope_check(src: Path) -> None:
+    """Run Hermes's REAL tui_gateway/method_ctx.py and model_switch.py — not
+    a reading of them — to show what the waker must call. Only what their
+    function bodies import is stubbed (agent.secret_scope,
+    tui_gateway.launch_profile_policy, tools.terminal_scope), and the fake
+    server supplies the server globals those bodies name. The waker once
+    called the module's copy, and crashed on every profile in a real deploy.
+    """
+    import contextlib
+    import importlib.util
+    import types
+    saved = dict(sys.modules)
+    calls = []
+    try:
+        pkg = types.ModuleType("tui_gateway")
+        pkg.__path__ = [str(src / "tui_gateway")]
+        stub = {
+            "tui_gateway": pkg,
+            "agent": types.ModuleType("agent"),
+            "agent.secret_scope": types.ModuleType("agent.secret_scope"),
+            "tui_gateway.launch_profile_policy":
+                types.ModuleType("tui_gateway.launch_profile_policy"),
+            "tools": types.ModuleType("tools"),
+            "tools.terminal_scope": types.ModuleType("tools.terminal_scope"),
+        }
+        stub["agent.secret_scope"].is_multiplex_active = lambda: False
+        lpp = stub["tui_gateway.launch_profile_policy"]
+        lpp.launch_secret_scope = lambda home: ("secrets-of", str(home))
+        lpp.launch_terminal_env = lambda: {}
+        stub["tools.terminal_scope"].reset_terminal_scope = (
+            lambda token: calls.append(("reset_terminal", token)))
+        sys.modules.update(stub)
+
+        def load(name):
+            spec = importlib.util.spec_from_file_location(
+                f"tui_gateway.{name}", src / "tui_gateway" / f"{name}.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+            return mod
+        load("method_ctx")
+        ms = load("model_switch")
+
+        err = None
+        try:
+            with ms._session_profile_runtime_scope({"profile_home": None}):
+                pass
+        except NameError as e:
+            err = str(e)
+        except Exception as e:      # noqa: BLE001 — any other is a FAIL below
+            err = f"{type(e).__name__}: {e}"
+        check("REAL model_switch: its own _session_profile_runtime_scope "
+              "raises NameError on _TurnScopes — what crashed the waker",
+              err is not None and "_TurnScopes" in err, str(err))
+
+        class _TurnScopes:
+            def __init__(self):
+                self.home = self.secret = self.terminal = None
+
+        server = types.ModuleType("tui_gateway.server")
+        server.__dict__.update(
+            _TurnScopes=_TurnScopes, Path=Path,
+            _launch_home=lambda: Path("/launch"),
+            set_secret_scope=lambda s, **kw: calls.append(("secret", s)) or "T",
+            reset_secret_scope=lambda t: calls.append(("reset_secret", t)),
+            set_hermes_home_override=lambda h: calls.append(("home", h)) or "H",
+            reset_hermes_home_override=lambda t: calls.append(("reset_home", t)),
+            register_method=lambda name, fn: None,
+            _profile_scoped=lambda fn: fn,
+            logger=__import__("logging").getLogger("fake-server"))
+        ms.register(server)
+        scope = getattr(server, "_session_profile_runtime_scope", None)
+        ran = False
+        try:
+            with scope({"profile_home": None}):
+                ran = True
+        except Exception as e:      # noqa: BLE001
+            calls.append(("raised", repr(e)))
+        check("REAL bind_module: the SERVER's copy runs, on the server's "
+              "globals — the one the waker enters",
+              ran and ("secret", ("secrets-of", "/launch")) in calls
+              and ("reset_secret", "T") in calls, str(calls))
+        check("REAL bind_module: the server's copy is a context manager "
+              "whose function was rebuilt on the server's namespace",
+              getattr(getattr(scope, "__wrapped__", None), "__globals__",
+                      None) is vars(server), repr(scope))
+    except Exception as e:          # noqa: BLE001
+        check("REAL model_switch and method_ctx load from the checkout", False,
+              f"{type(e).__name__}: {e}")
+    finally:
+        for name in set(sys.modules) - set(saved):
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -335,8 +431,64 @@ def main() -> int:
           in text_of("tui_gateway/session_lifecycle.py"), "")
     check("server._profile_home resolves a profile name (None: the launch "
           "home)", "def _profile_home(profile" in srv_text, "")
-    check("a dashboard is the process with hermes_cli.web_server_app",
+    check("the dashboard's modules are hermes_cli.web_server_app",
           (src / "hermes_cli" / "web_server_app.py").is_file(), "")
+
+    # When a dashboard is one: the order `hermes serve` starts in. Added
+    # 2026-11-01 after a real deploy: a plugin that decided at load never
+    # held the default bot's conversation, and a waker that ran at import
+    # would have frozen the launch profile's environment before Hermes did.
+    def body(text, name, n=6000):
+        part = (text.split(f"def {name}(", 1) + [""])[1]
+        return part.split("\ndef ", 1)[0][:n]
+    main_text = text_of("hermes_cli/main.py")
+    prep = body(main_text, "_dashboard_prepare_runtime")
+    cmd = body(main_text, "cmd_dashboard")
+    check("hermes serve loads the launch profile's plugins in "
+          "_dashboard_prepare_runtime (discover_plugins)…",
+          "discover_plugins()" in prep, prep[:200])
+    check("…BEFORE it imports its web server — so a plugin cannot tell a "
+          "dashboard at load, and its hold thread must decide later",
+          0 <= cmd.find("_dashboard_prepare_runtime(")
+          < cmd.find("from hermes_cli.web_server import start_server"),
+          cmd[:400])
+    ws = text_of("hermes_cli/web_server.py")
+    start = body(ws, "start_server", 20000)
+    check("start_server makes the multi-profile decision BEFORE the server "
+          "starts (and with it the lifespan that installs the injector)",
+          0 <= start.find("activate_multi_profile_hosting_eagerly()")
+          < start.find("server.startup()"), "")
+    check("the dashboard plugins' api files are imported while web_server is "
+          "imported — long before that decision",
+          re.search(r"^_mount_plugin_api_routes\(\)\s*$", ws, re.M)
+          is not None, "")
+    wsa = text_of("hermes_cli/web_server_app.py")
+    check("the dashboard's own lifespan installs the desktop injector — the "
+          "end of startup the waker waits for",
+          "install_tui_message_injector()"
+          in body(wsa, "standalone_lifespan", 9000), "")
+    check("a gateway that mounts the dashboard runs http_lifespan instead, "
+          "which installs no desktop injector",
+          "http_lifespan if getattr(app.state, \"gateway_runner\", None) is "
+          "not None else standalone_lifespan" in wsa
+          and "install_tui_message_injector" not in body(wsa, "http_lifespan"),
+          "")
+    for prop in ("has_tui_message_injector", "has_gateway_message_injector"):
+        fn = find(mgr, ast.FunctionDef, prop)
+        check(f"PluginManager.{prop} is a property", fn is not None
+              and is_property(fn), "")
+    check("server._profile_home of a second profile turns multi-profile on "
+          "(why the waker must not run before Hermes decides)",
+          "activate_multi_profile_hosting()" in body(srv_text, "_profile_home"),
+          "")
+    lp = text_of("tui_gateway/launch_profile_policy.py")
+    check("and turning it on freezes the launch environment",
+          "capture_launch_env()" in body(lp, "activate_multi_profile_hosting"),
+          "")
+    check("a dashboard plugin's api is imported as "
+          "hermes_dashboard_plugin_<name> — where the doctor reads the "
+          "waker's status", "f\"hermes_dashboard_plugin_{plugin['name']}\""
+          in text_of("hermes_cli/web_server_dashboard.py"), "")
 
     # The waking routine: the plugin's dashboard part, imported by the
     # dashboard at start, wakes every a2a bot. Added 2026-11-01 against main.
@@ -356,10 +508,27 @@ def main() -> int:
         check(f"hermes_cli.profiles.{fn} exists", f"def {fn}(" in pr, "")
     check("discover_plugins(force=False): idempotent, never a reload unless "
           "forced", "def discover_plugins(force: bool = False)" in text, "")
-    check("tui_gateway.model_switch._session_profile_runtime_scope exists — "
-          "the scope a profile-scoped dashboard call runs in",
-          "def _session_profile_runtime_scope(session"
-          in text_of("tui_gateway/model_switch.py"), "")
+    msw = text_of("tui_gateway/model_switch.py")
+    check("_session_profile_runtime_scope is defined in "
+          "tui_gateway/model_switch.py…",
+          "def _session_profile_runtime_scope(session" in msw, "")
+    check("…a split module, copied onto the session server "
+          "(bind_module), which server.py registers",
+          "bind_module(globals(), server" in body(msw, "register")
+          and "_model_switch" in srv_text, "")
+    check("…whose body names server globals it does not define itself "
+          "(_TurnScopes) — so only the SERVER's copy can run",
+          "_TurnScopes()" in msw
+          and re.search(r"^class _TurnScopes\b", msw, re.M) is None, "")
+    real_scope_check(src)
+    api_code = API.read_text().split('"""', 2)[-1]
+    check("the waker never imports tui_gateway.model_switch",
+          re.search(r"from\s+tui_gateway\.model_switch\s+import|"
+                    r"from\s+tui_gateway\s+import\s+model_switch|"
+                    r"import\s+tui_gateway\.model_switch", api_code) is None,
+          "")
+    check("the waker enters the server's _session_profile_runtime_scope",
+          '"_session_profile_runtime_scope"' in api_code, "")
     check("plugins_cmd._get_enabled_set reads plugins.enabled",
           re.search(r"_get_enabled_set\s*=.*\"plugins\",\s*\"enabled\"",
                     text_of("hermes_cli/plugins_cmd.py")) is not None, "")
