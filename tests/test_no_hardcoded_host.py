@@ -99,9 +99,9 @@ def main() -> int:
           not offenders, "\n      " + "\n      ".join(offenders[:12]))
 
     # --- the clients must refuse rather than guess -------------------------
-    oc = (ROOT / "plugin" / "opencode" / "a2a-opencode.js").read_text()
-    pi = (ROOT / "plugin" / "pi" / "index.ts").read_text()
-    cc = (ROOT / "plugin" / "a2a" / "server" / "a2a-channel.py").read_text()
+    oc = (ROOT / "deploy" / "plugin" / "opencode" / "a2a-opencode.js").read_text()
+    pi = (ROOT / "deploy" / "plugin" / "pi" / "index.ts").read_text()
+    cc = (ROOT / "deploy" / "plugin" / "a2a" / "server" / "a2a-channel.py").read_text()
 
     check("OpenCode has no fallback url",
           'process.env.A2A_URL || ""' in oc, "a default crept back in")
@@ -113,7 +113,7 @@ def main() -> int:
           "request against an empty string",
           "if (!URL_BASE || !TOKEN)" in oc, "no guard")
     check("Pi refuses too", "if (!URL_BASE || !TOKEN)" in pi, "no guard")
-    inst = (ROOT / "plugin" / "installer" / "a2a-install.py").read_text()
+    inst = (ROOT / "deploy" / "plugin" / "installer" / "a2a-install.py").read_text()
     check("the installer takes its url from what the broker baked, and only "
           "from that — it is the program that writes every client's url",
           'URL = (A2A_BAKED.get("url") or "").rstrip("/")' in inst
@@ -122,7 +122,7 @@ def main() -> int:
           "if not URL or not VERSION:" in inst, "no guard")
 
     # --- and the broker fills it in ----------------------------------------
-    broker = (ROOT / "a2a_mcp" / "a2a-mcp.py").read_text()
+    broker = (ROOT / "deploy" / "a2a_mcp" / "a2a-mcp.py").read_text()
     check("the broker rewrites .mcp.json as it packs the Claude Code archive "
           "— otherwise the committed placeholder IS what every install uses",
           'rewrite={".mcp.json"' in broker, "archive still packed verbatim")

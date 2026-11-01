@@ -29,9 +29,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 fails: list[str] = []
 

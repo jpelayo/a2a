@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 MCP_JSON = PLUGIN / "a2a" / ".mcp.json"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 

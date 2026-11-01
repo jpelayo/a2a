@@ -27,7 +27,7 @@ from pathlib import Path
 
 import dbharness
 
-BROKER = Path(__file__).resolve().parent.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = Path(__file__).resolve().parent.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 ST, ME, PEER = "default", "receiver", "sender"
 
 fails: list[str] = []

@@ -36,7 +36,7 @@ from pathlib import Path
 
 import dbharness
 
-BROKER = Path(__file__).resolve().parent.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = Path(__file__).resolve().parent.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 # Tools an agent must NOT have. Each one creates or destroys structure.
 FORBIDDEN_TOOLS = ("register_me", "create_agent", "delete_agent",

@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-SOURCE = ROOT / "plugin" / "installer" / "a2a-install.py"
+SOURCE = ROOT / "deploy" / "plugin" / "installer" / "a2a-install.py"
 TOKEN = "a2a_st_TESTsecretTOKENvalue123"
 # A second user's token, in another station: what a harness given its own
 # token (Hermes bots on `bots`, say) is installed with.
@@ -55,7 +55,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 def load_broker():
     os.environ.pop("A2A_PUBLIC_URL", None)   # the url must come from the host
     spec = importlib.util.spec_from_file_location(
-        "broker_installer", ROOT / "a2a_mcp" / "a2a-mcp.py")
+        "broker_installer", ROOT / "deploy" / "a2a_mcp" / "a2a-mcp.py")
     b = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(b)               # importing opens no database
 

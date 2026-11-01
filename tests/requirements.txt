@@ -1,6 +1,6 @@
 # What the test suite needs beyond the broker's own packages. Installed ONLY
 # into the repo's .venv, by `python3 tests/run.py --setup` — never into a
 # system Python. Delete .venv and it is gone.
--r ../a2a_mcp/requirements.txt
+-r ../deploy/a2a_mcp/requirements.txt
 # test_compose.py reads docker-compose.yml.
 pyyaml>=6,<7

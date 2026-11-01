@@ -1,0 +1,9 @@
+{
+  "name": "a2a",
+  "label": "a2a",
+  "description": "Wakes every a2a bot when the Hermes dashboard starts, so each keeps its a2a conversation loaded without being opened.",
+  "icon": "Puzzle",
+  "tab": {"hidden": true},
+  "entry": "dist/index.js",
+  "api": "api.py"
+}

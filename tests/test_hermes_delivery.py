@@ -42,7 +42,7 @@ sys.dont_write_bytecode = True
 import dbharness  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 sys.path.insert(0, str(HERE))
 # The stubbed Hermes (session ContextVars, home) and the fake PluginContext.
 import test_hermes_client as th  # noqa: E402

@@ -45,7 +45,7 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PI = HERE.parent / "plugin" / "pi" / "index.ts"
+PI = HERE.parent / "deploy" / "plugin" / "pi" / "index.ts"
 INSTANCES = 18
 
 fails: list[str] = []

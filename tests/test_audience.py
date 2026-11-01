@@ -36,7 +36,7 @@ from pathlib import Path
 
 import dbharness
 
-BROKER = Path(__file__).resolve().parent.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = Path(__file__).resolve().parent.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 ST = "default"
 SENDER = "poster"
 MEMBERS = ["alice", "bob", "carol"]

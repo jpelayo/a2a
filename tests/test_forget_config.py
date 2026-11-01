@@ -19,7 +19,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 HOOK = PLUGIN / "a2a" / "hooks" / "forget-config.py"
 PLUGIN_ROOT = PLUGIN / "a2a"
 KEY = "a2a@skills-dir"

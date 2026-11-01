@@ -41,8 +41,8 @@ from pathlib import Path
 import dbharness
 
 HERE = Path(__file__).resolve().parent
-PLUGIN = HERE.parent / "plugin"
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+PLUGIN = HERE.parent / "deploy" / "plugin"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 AGENT_A = "restart-a"
 AGENT_B = "restart-b"

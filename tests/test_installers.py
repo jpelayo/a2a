@@ -31,7 +31,7 @@ from pathlib import Path
 import dbharness
 
 ROOT = Path(__file__).resolve().parent.parent
-BROKER = ROOT / "a2a_mcp" / "a2a-mcp.py"
+BROKER = ROOT / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 fails: list[str] = []
 
@@ -221,7 +221,7 @@ def main() -> int:
         # The clients ship no README of their own — there is one, at the
         # repo root — so this asserts against that, which is now the only
         # place the launch line is written down for a user.
-        readme = (ROOT / "README.md").read_text()
+        readme = (ROOT / "deploy" / "README.md").read_text()
         check("codex: the root README teaches the two bare commands that make "
               "a session reachable — `--listen unix://` and `--remote "
               "unix://` — because a plain codex has no socket to deliver into",
@@ -240,10 +240,15 @@ def main() -> int:
                         hmembers[m.name] = f.read()
         except Exception as e:
             check("hermes: extracts as a gzipped tar", False, repr(e))
+        # .DS_Store: Finder's, in a checkout browsed on a Mac; .dockerignore
+        # keeps it out of the image the broker serves from.
+        hserved = sorted(n for n in hmembers if Path(n).name != ".DS_Store")
         check("hermes: exactly plugin.yaml and __init__.py — what Hermes "
-              "loads as a directory plugin, and nothing else",
-              sorted(hmembers) == ["__init__.py", "plugin.yaml"],
-              str(sorted(hmembers)))
+              "loads as a directory plugin — plus its dashboard part "
+              "(manifest, api, a no-op entry), and nothing else",
+              hserved == ["__init__.py", "dashboard/api.py",
+                          "dashboard/dist/index.js", "dashboard/manifest.json",
+                          "plugin.yaml"], str(hserved))
         hx_src = hmembers.get("__init__.py", b"").decode("utf8", "replace")
         check("hermes: credentials are baked by replacing the A2A_BAKED seam",
               "A2A_BAKED = {}" not in hx_src

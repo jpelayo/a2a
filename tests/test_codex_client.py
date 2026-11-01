@@ -46,7 +46,7 @@ import types
 from pathlib import Path
 
 # The clients live in plugin/; the suite lives here, beside it.
-CLIENT = Path(__file__).resolve().parent.parent / "plugin" / "codex" / "a2a-codex.py"
+CLIENT = Path(__file__).resolve().parent.parent / "deploy" / "plugin" / "codex" / "a2a-codex.py"
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 fails: list[str] = []

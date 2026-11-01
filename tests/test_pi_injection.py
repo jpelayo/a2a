@@ -37,7 +37,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 PI = PLUGIN / "pi" / "index.ts"
 
 fails: list[str] = []

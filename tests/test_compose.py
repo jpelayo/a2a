@@ -19,9 +19,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-COMPOSE = ROOT / "docker-compose.yml"
-MYCNF = ROOT / "a2a_mcp" / "my.cnf"
-BROKER = ROOT / "a2a_mcp" / "a2a-mcp.py"
+COMPOSE = ROOT / "deploy" / "docker-compose.yml"
+MYCNF = ROOT / "deploy" / "a2a_mcp" / "my.cnf"
+BROKER = ROOT / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 fails: list[str] = []
 
@@ -105,8 +105,10 @@ def main() -> int:
     for name, svc in services.items():
         for target, source in mounts_of(svc).items():
             if source.startswith("./"):
+                # Relative to the compose file, which lives in deploy/.
                 check(f"{name}: {source} exists in the repo",
-                      (ROOT / source[2:]).exists(), f"{source} is missing")
+                      (COMPOSE.parent / source[2:]).exists(),
+                      f"{source} is missing")
 
     # --- the volumes that must never be auto-created -----------------------
     # Left to create them, compose makes an EMPTY volume whenever a name fails

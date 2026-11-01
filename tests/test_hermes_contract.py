@@ -25,8 +25,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CLIENT = HERE.parent / "plugin" / "hermes" / "__init__.py"
-MANIFEST = HERE.parent / "plugin" / "hermes" / "plugin.yaml"
+CLIENT = HERE.parent / "deploy" / "plugin" / "hermes" / "__init__.py"
+MANIFEST = HERE.parent / "deploy" / "plugin" / "hermes" / "plugin.yaml"
 
 fails: list[str] = []
 
@@ -269,6 +269,100 @@ def main() -> int:
           "listing it in enabled_toolsets, as CLAUDE.md says",
           re.search(r"_DEFAULT_OFF_TOOLSETS[^=]*=\s*\{[^}]*\"a2a\"", tc_text,
                     re.S) is not None, "")
+
+    # The hold: in the dashboard the plugin loads its route conversation
+    # itself — the installed session.resume handler, called in-process as
+    # Hermes's hosted Group Chat does — with its own transport bound, so no
+    # reaper takes it. Added 2026-11-01 against main.
+    def text_of(rel):
+        p = src / rel
+        return p.read_text() if p.is_file() else ""
+    check("server.py keeps the handler table (_methods), the launch home "
+          "(_hermes_home) and the stdio fallback (_stdio_transport)",
+          all(re.search(rf"^{n}\b", srv_text, re.M) for n in
+              ("_methods", "_hermes_home", "_stdio_transport")), "")
+    tr = tree(src, "tui_gateway/transport.py")
+    for fn in ("bind_transport", "reset_transport", "current_transport"):
+        check(f"tui_gateway.transport.{fn} exists — how a caller attaches "
+              f"its own transport", find(tr, ast.FunctionDef, fn) is not None,
+              "")
+    check("a record made with nothing bound falls back to stdout — why the "
+          "plugin always binds its own",
+          "current_transport() or _stdio_transport"
+          in text_of("tui_gateway/session_registry.py"), "")
+    ms = text_of("tui_gateway/methods_session.py")
+    reuse = (ms.split("def _resume_reuse_live_locked", 1) + [""])[1][:1500]
+    check("session.resume on a loaded conversation attaches the CALLER's "
+          "transport beside the clients already on it",
+          "transport=current_transport() or _stdio_transport" in reuse, "")
+    check("session.resume is an installed handler",
+          '@method("session.resume")' in ms, "")
+    cs = text_of("tui_gateway/contracts/sessions.py")
+    resume_params = (cs.split("class SessionResumeParams", 1) + [""])[1][:900]
+    common_text = text_of("tui_gateway/contracts/common.py")
+    sp = (common_text.split("class SessionParams", 1) + [""])[1][:300]
+    for key in ("source", "omit_messages"):
+        check(f"session.resume accepts {key}", f"{key}:" in resume_params, "")
+    for key in ("session_id", "profile"):
+        check(f"session.resume accepts {key} (SessionParams)",
+              "SessionResumeParams(SessionParams)" in cs and f"{key}:" in sp,
+              "")
+    hr = text_of("tui_gateway/hosted_room_server_rpc.py")
+    check("Hermes's own hosted rooms call the installed handlers in-process "
+          "the same way (server._methods[method](rid, params))",
+          "self.server._methods[method]" in hr and '"session.resume"' in hr,
+          "")
+    stx = text_of("tui_gateway/session_transports.py")
+    live = (stx.split("def _transport_is_live_peer", 1) + [""])[1][:600]
+    check("a live peer is anything but stdio, the drop sink, the parked "
+          "sentinel or a dead transport — so the plugin's _Hold counts",
+          all(s in live for s in ("_detached_ws_transport", "_stdio_transport",
+                                  "_DropTransport", "StdioTransport",
+                                  "_transport_is_dead")), live[:300])
+    rp = text_of("tui_gateway/session_reaper.py")
+    dead = (rp.split("def _transport_is_dead", 1) + [""])[1][:1500]
+    check("a transport is dead when its _closed is True — what _Hold.close "
+          "sets", 'getattr(transport, "_closed", None) is True' in dead, "")
+    evict = (rp.split("def _session_is_lru_evictable", 1) + [""])[1][:900]
+    check("no reaper takes a session on a live transport",
+          'return _transport_is_dead(session.get("transport"))' in evict, "")
+    check("a fan-out of several clients lists them (transports())",
+          find(tree(src, "tui_gateway/transport.py"), ast.FunctionDef,
+               "transports") is not None, "")
+    check("_close_sessions_for_transport is the disconnect path the plugin "
+          "releases through",
+          "def _close_sessions_for_transport(transport"
+          in text_of("tui_gateway/session_lifecycle.py"), "")
+    check("server._profile_home resolves a profile name (None: the launch "
+          "home)", "def _profile_home(profile" in srv_text, "")
+    check("a dashboard is the process with hermes_cli.web_server_app",
+          (src / "hermes_cli" / "web_server_app.py").is_file(), "")
+
+    # The waking routine: the plugin's dashboard part, imported by the
+    # dashboard at start, wakes every a2a bot. Added 2026-11-01 against main.
+    wd = text_of("hermes_cli/web_server_dashboard.py")
+    check("the dashboard scans <plugin>/dashboard/manifest.json",
+          '"dashboard" / "manifest.json"' in wd, "")
+    check("it imports the manifest's `api` file and mounts its `router`",
+          'data.get("api")' in wd and 'getattr(mod, "router", None)' in wd
+          and "spec.loader.exec_module(mod)" in wd, "")
+    check("only for a plugin in plugins.enabled",
+          '"not in plugins.enabled"' in wd, "")
+    check("in the dashboard process by default (plugins.isolation: "
+          "in_process)", '"isolation": "in_process"'
+          in text_of("hermes_cli/config_defaults.py"), "")
+    pr = text_of("hermes_cli/profiles.py")
+    for fn in ("list_profile_names", "get_profile_dir"):
+        check(f"hermes_cli.profiles.{fn} exists", f"def {fn}(" in pr, "")
+    check("discover_plugins(force=False): idempotent, never a reload unless "
+          "forced", "def discover_plugins(force: bool = False)" in text, "")
+    check("tui_gateway.model_switch._session_profile_runtime_scope exists — "
+          "the scope a profile-scoped dashboard call runs in",
+          "def _session_profile_runtime_scope(session"
+          in text_of("tui_gateway/model_switch.py"), "")
+    check("plugins_cmd._get_enabled_set reads plugins.enabled",
+          re.search(r"_get_enabled_set\s*=.*\"plugins\",\s*\"enabled\"",
+                    text_of("hermes_cli/plugins_cmd.py")) is not None, "")
 
     # plugin.yaml: every key the plugin's manifest uses is one Hermes reads.
     manifest_src = ""

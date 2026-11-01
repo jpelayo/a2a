@@ -29,10 +29,18 @@ ROUTE — and there are two kinds:
   source). The process that serves it publishes Hermes's TUI/desktop
   injector; ctx.inject_message(text, session_key=<that conversation's key>)
   queues the text on it, and an idle conversation starts a turn. Only a
-  conversation OPEN there is accepted. While it is closed the stream stays
-  shut, so the broker keeps new messages undelivered, and a read-only peek
-  (/pending/peek) every PEEK_S — or any turn there — finds it open again
-  and hands over everything unacked, however old.
+  conversation LOADED there is accepted, and the app keeps a bot's loaded
+  only while it shows or uses that bot. So in a dashboard the plugin keeps
+  its route conversation loaded ITSELF (the hold, see _Hold): Hermes's own
+  session.resume, called in-process as its hosted Group Chat does, with this
+  plugin's transport attached — no reaper takes a conversation with a live
+  client, and the app attaches beside it. Where it is not loaded anyway (not
+  a dashboard, or Hermes refused) the stream stays shut, so the broker keeps
+  new messages undelivered, and a read-only peek (/pending/peek) every PEEK_S
+  — or any turn there — finds it open again and hands over everything
+  unacked, however old. After a dashboard restart the dashboard part of this
+  plugin (dashboard/api.py) starts every a2a bot's plugin, so each takes its
+  hold without being opened.
 
   a MESSAGING CHAT of the bot. ctx.inject_message(text, origin=<chat>) asks
   the bot's gateway to run a turn in that chat; the reply goes back to it.
@@ -319,6 +327,99 @@ def _table_holds(route):
                    for s in rows)
     except Exception:
         return False
+
+
+# --- the hold: the route conversation stays loaded ---------------------------
+# Hermes's injector queues only on a conversation LOADED in the dashboard's
+# session table, and the app keeps a bot's conversation loaded only while it
+# holds that bot's socket — the active bot, one on screen, one busy, or one
+# opened less than 30 s ago (apps/desktop/src/store/gateway.ts
+# pruneSecondaryGateways). 20 s after the socket goes the dashboard reaps the
+# conversation (tui_gateway/server.py _WS_ORPHAN_REAP_GRACE_S). So a message
+# for any other bot waited for a click.
+#
+# The dashboard process loads the route conversation ITSELF, the way Hermes's
+# hosted Group Chat loads a member's session — the installed session.resume
+# handler, called in-process (tui_gateway/hosted_room_server_rpc.py) — with
+# this plugin's own transport bound first, so the record is attached to it and
+# not to the process's stdout (server.py _stdio_transport). That transport is
+# a live client to Hermes (session_transports.py _transport_is_live_peer), so
+# no reaper takes the conversation while it is attached; the app attaches
+# alongside it when the chat is opened, and approval questions still go only
+# to the app (only WebSocket clients count for them).
+HOLD_RETRY_S = 30.0
+HOLD_RETRY_MAX_S = 300.0
+
+
+class _Hold:
+    """This plugin's connection to its route conversation. Frames are
+    dropped: the app, when attached, gets its own copy of each (fan-out)."""
+
+    def __init__(self):
+        self._closed = False          # what Hermes's _transport_is_dead reads
+        self.frames = 0
+
+    def write(self, obj):
+        if self._closed:
+            return False
+        self.frames += 1
+        return True
+
+    def close(self):
+        self._closed = True
+
+
+def _dashboard_server():
+    """Hermes's session server when THIS process is a dashboard (`hermes
+    dashboard` / `hermes serve`: hermes_cli.web_server_app is loaded and the
+    session handlers are installed), else None. Not `hermes --tui`, the
+    gateway, cron or the CLI. Read from sys.modules only, never imported."""
+    if "hermes_cli.web_server_app" not in sys.modules:
+        return None
+    srv = sys.modules.get("tui_gateway.server")
+    methods = getattr(srv, "_methods", None)
+    if not isinstance(methods, dict) or "session.resume" not in methods:
+        return None
+    if not isinstance(getattr(srv, "_sessions", None), dict):
+        return None
+    return srv
+
+
+def _carries(record, transport):
+    """Is `transport` attached to `record` — alone, or beside other clients?"""
+    if not isinstance(record, dict) or transport is None:
+        return False
+    current = record.get("transport")
+    if current is transport:
+        return True
+    peers = getattr(current, "transports", None)
+    try:
+        return callable(peers) and transport in peers()
+    except Exception:
+        return False
+
+
+def _same_dir(a, b):
+    """Do two paths name one directory? True when it cannot be told: the
+    resume was asked for this bot's profile by name, so a check that cannot
+    run must not undo it."""
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except Exception:
+        return True
+
+
+def _held_record(srv, transport):
+    """(sid, record) of the record `transport` is attached to, or (None, None)."""
+    try:
+        with srv._sessions_lock:
+            rows = list(srv._sessions.items())
+    except Exception:
+        return None, None
+    for sid, record in rows:
+        if _carries(record, transport):
+            return sid, record
+    return None, None
 
 
 # --- the doctor ------------------------------------------------------------------
@@ -947,6 +1048,19 @@ class A2AHermes:
         # so a request made before a reconnect never cuts the next one.
         self._reconnect = threading.Event()
         self._threads: list[threading.Thread] = []
+        # The hold (see _Hold): this plugin's transport on the route
+        # conversation in the dashboard, and the doctor's view of it. Changed
+        # under _hold_lock only (the hold thread, and stop()).
+        self._holdT = None
+        self._hold_lock = threading.Lock()
+        # Bumped whenever the route is set, moved or turned off: a hold taken
+        # under another generation is for a conversation that is not the route
+        # any more. A key Hermes rotated is the SAME route (no bump).
+        self._route_gen = 0
+        self._hold_gen = -1
+        self._hold_n = 0
+        self.hold = {"held": False, "since": None, "error": None,
+                     "next": 0.0, "backoff": HOLD_RETRY_S}
 
         for name, desc, props, required, fn in TOOLS:
             if not CREDENTIALS and name != "a2a_channel_status":
@@ -966,8 +1080,13 @@ class A2AHermes:
             return
         ctx.register_hook("pre_llm_call", self.pre_llm_call)
         ctx.on_unload(self.stop)
-        for target, label in ((self._pump_guard, "pump"),
-                              (self._ack_loop, "ack")):
+        threads = [(self._pump_guard, "pump"), (self._ack_loop, "ack")]
+        # The hold only ever runs in a dashboard, which imports
+        # hermes_cli.web_server_app before any profile's plugins load there.
+        # The CLI, the gateway, a TUI and cron get no extra thread.
+        if "hermes_cli.web_server_app" in sys.modules:
+            threads.append((self._hold_loop, "hold"))
+        for target, label in threads:
             t = threading.Thread(target=self._home_ctx.copy().run,
                                  args=(target,), daemon=True,
                                  name=f"a2a-{label}-{self.profile or 'default'}")
@@ -1267,6 +1386,141 @@ class A2AHermes:
             self.log(f"could not save the conversation's new key: {e!r}")
         self.log(f"following {self._chat_label(route)}")
 
+    # -- the hold (see _Hold) ----------------------------------------------------
+    def _hold_wanted(self, srv):
+        """Should THIS process keep the route conversation loaded? Only a
+        dashboard that can deliver into it, with a2a on in a conversation."""
+        return bool(CREDENTIALS and srv is not None and self.enabled
+                    and is_desktop(self.route) and self._tui_injector())
+
+    def _hold_loop(self):
+        last = ""
+        while not self._stop.is_set():
+            try:
+                self._hold_once()
+                last = ""
+            except Exception as e:
+                if repr(e) != last:
+                    last = repr(e)
+                    self.log(f"keeping the conversation loaded failed: {e!r}")
+            self._stop.wait(GATE_POLL_S)
+
+    def _hold_once(self):
+        with self._hold_lock:
+            srv = _dashboard_server()
+            if not self._hold_wanted(srv):
+                if self._holdT is not None:
+                    self._release_hold(srv, "a2a is off here")
+                return
+            if self._holdT is not None and self._hold_gen != self._route_gen:
+                self._release_hold(srv, "a2a moved to another conversation")
+            if self._holdT is not None:
+                sid, record = _held_record(srv, self._holdT)
+                if record is not None:
+                    # Compaction gives the conversation a new key inside the
+                    # same record: follow it, so the injector finds it.
+                    self._follow_hold(sid, record)
+                    return
+                # The record that carried it is gone — closed in Hermes, or
+                # deleted. Load it again (or say why not).
+                self._holdT.close()
+                self._holdT = None
+                self.hold.update(held=False, since=None)
+                self.log(f"{self._chat_label(self.route)} was closed in "
+                         f"Hermes; loading it again")
+            if time.time() >= self.hold["next"]:
+                self._take_hold(srv)
+
+    def _take_hold(self, srv):
+        """Load the route conversation with this plugin's transport attached:
+        the installed session.resume handler, called in-process as Hermes's
+        hosted Group Chat does, under bind_transport so the record is attached
+        to the _Hold and not to stdout. A conversation already loaded (the app
+        has it open) gets the _Hold beside the app, not instead of it."""
+        trans = sys.modules.get("tui_gateway.transport")
+        bind = getattr(trans, "bind_transport", None)
+        reset = getattr(trans, "reset_transport", None)
+        if not (callable(bind) and callable(reset)):
+            return self._hold_failed("this Hermes has no transport to attach "
+                                     "with (tui_gateway.transport)")
+        key = (self.route or {}).get("session_key") or ""
+        if not key:
+            return self._hold_failed("the route names no conversation")
+        hold = _Hold()
+        self._hold_n += 1
+        params = {"profile": self.profile or "default", "session_id": key,
+                  "source": self.route.get("source") or "desktop",
+                  "omit_messages": True}
+        token = bind(hold)
+        try:
+            envelope = srv._methods["session.resume"](
+                f"a2a-hold-{self._hold_n}", params)
+        except Exception as e:
+            # Called directly, as Hermes's hosted rooms do, a handler's raise
+            # (a missing profile, say) is not turned into an error reply by
+            # the dispatcher: it is the same refusal here.
+            hold.close()
+            return self._hold_failed(f"Hermes did not load it: {e}")
+        finally:
+            reset(token)
+        error = envelope.get("error") if isinstance(envelope, dict) else None
+        if isinstance(error, dict):
+            hold.close()
+            return self._hold_failed(
+                f"Hermes did not load it: {error.get('message') or error}")
+        sid, record = _held_record(srv, hold)
+        if record is None:
+            hold.close()
+            return self._hold_failed("Hermes loaded it without attaching a2a")
+        home = record.get("profile_home") or getattr(srv, "_hermes_home", None)
+        if home and not _same_dir(home, self.home):
+            self._release_transport(srv, hold)
+            return self._hold_failed(f"Hermes loaded it in another profile's "
+                                     f"home ({home}), not this bot's")
+        self._holdT, self._hold_gen = hold, self._route_gen
+        self.hold.update(held=True, since=time.time(), error=None, next=0.0,
+                         backoff=HOLD_RETRY_S)
+        self._follow_hold(sid, record)
+        self.log(f"keeping {self._chat_label(self.route)} loaded in this "
+                 f"dashboard: a2a delivers into it whether or not it is open "
+                 f"in the app")
+        self._wake.set()            # the pump: it can deliver here now
+
+    def _follow_hold(self, sid, record):
+        key = str(record.get("session_key") or "")
+        route = self.route or {}
+        if key and (key != route.get("session_key")
+                    or (sid and sid != route.get("ui_session_id"))):
+            self._follow({"session_key": key, "ui_session_id": sid or ""})
+
+    def _hold_failed(self, why):
+        backoff = self.hold["backoff"]
+        if why != self.hold["error"]:
+            self.log(f"could not keep {self._chat_label(self.route)} loaded: "
+                     f"{why}; trying again in {backoff:.0f}s. Until then a2a "
+                     f"delivers into it while it is open in the app")
+        self.hold.update(held=False, since=None, error=why,
+                         next=time.time() + backoff,
+                         backoff=min(backoff * 2, HOLD_RETRY_MAX_S))
+
+    def _release_hold(self, srv, why):
+        hold, self._holdT = self._holdT, None
+        self.hold.update(held=False, since=None)
+        if hold is not None:
+            self._release_transport(srv, hold)
+            self.log(f"no longer keeping the conversation loaded: {why}")
+
+    @staticmethod
+    def _release_transport(srv, hold):
+        """Hermes's own disconnect path: the conversation is parked and
+        reaped exactly as when the app leaves it."""
+        try:
+            close = getattr(srv, "_close_sessions_for_transport", None)
+            if callable(close):
+                close(hold)
+        finally:
+            hold.close()
+
     def _injection_allowed(self):
         probe = getattr(self.ctx, "_gateway_injection_allowed", None)
         if not callable(probe):
@@ -1447,18 +1701,27 @@ class A2AHermes:
                 self.enabled = False
         except Exception as e:
             return json.dumps({"error": f"could not save the setting: {e}"})
+        # The hold thread drops a hold taken for the previous route (or for
+        # a2a on) and takes the new one.
+        self._route_gen += 1
         self._closed_since = None
         self._wake.set()
         self.log(f"a2a turned {'on in ' + self._chat_label(self.route) if on else 'off'}")
         if not on:
             step = ("Tell the human a2a is off for this bot. Nothing is "
                     "delivered until they turn it on again.")
-        elif desk is not None:
+        elif desk is not None and _dashboard_server() is not None:
             step = ("Tell the human a2a is on for this bot in this "
                     "conversation of the Hermes app, connecting now — no "
-                    "restart. a2a messages arrive here while this "
-                    "conversation is open in the app; while it is closed they "
-                    "wait on the broker and arrive when it is opened again.")
+                    "restart. a2a keeps this conversation loaded in Hermes, "
+                    "so a2a messages arrive here whenever Hermes runs, open in "
+                    "the app or not.")
+        elif desk is not None:
+            step = ("Tell the human a2a is on for this bot in this "
+                    "conversation, connecting now — no restart. a2a messages "
+                    "arrive here while this conversation is open; while it is "
+                    "closed they wait on the broker and arrive when it is "
+                    "opened again.")
         else:
             step = ("Tell the human a2a is on for this bot in this chat, "
                     "connecting now — no restart. Only they can use the a2a "
@@ -1995,6 +2258,13 @@ class A2AHermes:
             self.flush_acks(timeout=5)
         except Exception:
             pass
+        # A reload replaces this instance: its successor takes the hold with a
+        # transport of its own, so this one must not stay attached.
+        try:
+            with self._hold_lock:
+                self._release_hold(_dashboard_server(), "unloading")
+        except Exception:
+            pass
         self.log("unloaded")
 
     # -- status ----------------------------------------------------------------
@@ -2131,14 +2401,20 @@ class A2AHermes:
                             "Hermes app and open it again (or restart the "
                             "gateway however it is run)"))
         elif self._closed_since is not None:
+            why = self.hold["error"]
             c.append(_check("push_host", False, "human",
                             "the a2a conversation is not open in the Hermes "
                             "app, so nothing can be delivered into it: ask "
                             f"the human to open it ({label}). Messages wait "
                             "on the broker meanwhile and arrive once it is "
-                            "open."))
+                            "open."
+                            + (f" a2a could not keep it loaded itself: {why}"
+                               if why else ""),
+                            detail=why))
         else:
-            c.append(_check("push_host", True, detail=label))
+            c.append(_check("push_host", True,
+                            detail=label + (" (kept loaded by a2a)"
+                                            if self.hold["held"] else "")))
         push_ok = c[-1]["ok"] is True
         if not push_ok:
             c.append(_check("stream", None,
@@ -2267,6 +2543,16 @@ class A2AHermes:
                 "desktop_app": self._desktop_backend(),
                 "conversation_open": (None if not is_desktop(self.route)
                                       else self._closed_since is None),
+                # The route conversation kept loaded in this dashboard, so
+                # it can be delivered into whether or not the app shows it.
+                "hold": {
+                    "held": self.hold["held"],
+                    "since": (iso_utc(self.hold["since"])
+                              if self.hold["since"] else None),
+                    "error": self.hold["error"],
+                    "frames": self._holdT.frames if self._holdT else 0,
+                    "dashboard": _dashboard_server() is not None,
+                },
                 "chat": self._chat_label(self.route) if self.route else None,
             },
             "unacked_here": unacked,

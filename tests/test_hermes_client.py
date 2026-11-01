@@ -56,7 +56,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True        # nothing lands in plugin/hermes/
 
 HERE = Path(__file__).resolve().parent
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 CLIENT = PLUGIN / "hermes" / "__init__.py"
 MANIFEST = PLUGIN / "hermes" / "plugin.yaml"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
@@ -705,6 +705,7 @@ def main() -> int:
 
     served_artifact()
     desktop()
+    hold()
     tui_route()
     cloned()
     own_state()
@@ -1070,7 +1071,7 @@ def served_artifact() -> None:
     from starlette.requests import Request
 
     spec = importlib.util.spec_from_file_location(
-        "broker_hermes_install", HERE.parent / "a2a_mcp" / "a2a-mcp.py")
+        "broker_hermes_install", HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py")
     b = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(b)        # importing opens no database
 
@@ -1095,9 +1096,14 @@ def served_artifact() -> None:
     with tarfile.open(fileobj=io.BytesIO(resp.body), mode="r:gz") as t:
         for m in t.getmembers():
             members[m.name] = t.extractfile(m).read()
-    check("installer: serves exactly plugin.yaml and __init__.py",
-          sorted(members) == ["__init__.py", "plugin.yaml"],
-          str(sorted(members)))
+    # .DS_Store: Finder's, in a checkout browsed on a Mac; .dockerignore keeps
+    # it out of the image the broker serves from.
+    served = sorted(n for n in members if Path(n).name != ".DS_Store")
+    check("installer: serves exactly plugin.yaml, __init__.py and the "
+          "dashboard part (manifest, api, its no-op entry)",
+          served == ["__init__.py", "dashboard/api.py",
+                     "dashboard/dist/index.js", "dashboard/manifest.json",
+                     "plugin.yaml"], str(served))
     check("installer: plugin.yaml's version is the broker's",
           f'version: "{b.VERSION}"' in members["plugin.yaml"].decode(),
           members["plugin.yaml"][:300])
@@ -1698,6 +1704,271 @@ def doctor() -> None:
         if saved_env is not None:
             os.environ["HERMES_DESKTOP"] = saved_env
     fb.close()
+
+
+class _Fanout:
+    """Hermes's FanoutTransport, as far as the plugin reads it: the live
+    peers of a record shared by several clients (transports())."""
+
+    def __init__(self, *peers):
+        self.peers = list(peers)
+
+    def transports(self):
+        return list(self.peers)
+
+
+class _TableKeys:
+    """Ctx.live_keys backed by the fake session table: Hermes's injector
+    accepts a key exactly when a loaded record carries it."""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def __contains__(self, key):
+        return any(r.get("session_key") == key
+                   for r in list(self.srv._sessions.values()))
+
+
+def dashboard(launch_home: str):
+    """A Hermes dashboard process (hermes_cli.web_server_app loaded) with its
+    session server: _sessions, the installed session.resume handler — which,
+    like Hermes's, attaches the transport the CALLER bound (tui_gateway.
+    transport), beside the clients already on a loaded record, and follows a
+    compressed conversation to its tip — and _close_sessions_for_transport."""
+    trans = types.ModuleType("tui_gateway.transport")
+    cur: contextvars.ContextVar = contextvars.ContextVar("transport",
+                                                        default=None)
+    trans.current_transport = cur.get
+    trans.bind_transport = cur.set
+    trans.reset_transport = cur.reset
+    srv = types.ModuleType("tui_gateway.server")
+    srv._sessions_lock = threading.Lock()
+    srv._sessions = {}
+    srv._hermes_home = launch_home
+    srv.resumes, srv.closed, srv.tips = [], [], {}
+    srv.refuse = None
+    srv.profile_home = None              # None: the launch profile's home
+    srv.n = 0
+
+    def resume(rid, params):
+        if srv.refuse:
+            return {"id": rid, "error": {"code": 4007, "message": srv.refuse}}
+        t = trans.current_transport()
+        srv.resumes.append((dict(params), t))
+        key = srv.tips.get(params["session_id"], params["session_id"])
+        with srv._sessions_lock:
+            sid = next((s for s, r in srv._sessions.items()
+                        if r.get("session_key") == key), None)
+            if sid is None:
+                srv.n += 1
+                sid = f"held{srv.n}"
+                srv._sessions[sid] = {"session_key": key, "transport": t,
+                                      "profile_home": srv.profile_home}
+            else:
+                rec = srv._sessions[sid]
+                was = rec.get("transport")
+                peers = was.transports() if isinstance(was, _Fanout) else [was]
+                rec["transport"] = _Fanout(*[p for p in peers if p], t)
+        return {"id": rid, "result": {"session_id": sid, "resumed": key}}
+
+    def close_for(t):
+        srv.closed.append(t)
+        with srv._sessions_lock:
+            for sid, rec in list(srv._sessions.items()):
+                cur_t = rec.get("transport")
+                if cur_t is t:
+                    del srv._sessions[sid]      # clientless: parked, reaped
+                elif isinstance(cur_t, _Fanout) and t in cur_t.peers:
+                    cur_t.peers.remove(t)
+
+    srv._methods = {"session.resume": resume}
+    srv._close_sessions_for_transport = close_for
+    pkg = types.ModuleType("tui_gateway")
+    pkg.server, pkg.transport = srv, trans
+    app = types.ModuleType("hermes_cli.web_server_app")
+    sys.modules.update({"tui_gateway": pkg, "tui_gateway.server": srv,
+                        "tui_gateway.transport": trans,
+                        "hermes_cli.web_server_app": app})
+    return srv
+
+
+def _no_dashboard():
+    for name in ("tui_gateway.transport", "hermes_cli.web_server_app"):
+        sys.modules.pop(name, None)
+    _no_tui_gateway()
+
+
+def hold() -> None:
+    """In the dashboard, the plugin keeps its route conversation LOADED
+    itself: Hermes's injector queues only on a loaded conversation, and the
+    app keeps a bot's loaded only while it shows or uses that bot."""
+    try:
+        _hold()
+        _hold_elsewhere()
+    finally:
+        _no_dashboard()
+
+
+def _hold() -> None:
+    fb = FakeBroker()
+    mod = load(fb.url)
+    mod.PEEK_S = 0.3
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    srv = dashboard(home)                # nothing loaded: the app is elsewhere
+    ctx = Ctx("bot", gateway=False, tui=True, state=dict(DESK_ON))
+    ctx.live_keys = _TableKeys(srv)
+    start(mod, ctx, home)
+    inst = ctx_inst(ctx)
+    key = DESK["session_key"]
+    check("hold: the dashboard loads the route conversation itself, with "
+          "Hermes's session.resume — no click in the app",
+          until(lambda: len(srv.resumes) == 1), str(srv.resumes))
+    params, t = srv.resumes[0] if srv.resumes else ({}, None)
+    check("hold: asked exactly as Hermes's hosted Group Chat asks: profile, "
+          "the route's session, its source, no messages",
+          params == {"profile": "bot", "session_id": key,
+                     "source": "desktop", "omit_messages": True}, str(params))
+    check("hold: with the plugin's OWN transport bound — never left unbound, "
+          "where Hermes falls back to the dashboard's stdout",
+          type(t).__name__ == "_Hold" and t._closed is False, repr(t))
+    check("hold: the doctor reports it held",
+          until(lambda: inst.hold["held"])
+          and ctx.call("a2a_channel_status", DESK)["push"]["hold"]["held"]
+          is True, str(inst.hold))
+    fb.live.put(msg("h1"))
+    check("hold: a message lands with the app nowhere near it — delivered "
+          "into the conversation by its key",
+          until(lambda: "h1" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": key},
+          str(ctx.injected[-1:]))
+    ctx.turn(DESK, "s1", ctx.injected[-1][0])
+    check("hold: and acked once a turn shows it, as always",
+          until(lambda: "h1" in fb.acked), str(fb.acked))
+
+    # The app opens the chat: it attaches BESIDE the hold, not instead.
+    app = object()
+    rec = next(iter(srv._sessions.values()))
+    rec["transport"] = _Fanout(rec["transport"], app)
+    time.sleep(0.4)
+    check("hold: the app attaching beside it changes nothing — no second load",
+          len(srv.resumes) == 1 and inst.hold["held"], str(srv.resumes))
+
+    # Hermes compresses the conversation: the key rotates in the same record.
+    new_key = "20261013_150000_ffffff"
+    rec["session_key"] = new_key
+    check("hold: a compressed conversation's new key is followed, with no "
+          "second load",
+          until(lambda: (ctx.saved.get("route") or {}).get("session_key")
+                == new_key) and len(srv.resumes) == 1,
+          f"{ctx.saved.get('route')} {len(srv.resumes)}")
+
+    # The record goes (closed in Hermes): it is loaded again.
+    with srv._sessions_lock:
+        srv._sessions.clear()
+    check("hold: a conversation that went from the table is loaded again",
+          until(lambda: len(srv.resumes) == 2
+                and any(r.get("session_key") == new_key
+                        for r in srv._sessions.values())),
+          str(srv.resumes[1:]))
+
+    # a2a moved to another conversation: the old hold goes, the new is taken.
+    hold_before = inst._holdT
+    out = ctx.call("enable_a2a_here", DESK2, {"enabled": True})
+    check("hold: moving a2a releases the old conversation the way an app "
+          "leaving does, and loads the new one",
+          out.get("enabled") is True
+          and until(lambda: hold_before in srv.closed
+                    and srv.resumes[-1][0]["session_id"] == DESK2["session_key"])
+          and hold_before._closed is True,
+          f"{srv.closed} {srv.resumes[-1:]}")
+
+    # Off: released, nothing loaded any more.
+    held = inst._holdT
+    ctx.call("enable_a2a_here", DESK2, {"enabled": False})
+    check("hold: turning a2a off releases it, and nothing is loaded again",
+          until(lambda: held in srv.closed and held._closed)
+          and not inst.hold["held"], str(srv.closed))
+    n = len(srv.resumes)
+    time.sleep(0.4)
+    check("hold: while off, no load at all", len(srv.resumes) == n,
+          str(srv.resumes[n:]))
+
+    # On again; then unloading the plugin releases it (a reload re-holds).
+    ctx.call("enable_a2a_here", DESK2, {"enabled": True})
+    until(lambda: inst.hold["held"])
+    held = inst._holdT
+    stop(ctx)
+    check("hold: unloading releases it, so a reloaded plugin holds afresh",
+          held is not None and held in srv.closed and held._closed,
+          str(srv.closed))
+    fb.close()
+
+
+def _hold_elsewhere() -> None:
+    """Refusals, a foreign profile, and the processes that must never hold."""
+    # Refused by Hermes: no crash, said once, retried on a backoff.
+    fb = FakeBroker()
+    mod = load(fb.url)
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    srv = dashboard(home)
+    srv.refuse = "Session not found"
+    ctx = Ctx("bot", gateway=False, tui=True, state=dict(DESK_ON))
+    ctx.live_keys = _TableKeys(srv)
+    start(mod, ctx, home)
+    inst = ctx_inst(ctx)
+    until(lambda: srv.resumes or inst.hold["error"])
+    time.sleep(0.6)
+    logged = inst.log_file.read_text().count("could not keep")
+    check("refused: the plugin goes on, says why once, and does not hammer "
+          "Hermes (backoff)",
+          inst.hold["error"] and "Session not found" in inst.hold["error"]
+          and not inst.hold["held"] and logged == 1,
+          f"{inst.hold} logged={logged}")
+    st = ctx.call("a2a_channel_status", DESK)
+    check("refused: the doctor carries the reason",
+          "Session not found" in str(st["push"]["hold"]["error"]),
+          str(st["push"]["hold"]))
+    stop(ctx)
+    fb.close()
+    _no_dashboard()
+
+    # Loaded in another profile's home: released, not kept.
+    fb = FakeBroker()
+    mod = load(fb.url)
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    srv = dashboard(home)
+    srv.profile_home = tempfile.mkdtemp(prefix="a2a-other-profile-")
+    ctx = Ctx("bot", gateway=False, tui=True, state=dict(DESK_ON))
+    start(mod, ctx, home)
+    inst = ctx_inst(ctx)
+    check("foreign home: a conversation Hermes loaded for another profile is "
+          "released at once, not kept",
+          until(lambda: srv.closed and not srv._sessions
+                and "another profile" in str(inst.hold["error"])),
+          f"{srv.closed} {inst.hold}")
+    stop(ctx)
+    fb.close()
+    _no_dashboard()
+
+    # Never outside a dashboard, and never for a messaging chat.
+    for label, tui, state, dash in (
+            ("hermes --tui (an injector, no dashboard)", True, DESK_ON, False),
+            ("the gateway (no TUI injector)", False, DESK_ON, True),
+            ("a messaging-chat route", True, ON, True)):
+        fb = FakeBroker()
+        mod = load(fb.url)
+        home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+        srv = dashboard(home)
+        if not dash:
+            sys.modules.pop("hermes_cli.web_server_app", None)
+        ctx = Ctx("bot", gateway=not tui, tui=tui, state=dict(state))
+        start(mod, ctx, home)
+        time.sleep(0.4)
+        check(f"never holds in {label}", srv.resumes == [],
+              str(srv.resumes))
+        stop(ctx)
+        fb.close()
+        _no_dashboard()
 
 
 def same_chat_keys(route: dict, chat: dict) -> bool:

@@ -35,6 +35,8 @@ REPO = HERE.parent
 VENV = REPO / ".venv"
 VPY = VENV / "bin" / "python"
 FAKE = HERE / "fakemaria"
+# The tree that is copied to the server. A run must leave it exactly as found.
+DEPLOY = REPO / "deploy"
 # An input each needs, and what the test prints when it is missing.
 CHECKOUTS = {"test_hermes_contract.py": "HERMES_SRC",
              "test_opencode_contract.py": "OPENCODE_SRC"}
@@ -48,7 +50,7 @@ def setup() -> int:
             return r.returncode
     print(f"installing tests/requirements.txt into {VENV}")
     env = dict(os.environ, PIP_NO_CACHE_DIR="1",
-               PIP_DISABLE_PIP_VERSION_CHECK="1")
+               PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
     env.pop("PIP_USER", None)
     r = subprocess.run([str(VPY), "-m", "pip", "install", "--no-cache-dir",
                         "--disable-pip-version-check", "-r",
@@ -101,6 +103,10 @@ def main() -> int:
         files = [f for f in files if f.name in want]
 
     env = dict(os.environ)
+    # No bytecode: a test imports the broker and the clients from deploy/,
+    # and Python would leave a __pycache__ beside each — in the tree that is
+    # copied to the server.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     real = env.get("A2A_TEST_DB_REAL", "") not in ("", "0")
     data = None
     if not real:
@@ -113,6 +119,7 @@ def main() -> int:
 
     passed, failed, checkout = [], [], []
     t0 = time.monotonic()
+    caches_before = set(DEPLOY.rglob("__pycache__"))
     try:
         with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
             futs = [pool.submit(run_one, f, str(VPY), env, a.timeout)
@@ -136,6 +143,17 @@ def main() -> int:
     finally:
         if data:
             shutil.rmtree(data, ignore_errors=True)
+
+    # A subprocess a test started with an environment of its own does not
+    # inherit PYTHONDONTWRITEBYTECODE. What it wrote into deploy/ is removed
+    # here and the run FAILS, so the test that did it gets fixed.
+    leaked = sorted(set(DEPLOY.rglob("__pycache__")) - caches_before)
+    for d in leaked:
+        shutil.rmtree(d, ignore_errors=True)
+    if leaked:
+        failed.append("(bytecode written into deploy/)")
+        print("FAIL  a test wrote into deploy/ (removed): "
+              + ", ".join(str(d.relative_to(REPO)) for d in leaked))
 
     print(f"\n{len(passed)} passed, {len(failed)} failed"
           + (f", {len(checkout)} need a checkout" if checkout else "")

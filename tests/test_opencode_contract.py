@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CLIENT = HERE.parent / "plugin" / "opencode" / "a2a-opencode.js"
+CLIENT = HERE.parent / "deploy" / "plugin" / "opencode" / "a2a-opencode.js"
 
 fails: list[str] = []
 

@@ -31,7 +31,7 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-OPENCODE = HERE.parent / "plugin" / "opencode" / "a2a-opencode.js"
+OPENCODE = HERE.parent / "deploy" / "plugin" / "opencode" / "a2a-opencode.js"
 
 fails: list[str] = []
 

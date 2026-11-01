@@ -34,8 +34,8 @@ import dbharness
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+PLUGIN = HERE.parent / "deploy" / "plugin"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 

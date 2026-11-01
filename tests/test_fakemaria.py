@@ -56,7 +56,7 @@ def raises(fn, exc, code=None, text=None):
 
 
 def schema() -> tuple:
-    src = (HERE.parent / "a2a_mcp" / "a2a-mcp.py").read_text()
+    src = (HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py").read_text()
     for node in ast.parse(src).body:
         if isinstance(node, ast.Assign) and any(
                 getattr(t, "id", None) == "SCHEMA" for t in node.targets):

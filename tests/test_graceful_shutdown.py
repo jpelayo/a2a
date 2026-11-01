@@ -40,7 +40,7 @@ import dbharness
 import pymysql
 import pymysql.cursors
 
-BROKER = Path(__file__).resolve().parent.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = Path(__file__).resolve().parent.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 GRACE = int(re.search(r"^SHUTDOWN_GRACE_S = (\d+)", BROKER.read_text(),
                       re.M).group(1))
 

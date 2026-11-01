@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 IDENTITY = PLUGIN / "a2a" / "server" / "identity.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"

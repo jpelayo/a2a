@@ -37,7 +37,7 @@ from pathlib import Path
 import dbharness
 
 HERE = Path(__file__).resolve().parent
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 fails: list[str] = []
 

@@ -34,7 +34,7 @@ from pathlib import Path
 from test_project_gate import FakeBroker
 
 HERE = Path(__file__).resolve().parent
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 PI = PLUGIN / "pi" / "index.ts"

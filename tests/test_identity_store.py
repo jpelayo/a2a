@@ -28,7 +28,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
-PLUGIN = HERE.parent / "plugin"
+PLUGIN = HERE.parent / "deploy" / "plugin"
 IDENTITY = PLUGIN / "a2a" / "server" / "identity.py"
 PROJECT = "/Users/x/acme-api"
 DIRNAME = "acme-api"

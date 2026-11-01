@@ -47,7 +47,7 @@ from pathlib import Path
 import dbharness
 
 HERE = Path(__file__).resolve().parent
-BROKER = HERE.parent / "a2a_mcp" / "a2a-mcp.py"
+BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
 K1, K2 = "a2a_ck_first-client-key-000000000", "a2a_ck_second-client-key-11111111"
 K3, K4 = "a2a_ck_racer-three-2222222222222", "a2a_ck_racer-four-33333333333333"
