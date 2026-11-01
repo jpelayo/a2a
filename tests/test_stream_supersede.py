@@ -55,6 +55,12 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+# Every stream this file opens, so the teardown can close them all: uvicorn
+# answers SIGTERM by waiting — with no deadline — for open connections to
+# finish, and a stream never finishes on its own.
+STREAMS: list["Stream"] = []
+
+
 class Stream:
     """One /stream connection, reading lines on a thread.
 
@@ -72,7 +78,24 @@ class Stream:
         self.resp = urllib.request.urlopen(req, timeout=30)
         self.lines: list[dict] = []
         self.closed = False
+        STREAMS.append(self)
         threading.Thread(target=self._read, daemon=True).start()
+
+    def close(self) -> None:
+        """End the connection from the client side, now. shutdown() and not
+        only close(): the reader thread is parked in recv on this socket, and
+        shutdown is what wakes it and sends the FIN at once."""
+        fp = self.resp.fp                 # None once the server ended it
+        sock = getattr(getattr(fp, "raw", None), "_sock", None)
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.resp.close()
+        except Exception:
+            pass
 
     def _read(self) -> None:
         try:
@@ -196,11 +219,18 @@ def main() -> int:
               "the firehose names none",
               not wait(lambda: f1.closed or f2.closed, 3),
               "a firehose was evicted")
-        del d, f2
 
     finally:
+        for s in STREAMS:
+            s.close()
         proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            check("serve exits on SIGTERM once every stream is closed", False,
+                  "still running 15 s after SIGTERM with every stream closed")
 
     print()
     if fails:

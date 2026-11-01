@@ -96,7 +96,13 @@ def main() -> int:
 
     # --- create --------------------------------------------------------------
     t.answers = ["ops", "operations chatter"]
+    # No station filter and no row selected: `n` must ASK which station — a
+    # channel created in the wrong one is invisible to the agents meant to
+    # use it.
+    t.picks = [sid]
     t.act_channel("n", None)
+    check("with no filter and no row, n asks which station to create in",
+          t.picks == [], f"picks left: {t.picks}")
     check("n CREATES the channel in the database — the whole point of this "
           "file: without asyncio.run this returns a coroutine, changes "
           "nothing, and raises nothing",

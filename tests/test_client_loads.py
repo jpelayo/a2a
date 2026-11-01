@@ -146,10 +146,16 @@ def main() -> int:
     check("the gate CATCHES the exact regression: re-inserting the function "
           "into the object literal fails the import…",
           not still_ok, "the broken shape imported fine")
-    check("…while `node --check` on the same file still passes it, which is "
-          "why that was never a gate",
-          plain.returncode == 0,
-          f"node --check exited {plain.returncode}")
+    # History, not a property of this code: the Node that shipped the break
+    # PASSED it under `node --check` (exit 0), which is why the import above
+    # is the gate. Newer Nodes reject it (v26.13.0 exits 1). Reported, not
+    # asserted — the gate must not depend on which Node runs it.
+    ver = subprocess.run(["node", "--version"], capture_output=True,
+                         text=True).stdout.strip()
+    print(f"note `node --check` on the broken file exits {plain.returncode} "
+          f"on node {ver}" + (" — it would have passed it, as it did then"
+                              if plain.returncode == 0 else
+                              " — this Node catches it; older ones did not"))
 
     # --- the python clients ---------------------------------------------------
     python_client(CLAUDE, "claude", ("_handle", "_pump", "_instructions"))

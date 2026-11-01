@@ -761,6 +761,12 @@ _state = {"connected": False, "delivered": 0, "last": "", "error": "",
           "last_line": 0.0, "briefed": False}
 _server: AppServer | None = None
 _server_lock = threading.Lock()
+# Set by the doctor (a2a_channel_status fix=true) for a connected but silent
+# stream; read on the stream's next line, and cleared whenever a connection
+# opens, so a request made before a reconnect never cuts the next one. NOT
+# _enabled: that is the human's switch, and toggling it would re-run
+# catch_up(), which injects a turn.
+_reconnect = threading.Event()
 
 
 def get_server():
@@ -947,6 +953,7 @@ def pump():
                 _state["error"] = ""
                 _state["last_line"] = time.time()
                 log(f"stream open as {stream_key}")
+                _reconnect.clear()
                 for raw in resp:
                     _state["last_line"] = time.time()
                     # Checked BEFORE emit: a line read after the project was
@@ -958,6 +965,11 @@ def pump():
                         break
                     if KEY != stream_key:
                         log("agent id changed; reconnecting")
+                        break
+                    if _reconnect.is_set():
+                        _reconnect.clear()
+                        log("the doctor asked for a fresh stream; "
+                            "reconnecting")
                         break
                     line = raw.decode("utf8", "replace").strip()
                     if line:                    # blank line = keepalive
@@ -1134,7 +1146,7 @@ BRIEF = (
     "you are registered, whether push is alive, and which channels you "
     "are a MEMBER of — a reply posted to a room you are not in reaches "
     "nobody. Its next_step names the one thing to do, or is null when "
-    "nothing is wrong. It reads nothing from your inbox."
+    "nothing is wrong; checks lists every check and who must act, and fix=true repairs what it safely can on its own. It reads nothing from your inbox."
     "\n\n"
         "MESSAGES HAVE A SHELF LIFE. Yours last a year unless you say otherwise: "
     'pass expires_in ("10m", "2h", "7d") when what you are saying stops '
@@ -1349,56 +1361,221 @@ def _propose_me(a):
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
-def _status(a):
+# --- the doctor ----------------------------------------------------------------
+# a2a_channel_status lists EVERY check, in this order, in every client — the
+# same ids, so an agent reading one never has to know its harness. `ok` is
+# True, False or None (not applicable here, or not knowable now); a failing
+# one says WHO must act and WHAT to do. fix=true repairs only what this client
+# would repair by itself later anyway, and only when that check is failing:
+# never the project switch, the identity, or anything on the broker.
+DOCTOR_CHECKS = ("install", "identity", "settings", "switch", "broker",
+                 "client", "registered", "push_host", "stream", "version")
+
+
+def _check(check, ok, who=None, do=None, detail=None):
+    return {"check": check, "ok": ok,
+            "who": who if ok is False else None,
+            "do": do if ok is False else None,
+            "detail": detail}
+
+
+def _quiet():
     quiet = (time.time() - _state["last_line"]) if _state["last_line"] else None
-    stale = bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
-    sock = control_socket()
+    return quiet, bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
+
+
+def _session_thread():
+    """(thread id or None, error text) for this session, as status sees it."""
     srv = get_server()
-    thread, thread_err = None, ""
-    if srv is not None:
-        try:
-            thread = srv.session_thread()
-        except WSError as e:
-            thread_err = str(e)
-        except Exception as e:
-            thread_err = f"{type(e).__name__}: {e}"
+    if srv is None:
+        return None, ""
+    try:
+        return srv.session_thread(), ""
+    except WSError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _repair():
+    """fix=true: what this client would do by itself later, done now, each
+    only when its own check is failing. Never the switch or the identity."""
+    fixed = []
+    if _enabled.is_set() and _session_thread()[0] is None:
+        # The same re-resolution deliver() does after a failed submit: look
+        # for the socket and the thread again.
+        drop_server()
+        fixed.append({"check": "push_host", "did": "looked for the "
+                      "app-server socket and this session's thread again"})
+    quiet, stale = _quiet()
+    if _enabled.is_set() and _state["connected"] and stale:
+        _reconnect.set()
+        fixed.append({"check": "stream",
+                      "did": "asked the silent stream to reconnect"})
+        with _ack_lock:
+            pending = len(_to_ack)
+        if pending:
+            flush_acks()
+            fixed.append({"check": "stream",
+                          "did": f"retried {pending} pending ack(s)"})
+    return fixed
+
+
+def _broker_version():
+    try:
+        out = api("GET", "/healthz", timeout=5)
+    except Exception:
+        return None
+    return (out or {}).get("clients") if isinstance(out, dict) else None
+
+
+def _checks(me, registered, thread, thread_err, quiet, stale):
+    """Every check, in DOCTOR_CHECKS order. The texts are the ones the single
+    next_step used to carry, in the same order — "off" first, or an agent in
+    a project that never opted in is told to register, or to wait for a
+    stream that will never open."""
+    c = []
+    if not (URL and TOKEN):
+        c.append(_check("install", False, "user",
+                        "no broker url or token in this install: run the "
+                        "installer and pick Codex (curl -fsSL "
+                        "<broker>/install | python3)"))
+        return c + [_check(k, None, detail="skipped: no broker configured")
+                    for k in DOCTOR_CHECKS[1:]]
+    c.append(_check("install", True))
+    c.append(_check("identity", True, detail=KEY))
+    c.append(_check("settings", None, detail="not applicable to Codex"))
+    on = _enabled.is_set()
+    if not on:
+        c.append(_check("switch", False, "human",
+                        f"a2a is off in this project: {PROJECT_FILE} does not "
+                        f'say {{"{ENABLE_KEY}": true}}, so nothing is '
+                        "delivered here. That is the user's decision: only if "
+                        "they ask for a2a in this project, call "
+                        "enable_a2a_here(enabled=true)"))
+    else:
+        c.append(_check("switch", True, detail=str(PROJECT_FILE)))
+    if me.get("error"):
+        c.append(_check("broker", False, "operator",
+                        f"the broker at {URL} did not answer ({me['error']}); "
+                        "nothing works until it does", detail=me["error"]))
+        c += [_check(k, None, detail="skipped: the broker did not answer")
+              for k in ("client", "registered")]
+    else:
+        c.append(_check("broker", True, detail=URL))
+        if me.get("refused"):
+            # Another client holds this agent, or this install is too old to
+            # send a client key: nothing else will work until that is fixed.
+            c.append(_check("client", False, "operator",
+                            f"the broker refuses to act as this agent: "
+                            f"{me['refused']}"))
+        else:
+            c.append(_check("client", True))
+        if not registered:
+            c.append(_check("registered", False, "you",
+                            "you are not registered in this station yet: "
+                            "call propose_me(note=\"what this project is\") "
+                            "and an operator approves it with one keystroke "
+                            "— no restart needed"))
+        else:
+            c.append(_check("registered", True))
+    if not on:
+        c.append(_check("push_host", None, detail="skipped: a2a is off"))
+    elif not thread:
+        c.append(_check("push_host", False, "user",
+                        "push is off, so nothing will arrive on its own. "
+                        f"Start Codex with its own app-server: {LAUNCH_LINE}"
+                        + (f" (note: {thread_err})" if thread_err else "")))
+    else:
+        c.append(_check("push_host", True, detail=thread))
+    if c[-1]["ok"] is not True:
+        c.append(_check("stream", None,
+                        detail="skipped: this session cannot be pushed into"))
+    elif not registered:
+        c.append(_check("stream", None, detail="skipped: not registered"))
+    elif stale:
+        c.append(_check("stream", False, "auto",
+                        f"the stream has been silent for {quiet:.0f}s; it "
+                        "reconnects by itself, so wait rather than acting on "
+                        "this (fix=true reconnects it now)"))
+    elif not _state["connected"]:
+        c.append(_check("stream", False, "auto",
+                        "the stream is not connected; it retries by itself, "
+                        "so wait rather than acting on this",
+                        detail=_state["error"] or None))
+    else:
+        c.append(_check("stream", True))
+    theirs = _broker_version()
+    if not theirs or not CLIENT_VERSION:
+        c.append(_check("version", None, detail="unknown"))
+    elif theirs != CLIENT_VERSION:
+        c.append(_check("version", False, "user",
+                        f"this client is {CLIENT_VERSION}, the broker serves "
+                        f"{theirs}: run the installer and pick Codex: "
+                        f"curl -fsSL {URL}/install | python3"))
+    else:
+        c.append(_check("version", True, detail=theirs))
+    return c
+
+
+_report_warned = False
+
+
+def _report(checks, fixed, thread):
+    """The doctor's finding, to the broker — the ONLY time this client reports
+    its state (POST /me/state, one row per agent, overwritten). Best effort:
+    any refusal or error is logged once and ignored."""
+    global _report_warned
+    body = {"harness": "codex", "version": CLIENT_VERSION or "",
+            "switch": _enabled.is_set(),
+            "route": "project" if _enabled.is_set() else None,
+            "receives": bool(thread), "settings": None,
+            "failing": [c["check"] for c in checks if c["ok"] is False],
+            "fixed": sorted({f["check"] for f in fixed})}
+    try:
+        out = api("POST", "/me/state", body, timeout=5)
+    except Exception as e:
+        if not _report_warned:
+            _report_warned = True
+            log(f"could not report the doctor's finding to the broker "
+                f"({e!r}); going on without it")
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _status(a):
+    a = a if isinstance(a, dict) else {}
+    fix = a.get("fix") is True or str(a.get("fix")).lower() == "true"
+    fixed = _repair() if fix else []
+    quiet, stale = _quiet()
+    sock = control_socket()
+    thread, thread_err = _session_thread()
 
     me = _me()
     registered = bool(me.get("registered"))
     stations = me.get("stations") or []
 
-    # In order: be switched on, exist, be reachable, be healthy. Only the
-    # first unmet condition is worth telling an agent about — and "off" must
-    # come first, or an agent in a project that never opted in is told to
-    # register, or to wait for a stream that will never open.
-    if not _enabled.is_set():
-        step = (f"a2a is off in this project: {PROJECT_FILE} does not say "
-                f'{{"{ENABLE_KEY}": true}}, so nothing is delivered here. '
-                "That is the user's decision: only if they ask for a2a in "
-                "this project, call enable_a2a_here(enabled=true)")
-    elif me.get("refused"):
-        # Another client holds this agent, or this install is too old to send
-        # a client key: nothing else will work until that is fixed.
-        step = f"the broker refuses to act as this agent: {me['refused']}"
-    elif not registered:
-        step = ("you are not registered in this station yet: call "
-                "propose_me(note=\"what this project is\") and an operator "
-                "approves it with one keystroke — no restart needed")
-    elif not thread:
-        step = ("push is off, so nothing will arrive on its own. Start Codex "
-                f"with its own app-server: {LAUNCH_LINE}"
-                + (f" (note: {thread_err})" if thread_err else ""))
-    elif stale:
-        step = (f"the stream has been silent for {quiet:.0f}s; it reconnects "
-                f"by itself, so wait rather than acting on this")
-    else:
-        step = None
+    checks = _checks(me, registered, thread, thread_err, quiet, stale)
+    reply = _report(checks, fixed, thread) if registered else None
+    stream = next(c for c in checks if c["check"] == "stream")
+    if (reply and reply.get("stream_live") and stream["ok"] is False
+            and not _state["connected"]):
+        # This session should hold the stream and does not, while the broker
+        # serves one for this agent: another process has it.
+        stream.update(_check(
+            "stream", False, "user",
+            "another process holds this agent's stream (the broker serves "
+            "one, and it is not this session's): close the other Codex "
+            "session using this agent, or give one of them its own name"))
+    step = next((c["do"] for c in checks if c["ok"] is False), None)
 
     return json.dumps({
         "agent": NAME,
         "station": (stations[0] if len(stations) == 1 else stations) or None,
         "registered": registered,
         "channels": _my_channels(),
+        "checks": checks,
+        "fixed": fixed,
         "push": {
             "enabled": bool(thread),
             "stream_connected": _state["connected"],
@@ -1613,8 +1790,11 @@ TOOLS = [
     ("a2a_channel_status",
      "Diagnose this client: the id it announces, whether push is enabled and "
      "the stream is live, how many messages it has injected into this "
-     "session, and where its log is. Read this first when a2a seems quiet.",
-     {}, [], _status),
+     "session, and where its log is. Read this first when a2a seems quiet. "
+     "`checks` lists every check with who must act; pass fix=true and it "
+     "repairs what it safely can on its own (a silent stream, pending acks, "
+     "a lost app-server connection) — everything else names who must act.",
+     {"fix": {"type": "boolean"}}, [], _status),
 ]
 
 TOOL_BY_NAME = {t[0]: t for t in TOOLS}

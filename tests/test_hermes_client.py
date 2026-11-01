@@ -29,6 +29,13 @@ What is pinned, and why each matters:
               → nothing goes in, nothing is lost, and it all arrives when the
               conversation is open again (a turn there, or the peek); a key
               Hermes rotates by compressing is followed by the app's id.
+  tui         a conversation tagged "tui" is the same kind of route: Hermes
+              tags a bot's own chat so on a gateway the app reaches by URL.
+  host        only the process whose session table holds the conversation
+              (or where a turn of it ran) streams; HERMES_DESKTOP is no sign.
+  cloned      settings and a baked id copied from another bot — Hermes
+              clones config.yaml and the plugins folder — are ignored: the
+              clone starts off, under its own name, and turns on where asked.
 
 Contract with Hermes itself — that these names and signatures exist — is
 tests/test_hermes_contract.py, against a Hermes checkout.
@@ -38,6 +45,7 @@ import importlib.util
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -152,11 +160,36 @@ class Manager:
         self.has_tui_message_injector = tui
 
 
+class FakeState:
+    """Hermes's PluginState (PluginContext.state): one plugin's JSON key/value
+    store at <profile>/plugin-data/<plugin>/state.json — kept in a dict here,
+    its folder under the profile home register() runs in."""
+
+    def __init__(self, data: dict):
+        self.data = data
+
+    @property
+    def data_dir(self):
+        return (Path(_HOME.get() or tempfile.gettempdir()) / "plugin-data"
+                / "agent-plugin-a2a-test")
+
+    def get(self, key, default=None):
+        return json.loads(json.dumps(self.data.get(key, default)))
+
+    def set(self, key, value):
+        self.data[key] = json.loads(json.dumps(value))
+
+
 class Ctx:
-    """The PluginContext surface the plugin uses, and nothing else."""
+    """The PluginContext surface the plugin uses, and nothing else.
+
+    `config` is the plugin's section of config.yaml — where a bot set up
+    before the plugin kept its own state had its settings, now only read.
+    `saved` is the plugin's own state (ctx.state). plugin_state=False is a
+    Hermes without one."""
 
     def __init__(self, profile, gateway=True, config=None, allowed=True,
-                 tui=False):
+                 tui=False, state=None, plugin_state=True):
         self.profile_name = profile
         self._manager = Manager(gateway, tui)
         self.allowed = allowed
@@ -164,6 +197,10 @@ class Ctx:
         self.hooks: dict = {}
         self.unload: list = []
         self.config: dict = dict(config or {})
+        self.config_writes: list = []
+        self.saved: dict = dict(state or {})
+        if plugin_state:
+            self.state = FakeState(self.saved)
         # (content, origin) for a chat; (content, {"session_key": K}) for an
         # app conversation.
         self.injected: list[tuple[str, dict]] = []
@@ -189,6 +226,7 @@ class Ctx:
         return json.loads(json.dumps(self.config.get(key, default)))
 
     def set_config(self, key, value):
+        self.config_writes.append(key)
         self.config[key] = json.loads(json.dumps(value))
 
     def inject_message(self, content, role="user", *, session_key=None,
@@ -261,9 +299,10 @@ def load(url, token="t"):
     return mod
 
 
-def start(mod, ctx):
-    """register(ctx) the way Hermes calls it: under the profile's home."""
-    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+def start(mod, ctx, home=None):
+    """register(ctx) the way Hermes calls it: under the profile's home — a
+    fresh one unless given (a restart of the same bot)."""
+    home = home or tempfile.mkdtemp(prefix="a2a-hermes-home-")
 
     def inner():
         _HOME.set(home)
@@ -294,8 +333,10 @@ DESK2 = {"source": "desktop", "session_key": "20261013_120500_bbbbbb",
 TUI = {"source": "tui", "session_key": "20261013_121000_eeeeee",
        "ui": "0a0b0c0d"}
 DESK_ROUTE = {"surface": "desktop", "session_key": DESK["session_key"],
-              "ui_session_id": DESK["ui"]}
+              "ui_session_id": DESK["ui"], "source": "desktop"}
 DESK_ON = {"enabled": True, "route": DESK_ROUTE}
+TUI_ROUTE = {"surface": "desktop", "session_key": TUI["session_key"],
+             "ui_session_id": TUI["ui"], "source": "tui"}
 
 
 def msg(i, text="hello"):
@@ -415,19 +456,19 @@ def main() -> int:
     start(mod, ctx)
     out = ctx.call("enable_a2a_here", CLI, {"enabled": True})
     check("enabling from the CLI is refused — a2a runs in a messaging chat",
-          "error" in out and not ctx.config.get("enabled"), str(out))
+          "error" in out and not ctx.saved.get("enabled"), str(out))
     out = ctx.call("enable_a2a_here", dict(GROUP, user_id=""),
                    {"enabled": True})
     check("enabling from a turn with no user id is refused — nobody could "
-          "own it", "error" in out and not ctx.config.get("enabled"), str(out))
+          "own it", "error" in out and not ctx.saved.get("enabled"), str(out))
     out = ctx.call("enable_a2a_here", ALICE, {"enabled": True})
     check("alice says 'enable a2a here' in the group: on, and the route is "
           "EXACTLY that turn's session", out.get("enabled") is True
-          and ctx.config.get("route") == GROUP
-          and ctx.config.get("enabled") is True, str(ctx.config))
+          and ctx.saved.get("route") == GROUP
+          and ctx.saved.get("enabled") is True, str(ctx.saved))
     check("and alice is its owner",
-          ctx.config.get("owner") == {"platform": "x", "user_id": "alice"},
-          str(ctx.config.get("owner")))
+          ctx.saved.get("owner") == {"platform": "x", "user_id": "alice"},
+          str(ctx.saved.get("owner")))
     check("it connects at once, no restart",
           until(lambda: any(c == "/stream" for c in fb.calls), 3),
           str(fb.calls))
@@ -464,11 +505,11 @@ def main() -> int:
           isinstance(out, dict) and "error" not in out, str(out))
     out = ctx.call("enable_a2a_here", BOB, {"enabled": False})
     check("bob cannot turn it off", "error" in out
-          and ctx.config.get("enabled") is True, str(out))
+          and ctx.saved.get("enabled") is True, str(out))
     out = ctx.call("enable_a2a_here", dict(ELSEWHERE, user_id="bob"),
                    {"enabled": True})
     check("nor move it to his own chat", "error" in out
-          and ctx.config.get("route") == GROUP, str(out))
+          and ctx.saved.get("route") == GROUP, str(out))
 
     # --- lifecycle: reserved → scheduled → observed → acked ------------------
     until(lambda: mod_state(ctx_inst(ctx))["connected"], 3)
@@ -483,11 +524,11 @@ def main() -> int:
           "m1" not in fb.acked, str(fb.acked))
     out = ctx.call("enable_a2a_here", dict(ELSEWHERE), {"enabled": True})
     check("moving the route is refused while a message is still settling",
-          "settling" in str(out.get("error")) and ctx.config["route"] == GROUP,
+          "settling" in str(out.get("error")) and ctx.saved["route"] == GROUP,
           str(out))
     out = ctx.call("enable_a2a_here", ALICE, {"enabled": False})
     check("and so is turning it off", "settling" in str(out.get("error"))
-          and ctx.config["enabled"] is True, str(out))
+          and ctx.saved["enabled"] is True, str(out))
     content = ctx.injected[-1][0]
     ctx.turn(dict(BOB, user_id="alice", chat_id="-999"), "s-other", content)
     time.sleep(0.3)
@@ -563,7 +604,7 @@ def main() -> int:
     until(lambda: inst.deliveries.get("m5", {}).get("state") == "scheduled")
     out = ctx.call("rename_me", ALICE, {"new_id": "other"})
     check("rename_me to an id this token already owns ADOPTS it",
-          out.get("adopted") is True and ctx.config.get("agent") == "other",
+          out.get("adopted") is True and ctx.saved.get("agent") == "other",
           str(out))
     check("the stream reconnects as the new id",
           until(lambda: ("/stream", "other") in fb.agents), str(fb.agents[-5:]))
@@ -595,7 +636,7 @@ def main() -> int:
     fb.quiet.set()                    # the next line on the wire is m7
     out = ctx.call("enable_a2a_here", ALICE, {"enabled": False})
     check("alice turns it off (nothing settling)",
-          out.get("enabled") is False and ctx.config["enabled"] is False,
+          out.get("enabled") is False and ctx.saved["enabled"] is False,
           str(out))
     fb.live.put(msg("m7", "after off"))
     check("the stream closes", until(lambda: not inst.state["connected"]),
@@ -664,6 +705,10 @@ def main() -> int:
 
     served_artifact()
     desktop()
+    tui_route()
+    cloned()
+    own_state()
+    doctor()
     cron()
     propose()
 
@@ -679,6 +724,19 @@ def main() -> int:
 def _no_tui_gateway():
     for name in ("tui_gateway.server", "tui_gateway"):
         sys.modules.pop(name, None)
+
+
+def hold_in_table(sessions: dict):
+    """Hermes's session table in THIS process (tui_gateway.server._sessions,
+    runtime id → record), holding `sessions` — what the injector matches a
+    session_key against, and what the plugin reads to know it serves one."""
+    srv = types.ModuleType("tui_gateway.server")
+    srv._sessions_lock = threading.Lock()
+    srv._sessions = dict(sessions)
+    pkg = types.ModuleType("tui_gateway")
+    pkg.server = srv
+    sys.modules.update({"tui_gateway": pkg, "tui_gateway.server": srv})
+    return srv
 
 
 def desktop() -> None:
@@ -720,8 +778,8 @@ def _desktop_route() -> None:
           "with no user id — the app is the bot's operator",
           out.get("enabled") is True, str(out))
     check("desktop: it pins that conversation by its key and by the app's id "
-          "for it", ctx.config.get("route") == DESK_ROUTE,
-          str(ctx.config.get("route")))
+          "for it", ctx.saved.get("route") == DESK_ROUTE,
+          str(ctx.saved.get("route")))
     check("desktop: and the app's backend opens the stream at once",
           until(lambda: "/stream" in fb.calls), str(fb.calls))
 
@@ -828,16 +886,16 @@ def _desktop_route() -> None:
           "and the message goes in under it",
           until(lambda: "d5" in ctx.ids_injected())
           and ctx.injected[-1][1] == {"session_key": new_key}
-          and (ctx.config.get("route") or {}).get("session_key") == new_key,
-          f"{ctx.injected[-1:]} {ctx.config.get('route')}")
+          and (ctx.saved.get("route") or {}).get("session_key") == new_key,
+          f"{ctx.injected[-1:]} {ctx.saved.get('route')}")
     ctx.turn(dict(DESK, session_key=new_key), "s1", ctx.injected[-1][0])
     check("compressed: a turn under the new key acks it",
           until(lambda: "d5" in fb.acked), str(fb.acked))
     newer = dict(DESK, session_key="20261013_140000_dddddd")
     ctx.turn(newer, "s1", "x")
     check("compressed: a turn under yet another key, same app id, is followed",
-          (ctx.config.get("route") or {}).get("session_key")
-          == newer["session_key"], str(ctx.config.get("route")))
+          (ctx.saved.get("route") or {}).get("session_key")
+          == newer["session_key"], str(ctx.saved.get("route")))
     _no_tui_gateway()
     stop(ctx)
     fb.close()
@@ -877,8 +935,8 @@ def _desktop_hosts() -> None:
           str(fb.calls))
     c.turn(TUI, "s-tui")
     time.sleep(0.4)
-    check("host: a terminal UI turn there does not make it the app's backend",
-          fb.calls == [], str(fb.calls))
+    check("host: a turn of ANOTHER conversation there (a tui one) does not "
+          "make it the route's host", fb.calls == [], str(fb.calls))
     c.turn(DESK, "s-desk")
     check("host: a turn of the route conversation there DOES — the stream "
           "opens at once", until(lambda: "/stream" in fb.calls, 3),
@@ -915,7 +973,32 @@ def _desktop_hosts() -> None:
     check("host: the GATEWAY, even with a route turn, never holds an app "
           "route — it has no desktop injector", fb.calls == [], str(fb.calls))
     stop(c)
+
+    # HERMES_DESKTOP is inherited by every shell the app opens, its terminal
+    # pane included (hermes_cli/process_identity.py), so it is no sign: a
+    # `hermes --tui` there has the injector and the variable, and not the
+    # conversation. It used to take the stream on the variable alone.
     os.environ["HERMES_DESKTOP"] = "1"
+    fb.calls.clear()
+    c = Ctx("bot", gateway=False, tui=True, config=DESK_ON)
+    start(mod, c)
+    time.sleep(0.4)
+    check("host: HERMES_DESKTOP and the injector, but the conversation not in "
+          "this process's table and no turn of it here → zero requests",
+          fb.calls == [], str(fb.calls))
+    stop(c)
+
+    # The table holding it by KEY under another app id — the injector's own
+    # match (inject_tui_session_message) — is the conversation being here.
+    fb.calls.clear()
+    hold_in_table({"ffff0000": {"session_key": DESK["session_key"]}})
+    c = Ctx("bot", gateway=False, tui=True, config=DESK_ON)
+    start(mod, c)
+    check("host: the conversation in this process's table by its key → the "
+          "stream opens", until(lambda: "/stream" in fb.calls, 3),
+          str(fb.calls))
+    stop(c)
+    _no_tui_gateway()
     fb.close()
 
 
@@ -928,17 +1011,17 @@ def _desktop_owner() -> None:
     out = c.call("enable_a2a_here", DESK, {"enabled": True})
     check("owner: the app takes a2a from a chat",
           out.get("enabled") is True
-          and (c.config.get("route") or {}).get("surface") == "desktop",
+          and (c.saved.get("route") or {}).get("surface") == "desktop",
           str(out))
     check("owner: and the chat's owner is kept, to move it back later",
-          c.config.get("owner") == {"platform": "x", "user_id": "alice"},
-          str(c.config.get("owner")))
+          c.saved.get("owner") == {"platform": "x", "user_id": "alice"},
+          str(c.saved.get("owner")))
     out = c.call("enable_a2a_here", BOB, {"enabled": True})
     check("owner: someone else in the chat cannot take it",
           "error" in out, str(out))
     out = c.call("enable_a2a_here", ALICE, {"enabled": True})
     check("owner: the chat's owner can move it back to their chat",
-          out.get("enabled") is True and c.config.get("route") == GROUP,
+          out.get("enabled") is True and c.saved.get("route") == GROUP,
           str(out))
     stop(c)
 
@@ -954,11 +1037,19 @@ def _desktop_owner() -> None:
     out = c.call("enable_a2a_here", BOB, {"enabled": True})
     check("owner: once the app turns it off, a chat user can turn it on and "
           "owns it", out.get("enabled") is True
-          and c.config.get("owner") == {"platform": "x", "user_id": "bob"},
+          and c.saved.get("owner") == {"platform": "x", "user_id": "bob"},
           str(out))
     out = c.call("enable_a2a_here", TUI, {"enabled": True})
-    check("owner: a terminal UI session is refused, and told where a2a can "
-          "run", "error" in out and "Hermes app" in out["error"], str(out))
+    check("owner: a tui-tagged conversation is a conversation like the "
+          "app's — it takes a2a, and the chat's owner is kept",
+          out.get("enabled") is True
+          and c.saved.get("route") == TUI_ROUTE
+          and c.saved.get("owner") == {"platform": "x", "user_id": "bob"},
+          str(out))
+    out = c.call("enable_a2a_here", CLI, {"enabled": True})
+    check("owner: the plain CLI is refused, and told where a2a can run",
+          "error" in out and "Hermes app" in out["error"]
+          and "hermes --tui" in out["error"], str(out))
     stop(c)
     fb.close()
 
@@ -1034,6 +1125,31 @@ def served_artifact() -> None:
           "default profile gets its name from ?agent=",
           len(c.tools) == 22 and inst.key == "bot1" and inst.key_valid,
           f"{len(c.tools)} tools, key {inst.key!r}")
+    stop(c)
+
+    # ?profile= names the bot the line is baked for: Hermes copies the
+    # plugins folder when it clones a bot, and a clone must not take the id.
+    resp = get("good", b"agent=bot1&profile=default")
+    with tarfile.open(fileobj=io.BytesIO(resp.body), mode="r:gz") as t:
+        src = t.extractfile("__init__.py").read()
+    (d / "__init__.py").write_bytes(src)
+    spec = importlib.util.spec_from_file_location("served_hermes_p",
+                                                  d / "__init__.py")
+    marked = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(marked)
+    check("installer: ?profile= is baked beside the id",
+          marked.A2A_BAKED.get("profile") == "default"
+          and marked.A2A_BAKED.get("agent") == "bot1",
+          str({k: v for k, v in marked.A2A_BAKED.items() if k != "token"}))
+    c = Ctx("default")
+    inst = start(marked, c)
+    mine = inst.key
+    stop(c)
+    c = Ctx("clone")
+    inst = start(marked, c)
+    check("and the id is used in that profile, and NOT in a clone of it — "
+          "the clone is named by its own profile",
+          mine == "bot1" and inst.key == "clone", f"{mine} / {inst.key}")
     stop(c)
 
 
@@ -1204,14 +1320,14 @@ def propose() -> None:
     check("propose: off, from the CLI → refused as enabling there is: "
           "nothing asked, still off",
           isinstance(out, dict) and "error" in out and not asked(fb)
-          and ctx.config.get("enabled") is not True, f"{out} {asked(fb)}")
+          and ctx.saved.get("enabled") is not True, f"{out} {asked(fb)}")
     out = ctx.call("propose_me", ALICE, {"note": "hi"})
-    route = ctx.config.get("route") or {}
+    route = ctx.saved.get("route") or {}
     check("propose: off, alice in the group → a2a turned on THERE, alice "
           "owns it, and the request is posted",
-          ctx.config.get("enabled") is True
+          ctx.saved.get("enabled") is True
           and same_chat_keys(route, GROUP)
-          and ctx.config.get("owner") == {"platform": "x", "user_id": "alice"}
+          and ctx.saved.get("owner") == {"platform": "x", "user_id": "alice"}
           and asked(fb) == [{"agent_id": "bot", "note": "hi"}]
           and "a2a" in out, f"{out} {route} {asked(fb)}")
     check("propose: and the stream opens at once — it delivers the moment "
@@ -1231,15 +1347,357 @@ def propose() -> None:
         check("propose: off, in an app conversation → that conversation is "
               "the route, the request posted, the stream open — with no "
               "HERMES_DESKTOP: the turn ran here",
-              ctx.config.get("route") == DESK_ROUTE
+              ctx.saved.get("route") == DESK_ROUTE
               and asked(fb) == [{"agent_id": "bot", "note": "app"}]
               and until(lambda: "/stream" in fb.calls, 3),
-              f"{out} {ctx.config.get('route')} {fb.calls}")
+              f"{out} {ctx.saved.get('route')} {fb.calls}")
         stop(ctx)
         fb.close()
     finally:
         if saved is not None:
             os.environ["HERMES_DESKTOP"] = saved
+
+
+def tui_route() -> None:
+    """A conversation tagged "tui" is a route like an app one. Hermes tags a
+    chat "desktop" only when the app passed it or the backend has
+    HERMES_DESKTOP (tui_gateway/agent_factory.py), and the app opens a bot's
+    own chat with no source (plugins/hermes-bots/canonical-chat.ts) — so on
+    a gateway the app reaches by URL that chat is "tui". It refused, and a
+    new bot there could not even sign up. The injector queues by key either
+    way (tui_gateway/plugin_inject.py)."""
+    saved = os.environ.pop("HERMES_DESKTOP", None)
+    try:
+        fb = FakeBroker()
+        mod = load(fb.url)
+        ctx = Ctx("bot", gateway=False, tui=True)
+        ctx.live_keys = {TUI["session_key"]}
+        start(mod, ctx)
+        out = ctx.call("enable_a2a_here", TUI, {"enabled": True})
+        check("tui: 'enable a2a here' in a tui-tagged conversation is "
+              "accepted, and pins it by key and app id",
+              out.get("enabled") is True
+              and ctx.saved.get("route") == TUI_ROUTE, f"{out}")
+        check("tui: the stream opens in the process the turn ran in",
+              until(lambda: "/stream" in fb.calls, 3), str(fb.calls))
+        fb.live.put(msg("t1"))
+        check("tui: a message is queued on it by its key",
+              until(lambda: "t1" in ctx.ids_injected())
+              and ctx.injected[-1][1] == {"session_key": TUI["session_key"]},
+              str(ctx.injected[-1:]))
+        ctx.turn(TUI, "s1", ctx.injected[-1][0])
+        check("tui: a turn there that shows it acks it",
+              until(lambda: "t1" in fb.acked), str(fb.acked))
+        ok = ctx.call("whoami", TUI)
+        other = ctx.call("whoami", DESK)
+        check("tui: the tools work there, and refuse in another "
+              "conversation, saying how to move it",
+              "error" not in json.dumps(ok)[:40]
+              and isinstance(other, dict) and "error" in other
+              and "enable a2a here" in other["error"], f"{ok} / {other}")
+        st = ctx.call("a2a_channel_status", TUI)
+        check("tui: status names the conversation without calling it the "
+              "app's, and shows the tag this turn carries",
+              (st.get("push") or {}).get("chat")
+              == f"the Hermes conversation {TUI['session_key']}"
+              and ((st.get("push") or {}).get("this_turn") or {})
+              .get("source") == "tui", str(st.get("push")))
+        stop(ctx)
+        fb.close()
+    finally:
+        if saved is not None:
+            os.environ["HERMES_DESKTOP"] = saved
+
+
+def cloned() -> None:
+    """A bot Hermes cloned from another. The app's "new bot" clones `default`
+    (plugins/hermes-bots/create-dialog.tsx), and a clone copies config.yaml
+    whole — this plugin's settings in it — and the plugins folder with the
+    id baked in (hermes_cli/profiles.py). A real one opened holding the
+    default bot's route, refused propose_me everywhere ("a2a runs in one
+    conversation of this bot … and this is not it"), and could not sign up."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+    other = Path(tempfile.mkdtemp(prefix="a2a-hermes-other-")).resolve()
+    copied = dict(DESK_ON, owner={"platform": "x", "user_id": "alice"},
+                  agent="botd", home=str(other))
+    ctx = Ctx("clone", gateway=False, tui=True, config=copied)
+    ctx.live_keys = {DESK["session_key"], TUI["session_key"]}
+    hold_in_table({DESK["ui"]: {"session_key": DESK["session_key"]}})
+    try:
+        inst = start(mod, ctx)
+        time.sleep(0.3)
+        check("cloned: settings written in another bot's home are ignored — "
+              "a2a off, zero broker requests, its own name — even with the "
+              "copied conversation open in this process",
+              fb.calls == [] and not inst.enabled and inst.route is None
+              and inst.key == "clone", f"{fb.calls} {inst.key}")
+    finally:
+        _no_tui_gateway()
+    st = ctx.call("a2a_channel_status", TUI)
+    settings = next((c for c in st.get("checks") or []
+                     if c["check"] == "settings"), {})
+    check("cloned: status says the settings are another bot's, and what to "
+          "do", "another bot's" in (st.get("next_step") or "")
+          and settings.get("ok") is False and settings.get("who") == "human",
+          f"{st.get('next_step')} / {settings}")
+    saved = dict(ctx.saved)
+    st = ctx.call("a2a_channel_status", TUI, {"fix": True})
+    check("cloned: fix=true repairs nothing here and writes nothing — the "
+          "copied settings stay ignored, reported only",
+          st.get("fixed") == [] and ctx.saved == saved
+          and ctx.config_writes == [], f"{st.get('fixed')} {ctx.saved}")
+    out = ctx.call("propose_me", TUI, {"note": "new bot"})
+    asked = [b for p, b in fb.bodies if p == "/me/proposals"]
+    check("cloned: propose_me in the bot's own chat turns a2a on THERE and "
+          "files the request under the bot's own name",
+          ctx.saved.get("route") == TUI_ROUTE
+          and ctx.saved.get("enabled") is True
+          and asked == [{"agent_id": "clone", "note": "new bot"}],
+          f"{out} {ctx.saved} {asked}")
+    check("cloned: and nothing was written to config.yaml — the plugin "
+          "keeps its own state", ctx.config_writes == [],
+          str(ctx.config_writes))
+    check("cloned: the first write cleared what it did not choose, and "
+          "recorded this home",
+          ctx.saved.get("agent") is None and ctx.saved.get("owner") is None
+          and ctx.saved.get("home") == inst.home_id
+          and inst.home_id != str(other), str(ctx.saved))
+    check("cloned: the stream opens where the turn ran",
+          until(lambda: "/stream" in fb.calls, 3), str(fb.calls))
+    home = str(inst.home)
+    stop(ctx)
+    again = Ctx("clone", gateway=False, tui=True, state=ctx.saved)
+    i2 = start(mod, again, home=home)
+    check("cloned: written here, they are this bot's on the next load",
+          i2.enabled and i2.route == TUI_ROUTE and not i2.copied,
+          f"{i2.enabled} {i2.route} {i2.copied}")
+    stop(again)
+
+    # Settings older than `home` carry no home: they are judged by their
+    # conversation, which lives in the bot's own state.db — and a clone
+    # does not copy state.db (hermes_cli/profiles.py).
+    legacy = tempfile.mkdtemp(prefix="a2a-hermes-legacy-")
+    db = sqlite3.connect(Path(legacy) / "state.db")
+    db.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, "
+               "source TEXT NOT NULL)")
+    db.execute("INSERT INTO sessions VALUES (?, 'desktop')",
+               (DESK2["session_key"],))
+    db.commit()
+    db.close()
+    fb.calls.clear()
+    c = Ctx("clone", gateway=False, tui=True, config=dict(DESK_ON))
+    i = start(mod, c, home=legacy)
+    check("legacy: an unmarked route whose session is NOT in this profile's "
+          "state.db is ignored", bool(i.copied) and not i.enabled
+          and i.route is None, f"{i.copied} {i.enabled}")
+    stop(c)
+    mine = dict(DESK_ROUTE, session_key=DESK2["session_key"],
+                ui_session_id=DESK2["ui"])
+    c = Ctx("bot", gateway=False, tui=True,
+            config={"enabled": True, "route": mine})
+    i = start(mod, c, home=legacy)
+    check("legacy: one whose session IS there is trusted",
+          not i.copied and i.enabled and i.route == mine, f"{i.copied}")
+    stop(c)
+    c = Ctx("bot", gateway=False, tui=True, config=dict(DESK_ON))
+    i = start(mod, c)
+    check("legacy: no state.db to ask → trusted, as before",
+          not i.copied and i.enabled, f"{i.copied}")
+    stop(c)
+
+    # The id baked into a copied plugins folder.
+    m2 = load(fb.url)
+    m2.A2A_BAKED.update(agent="botd")             # an older line: no profile
+    c = Ctx("clone")
+    i = start(m2, c)
+    check("baked: an unmarked id in a NAMED bot came from the bot it was "
+          "cloned from — ignored, named by its profile", i.key == "clone",
+          i.key)
+    stop(c)
+    c = Ctx("default")
+    i = start(m2, c)
+    check("baked: in the default profile an unmarked id is its own, as "
+          "before", i.key == "botd" and i.key_valid, i.key)
+    stop(c)
+    m2.A2A_BAKED.update(profile="default")
+    c = Ctx("clone")
+    i = start(m2, c)
+    check("baked: an id baked for `default` does not name its clone",
+          i.key == "clone", i.key)
+    stop(c)
+    m3 = load(fb.url)
+    m3.A2A_BAKED.update(agent="bot-x", profile="bot1")
+    c = Ctx("bot1")
+    i = start(m3, c)
+    check("baked: an id baked for this profile is used", i.key == "bot-x",
+          i.key)
+    stop(c)
+    fb.close()
+
+
+def own_state() -> None:
+    """The plugin keeps its state in its own folder (ctx.state, plugin-data/)
+    and never writes config.yaml, the file Hermes copies whole into a clone.
+    A bot set up before keeps working: its config.yaml settings are read,
+    read only, and carried over at the first write; its client secret stays
+    where it is, so its client key — which the broker pins — does not move."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+
+    # A working bot from before: its own chat route in config.yaml.
+    c = Ctx("bot", config=dict(ON))
+    i = start(mod, c)
+    check("own state: a bot's old config.yaml settings are read — on, in "
+          "its chat, as before", i.enabled and i.route == GROUP
+          and i.owner == ON["owner"], f"{i.enabled} {i.route}")
+    check("own state: and its stream opens, as before",
+          until(lambda: "/stream" in fb.calls, 3), str(fb.calls))
+    settle()
+    out = c.call("enable_a2a_here", ELSEWHERE | {"user_id": "alice"},
+                 {"enabled": True})
+    check("own state: the first write carries them over into the plugin's "
+          "own state, the change on top",
+          out.get("enabled") is True
+          and c.saved.get("owner") == ON["owner"]
+          and same_chat_keys(c.saved.get("route") or {},
+                             dict(ELSEWHERE, user_id="alice"))
+          and c.saved.get("enabled") is True
+          and c.saved.get("home") == i.home_id, f"{out} {c.saved}")
+    check("own state: and config.yaml is left exactly as it was",
+          c.config_writes == [] and c.config == ON, str(c.config_writes))
+    stop(c)
+
+    # A Hermes with no per-plugin store keeps the old place.
+    fb.calls.clear()
+    c = Ctx("bot", plugin_state=False)
+    i = start(mod, c)
+    out = c.call("enable_a2a_here", ALICE, {"enabled": True})
+    check("own state: a Hermes without ctx.state still works — its settings "
+          "go to config.yaml, as before",
+          out.get("enabled") is True and c.config.get("route") == GROUP
+          and "home" in c.config_writes, f"{out} {c.config_writes}")
+    check("own state: and its log stays in logs/", i.log_file.parent.name
+          == "logs", str(i.log_file))
+    stop(c)
+
+    # The client secret: an old one stays put; a new one is the plugin's.
+    home = tempfile.mkdtemp(prefix="a2a-hermes-secret-")
+    secret = "ab" * 32
+    (Path(home) / "a2a-client.secret").write_text(secret + "\n")
+    c = Ctx("bot")
+    i = start(mod, c, home=home)
+    expect = mod.derive_client_key(home, "profile:bot")
+    check("own state: a secret already at the profile root is THE secret — "
+          "same client key as before, nothing new made",
+          i.client_key() == expect and expect
+          and not (i.data_dir / "a2a-client.secret").exists(),
+          f"{i.client_key()} {expect}")
+    check("own state: and the log is in the plugin's own folder",
+          i.log_file.parent == i.data_dir, str(i.log_file))
+    stop(c)
+    c = Ctx("bot")
+    i = start(mod, c)
+    key = i.client_key()
+    check("own state: a new bot's secret lands in the plugin's own folder, "
+          "never at the profile root",
+          key and (i.data_dir / "a2a-client.secret").is_file()
+          and not (i.home / "a2a-client.secret").exists(), str(i.data_dir))
+    stop(c)
+    fb.close()
+
+
+DOCTOR_IDS = ["install", "identity", "settings", "switch", "broker",
+              "client", "registered", "push_host", "stream", "version"]
+REPORT_KEYS = {"harness", "version", "switch", "route", "receives",
+               "settings", "failing", "fixed"}
+
+
+def doctor() -> None:
+    """a2a_channel_status is a doctor: every check, who must act, and with
+    fix=true the repairs the client would make by itself anyway — only when
+    that check fails. A healthy install must come out of fix=true exactly as
+    it went in."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot")
+    inst = start(mod, ctx)
+    ctx.call("enable_a2a_here", ALICE, {"enabled": True})
+    until(lambda: inst.state["connected"], 3)
+    settle()
+    check("doctor: nothing reports state at load or at connect — only the "
+          "doctor does", "/me/state" not in fb.calls, str(fb.calls))
+    st = ctx.call("a2a_channel_status", ALICE)
+    ids = [c["check"] for c in st.get("checks") or []]
+    check("doctor: every check, in the shared order",
+          ids == DOCTOR_IDS, str(ids))
+    check("doctor: each entry is exactly {check, ok, who, do, detail}",
+          all(set(c) == {"check", "ok", "who", "do", "detail"}
+              for c in st["checks"]), str(st["checks"][:2]))
+    check("doctor: a healthy install has no failing check and no next_step",
+          st.get("next_step") is None
+          and not [c for c in st["checks"] if c["ok"] is False],
+          str([c for c in st["checks"] if c["ok"] is False]))
+    sent = [b for p, b in fb.bodies if p == "/me/state"]
+    check("doctor: it reports its finding — only the allowed keys, no chat "
+          "id, no user id, no path",
+          sent and set(sent[-1]) == REPORT_KEYS
+          and sent[-1]["route"] == "chat" and sent[-1]["harness"] == "hermes"
+          and "-100" not in json.dumps(sent[-1])
+          and "alice" not in json.dumps(sent[-1]), str(sent[-1:]))
+
+    # Safety: fix=true on a healthy install changes nothing.
+    streams, saved = fb.streams, json.dumps(ctx.saved, sort_keys=True)
+    st = ctx.call("a2a_channel_status", ALICE, {"fix": True})
+    time.sleep(0.5)
+    check("doctor: fix=true on a healthy install repairs nothing — no "
+          "reconnect, nothing written",
+          st.get("fixed") == [] and fb.streams == streams
+          and json.dumps(ctx.saved, sort_keys=True) == saved
+          and ctx.config_writes == [], f"{st.get('fixed')} {fb.streams}")
+    st = ctx.call("a2a_channel_status", BOB, {"fix": True})
+    check("doctor: fix=true from someone else's chat leaves the route and "
+          "the owner exactly as they were",
+          json.dumps(ctx.saved, sort_keys=True) == saved, str(ctx.saved))
+
+    # A connected stream gone silent: fix=true reconnects it now.
+    fb.quiet.set()
+    time.sleep(0.4)
+    inst.state["last_line"] = time.time() - 2 * mod.STREAM_READ_TIMEOUT
+    streams = fb.streams
+    st = ctx.call("a2a_channel_status", ALICE, {"fix": True})
+    fb.quiet.clear()
+    check("doctor: a silent stream is failing, `auto`, and fix=true asks it "
+          "to reconnect",
+          any(f["check"] == "stream" for f in st.get("fixed") or []),
+          str(st.get("fixed")))
+    check("doctor: and it does — a new stream on its next line",
+          until(lambda: fb.streams > streams, 5), f"{fb.streams}")
+    check("doctor: and nothing was written by it", ctx.config_writes == []
+          and json.dumps(ctx.saved, sort_keys=True) == saved, str(ctx.saved))
+    stop(ctx)
+
+    # A conversation key Hermes rotated: fix=true follows it, as _inject_app
+    # would on its next refusal.
+    saved_env = os.environ.pop("HERMES_DESKTOP", None)
+    try:
+        new_key = "20261013_150000_ffffff"
+        c = Ctx("bot", gateway=False, tui=True,
+                state={"enabled": True, "route": DESK_ROUTE})
+        c.live_keys = {DESK["session_key"], new_key}
+        hold_in_table({DESK["ui"]: {"session_key": new_key}})
+        i = start(mod, c)
+        st = c.call("a2a_channel_status", DESK, {"fix": True})
+        check("doctor: a rotated conversation key is followed by fix=true",
+              (c.saved.get("route") or {}).get("session_key") == new_key
+              and any(f["check"] == "push_host"
+                      for f in st.get("fixed") or []), str(st.get("fixed")))
+        stop(c)
+    finally:
+        _no_tui_gateway()
+        if saved_env is not None:
+            os.environ["HERMES_DESKTOP"] = saved_env
+    fb.close()
 
 
 def same_chat_keys(route: dict, chat: dict) -> bool:

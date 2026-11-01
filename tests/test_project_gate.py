@@ -268,6 +268,23 @@ const flip = await run({ enabled_opencode: true })
 await flip.s.tool.enable_a2a_here.execute({ enabled: false })
 await flip.s.tool.enable_a2a_here.execute({ enabled: true })
 
+// The doctor: fix=true on a healthy plugin changes nothing; on a stream
+// connected but silent it aborts that connection and the pump reconnects.
+const doc = await run({ enabled_opencode: true })
+out.doc_healthy = JSON.parse(await doc.s.tool.a2a_channel_status.execute({ fix: true }))
+await settle()
+out.doc_healthy_opened = opened(doc.dir)
+const realNow = Date.now
+Date.now = () => realNow() + 120000         // as if nothing arrived for 2 min
+out.doc_silent = JSON.parse(await doc.s.tool.a2a_channel_status.execute({ fix: true }))
+Date.now = realNow
+await new Promise((r) => setTimeout(r, 6500))   // RECONNECT_MS, then a new one
+out.doc_after = opened(doc.dir)
+// Off: the doctor says so, and nothing reached the broker before it was asked.
+const docOff = await run(null)
+out.doc_off_before = callsOf(docOff.dir)
+out.doc_off = JSON.parse(await docOff.s.tool.a2a_channel_status.execute({}))
+
 const v2 = await cases(runV2)
 out.v2_keys = keysOf(v2.on.dir)
 // The instructions in V2 go into the system prompt through the session
@@ -725,6 +742,31 @@ def main() -> int:
           str(oc["after_enable"]))
     check("opencode: it turns a project off as well as on",
           oc["off_again"]["enabled"] is False, str(oc["off_again"]))
+
+    # --- OpenCode: the doctor -------------------------------------------------
+    h = oc["doc_healthy"]
+    check("opencode doctor: every check, in the shared order",
+          [c["check"] for c in h.get("checks") or []]
+          == ["install", "identity", "settings", "switch", "broker", "client",
+              "registered", "push_host", "stream", "version"],
+          str([c["check"] for c in h.get("checks") or []]))
+    check("opencode doctor: fix=true on a healthy plugin repairs nothing and "
+          "opens no second stream",
+          h.get("fixed") == [] and h.get("next_step") is None
+          and oc["doc_healthy_opened"] == {"total": 1, "open": 1},
+          f"{h.get('fixed')} {oc['doc_healthy_opened']}")
+    check("opencode doctor: a connected but silent stream — fix=true aborts "
+          "it, and the pump opens a new one",
+          [f["check"] for f in oc["doc_silent"].get("fixed") or []] == ["stream"]
+          and oc["doc_after"] == {"total": 2, "open": 1},
+          f"{oc['doc_silent'].get('fixed')} {oc['doc_after']}")
+    sw = next((c for c in oc["doc_off"].get("checks") or []
+               if c["check"] == "switch"), {})
+    check("opencode doctor: in a project that is off it says so, names who "
+          "decides — and nothing reached the broker until it was asked",
+          sw.get("ok") is False and sw.get("who") == "human"
+          and "a2a is off" in (oc["doc_off"].get("next_step") or "")
+          and oc["doc_off_before"] == [], f"{sw} {oc['doc_off_before']}")
 
     # --- Codex: the real client, as a process ---------------------------------
     for label, contents in (("no .a2a.json at all", None),

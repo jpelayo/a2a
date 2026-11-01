@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -312,6 +313,10 @@ def main() -> int:
         check("fresh: a named bot lands in its profile, named by its profile",
               (hb / "__init__.py").is_file()
               and '"agent": ""' in (hb / "__init__.py").read_text())
+        check("fresh: each bot's line names the profile it was baked for — "
+              "Hermes copies the plugins folder when it clones a bot",
+              '"profile": "default"' in (hd / "__init__.py").read_text()
+              and '"profile": "bot1"' in (hb / "__init__.py").read_text())
         check("fresh: a profile folder with no Hermes identity file is no bot",
               not (home / ".hermes" / "profiles" / "empty" / "plugins").exists())
         ran = log.read_text().splitlines() if log.is_file() else []
@@ -426,6 +431,51 @@ def main() -> int:
               "the server registered",
               ran and not any(r.startswith("codex") for r in ran),
               "\n".join(ran))
+
+        # --- a bot Hermes cloned from the default one ------------------------
+        # The app's "new bot" clones `default`: config.yaml and the plugins
+        # folder are copied (hermes_cli/profiles.py), so the clone holds the
+        # default bot's plugin with ITS id baked in.
+        hc = home / ".hermes" / "profiles" / "clone"
+        hc.mkdir(parents=True)
+        (hc / "config.yaml").write_text("model: x\n")
+        shutil.copytree(hd, hc / "plugins" / "a2a")
+        check("clone: the copy carries the default bot's id (the setup)",
+              '"agent": "botd"' in (hc / "plugins" / "a2a" / "__init__.py")
+              .read_text())
+        # bot1 was switched on since, by the plugin, which keeps its switch
+        # in its own state (plugin-data/), not in config.yaml any more.
+        b1 = home / ".hermes" / "profiles" / "bot1"
+        st = b1 / "plugin-data" / "agent-plugin-a2a-0123abcd" / "state.json"
+        st.parent.mkdir(parents=True)
+        st.write_text(json.dumps({"enabled": True,
+                                  "home": str(b1.resolve())}))
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "",             # ENTER: the installed ones, already ticked
+            TOKEN,
+            "",             # ENTER: every harness uses it
+            "",             # ENTER: default, bot1 and the clone, all installed
+            "",             # ENTER: keep the default bot's id
+            "y",
+            "n",
+        ])
+        check("clone: the installer finishes", code == 0, out[-1500:])
+        cl = next((ln for ln in (hc / "plugins" / "a2a" / "__init__.py")
+                   .read_text().splitlines()
+                   if ln.startswith("A2A_BAKED = ")), "")
+        check("clone: the copied id is NOT kept — the clone is named by its "
+              "own profile, and its line says so",
+              '"agent": ""' in cl and '"profile": "clone"' in cl,
+              cl.replace(TOKEN, "<token>"))
+        check("clone: the default bot keeps its id",
+              '"agent": "botd"' in (hd / "__init__.py").read_text()
+              and '"profile": "default"' in (hd / "__init__.py").read_text())
+        steps = out.split("Next steps", 1)[-1]
+        check("clone: a bot switched on in the plugin's own state is not "
+              "asked to 'enable a2a here' again; the clone is",
+              "Hermes bot 'bot1': in the Hermes app" not in steps
+              and "Hermes bot 'clone': in the Hermes app" in steps,
+              steps[:1500])
 
         # --- commands declined ---------------------------------------------
         m2 = root / "m2"

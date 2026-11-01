@@ -173,6 +173,12 @@ def main() -> int:
               pc.get("pending_total", 0) == 0, json.dumps(pc)[:200])
 
         # ================= OpenCode ========================================
+        # A project is off until it says so (<project>/.a2a.json, one key per
+        # client): without this the plugin loads, registers its tools, and
+        # streams nothing. Inside this run's temp dir, never /tmp itself.
+        proj = tmp / "acme-api"
+        proj.mkdir()
+        (proj / ".a2a.json").write_text('{"enabled_opencode": true}')
         harness = tmp / "drive.mjs"
         harness.write_text(f"""
 // The module reads A2A_* at import time, so the env must be set FIRST.
@@ -199,11 +205,11 @@ const client = {{
   session: {{
     prompt: async () => new Promise(() => {{}}),     // never settles, like life
     promptAsync: async (a) => {{ seen.push(a); return {{}} }},
-    list: async () => [{{ id: "ses_test", directory: "/tmp/acme-api",
+    list: async () => [{{ id: "ses_test", directory: {json.dumps(str(proj))},
                          time: {{ updated: 1 }} }}],
   }},
 }}
-const hooks = await mod.default.server({{ client, directory: "/tmp/acme-api" }})
+const hooks = await mod.default.server({{ client, directory: {json.dumps(str(proj))} }})
 // NO events are fed. session.idle fires only after a turn completes and
 // session.created never fires on a resume, so a client that needs either one
 // is a client that never speaks at boot — which is the bug this asserts is

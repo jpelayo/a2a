@@ -22,6 +22,7 @@ Needs python3. No broker and no database.
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -50,8 +51,10 @@ class SilentStream:
     Also counts connections: the whole point is that the client comes back.
     """
 
-    def __init__(self, go_silent: bool = True):
+    def __init__(self, go_silent: bool = True, keepalive: float = 0.0):
         self.go_silent = go_silent
+        # > 0: a LIVE link instead — a keepalive line every `keepalive` s.
+        self.keepalive = keepalive
         self.connections = 0
         self._sock = socket.socket()
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -95,7 +98,13 @@ class SilentStream:
                                "sender": "peer", "text": "hello"}) + "\n"
             chunk = line.encode()
             conn.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-            if self.go_silent:
+            if self.keepalive:
+                # A healthy broker: a blank line every few seconds, until the
+                # client goes away.
+                while not self._stop.is_set():
+                    time.sleep(self.keepalive)
+                    conn.sendall(b"1\r\n\n\r\n")
+            elif self.go_silent:
                 # The failure being reproduced: the socket stays OPEN and
                 # simply never carries another byte. No close, no reset —
                 # indistinguishable from a live idle link, except that the
@@ -151,6 +160,55 @@ def run_client(script: Path, port: int, tmp: Path, timeout: str,
     return out, err
 
 
+def doctor(tmp: Path) -> None:
+    """The channel's doctor (a2a_channel_status fix=true), in process against
+    a live link. A request to reconnect is honoured on the stream's next line
+    — and one made before a connection opens is dropped when it opens, so a
+    repair can never cut the healthy connection that follows it."""
+    import importlib.util
+    srv = SilentStream(go_silent=False, keepalive=0.3)
+    d = tmp / "doctor"
+    d.mkdir()
+    os.environ.update(A2A_URL=f"http://127.0.0.1:{srv.port}",
+                      A2A_TOKEN="a2a_st_test", A2A_AGENT="probe",
+                      A2A_HELLO="0", A2A_READ_ON_INIT="0",
+                      A2A_STREAM_TIMEOUT="30",
+                      A2A_IDENTITY_STORE=str(d),
+                      A2A_LOG_FILE=str(d / "client.log"),
+                      A2A_AGENT_DIR=str(d))
+    sys.path.insert(0, str(CHANNEL.parent))
+    spec = importlib.util.spec_from_file_location("doctor_channel", CHANNEL)
+    ch = importlib.util.module_from_spec(spec)
+    sys.modules["doctor_channel"] = ch
+    spec.loader.exec_module(ch)
+    ch._send = lambda o: None            # no session to write to here
+    ch._ready.set()
+    try:
+        ch._reconnect.set()              # asked before any connection opened
+        threading.Thread(target=ch._pump_guard, daemon=True,
+                         name="a2a-pump").start()
+        time.sleep(2.5)
+        check("doctor: a reconnect asked for before the connection opened "
+              "does not cut it — cleared when it opens",
+              srv.connections == 1 and not ch._reconnect.is_set()
+              and ch._state["connected"], f"{srv.connections}")
+        check("doctor: and fix=true on that healthy, live channel repairs "
+              "nothing", ch._repair() == [], "")
+        ch._state["last_line"] = time.time() - 120     # as if gone silent
+        fixed = ch._repair()
+        check("doctor: a connected but silent stream is asked to reconnect",
+              [f["check"] for f in fixed] == ["stream"]
+              and ch._reconnect.is_set(), str(fixed))
+        time.sleep(7)
+        check("doctor: and it does, on its next line", srv.connections == 2,
+              f"{srv.connections}")
+        log = (d / "client.log").read_text(errors="replace")
+        check("doctor: logged as the doctor's request, not as a server "
+              "close", "the doctor asked for a fresh stream" in log, log[-300:])
+    finally:
+        srv.stop()
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="a2a-stream-"))
 
@@ -193,18 +251,37 @@ def main() -> int:
         d = tmp / "c"
         _, _ = run_client(CHANNEL, srv3.port, d, "1", 8.0,
                           {"A2A_LOG_MAX_BYTES": "2048"})
-        capped = d / "client.log"
-        size = capped.stat().st_size if capped.is_file() else 0
+        # Rotation is by RENAME (a2a-channel.py _log): over the cap the live
+        # file becomes client.log.1 and a new one starts. The live file is
+        # only ever appended to, so a concurrent session can at worst
+        # overwrite the archive — old lines, never the tail. Where the cut
+        # falls is arbitrary, so the newest lines are asserted across BOTH.
+        live, arch = d / "client.log", d / "client.log.1"
+        sizes = {p.name: p.stat().st_size for p in (live, arch) if p.is_file()}
         check("and caps it, so a client left running for weeks cannot fill "
               "a disk with its own diagnostics",
-              0 < size <= 2048 * 1.5, f"{size} bytes")
-        body = capped.read_text(errors="replace") if capped.is_file() else ""
+              sum(sizes.values()) > 0
+              and all(s <= 2048 * 1.5 for s in sizes.values()), str(sizes))
+        live_t = live.read_text(errors="replace") if live.is_file() else ""
+        arch_t = arch.read_text(errors="replace") if arch.is_file() else ""
+        check("by rotating it: over the cap the log is renamed to client.log.1 "
+              "and a new one starts, rather than being rewritten in place",
+              arch.is_file(), str(sizes))
+
+        def stamp(text: str, i: int) -> str:
+            found = re.findall(r"^\[a2a-channel (\S+ \S+)", text, re.M)
+            return found[i] if found else ""
         check("keeping the most recent lines, which are the ones that "
-              "diagnose a hang",
-              "earlier lines dropped" in body and "reconnecting" in body,
-              body[:200])
+              "diagnose a hang: the archive holds the lines just before the "
+              "live file's, in order",
+              "reconnecting" in arch_t + live_t
+              and (not live_t or stamp(arch_t, -1) <= stamp(live_t, 0)),
+              f"archive ends {stamp(arch_t, -1)!r}, live starts "
+              f"{stamp(live_t, 0)!r}")
     finally:
         srv3.stop()
+
+    doctor(tmp)
 
     print()
     for f in fails:

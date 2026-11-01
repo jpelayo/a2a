@@ -297,14 +297,34 @@ def check_token(token):
         raise
 
 
-def fetch(key, token, agent=""):
+def fetch(key, token, agent="", profile=""):
     q = urllib.parse.quote(token, safe="")
     path = {"claude": "/a2a-claudecode.tar.gz", "opencode": f"/install/{q}",
             "pi": f"/install/pi/{q}", "codex": f"/install/codex/{q}",
             "hermes": f"/install/hermes/{q}"}[key]
+    query = {}
     if key != "claude" and agent:
-        path += "?agent=" + urllib.parse.quote(agent, safe="")
+        query["agent"] = agent
+    if key == "hermes" and profile:
+        # The bot it is baked for: Hermes copies the plugins folder when it
+        # clones a bot, and the plugin honours a baked id only here.
+        query["profile"] = profile
+    if query:
+        path += "?" + urllib.parse.urlencode(query)
     return _get(path)
+
+
+def baked_for(path, profile):
+    """The agent id baked into a Hermes bot's plugin, if it was baked for
+    THAT bot. The line names its profile; an older line names none, and then
+    only a generic profile's id is its own — the only kind this installer
+    ever baked one for. A named bot's unmarked id came with the plugins
+    folder when Hermes cloned it from another bot, and must not be kept."""
+    agent = _baked_field(path, "agent") or ""
+    meant = _baked_field(path, "profile") or ""
+    if meant:
+        return agent if meant == profile else ""
+    return agent if profile in GENERIC_PROFILES else ""
 
 
 def unpack(data):
@@ -719,9 +739,10 @@ def ask_hermes(ui):
     out = []
     for i in picked:
         name, home = profiles[i]
-        # An id baked by an earlier install is kept: an update must not
-        # quietly turn the bot into somebody else.
-        prior = _baked_field(client_file("hermes", home), "agent") or ""
+        # An id baked by an earlier install FOR THIS BOT is kept: an update
+        # must not quietly turn the bot into somebody else — and neither
+        # must an id that came with a cloned plugins folder.
+        prior = baked_for(client_file("hermes", home), name)
         agent = prior
         if name in GENERIC_PROFILES:
             error = ""
@@ -761,7 +782,7 @@ def download(ui, targets):
     for t in targets:
         ui.status(f"downloading the {t.label} client...")
         try:
-            data = fetch(t.key, t.token, t.agent)
+            data = fetch(t.key, t.token, t.agent, t.profile)
         except urllib.error.HTTPError as e:
             raise SystemExit(redact(
                 f"a2a: the broker would not serve the {t.label} client "
@@ -833,7 +854,31 @@ def _hermes_config(home):
             on = value.lower() in ("true", "yes", "on")
         if not value:
             path.append((indent, keys[-1]))
-    return enabled and not disabled, allowed, on
+    own = _hermes_state_on(home)
+    return enabled and not disabled, allowed, (on if own is None else own)
+
+
+def _hermes_state_on(home):
+    """The plugin's own switch, from its own state — Hermes's per-plugin
+    store, <bot>/plugin-data/agent-plugin-<id>-<hash>/state.json, where the
+    plugin keeps its settings now instead of config.yaml. None when there
+    is no such state (a bot set up before: config.yaml decides). A state
+    recorded in another profile's home (copied with --clone-all) is not
+    this bot's switch."""
+    for path in sorted((home / "plugin-data").glob("agent-plugin-a2a*/"
+                                                   "state.json")):
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(state, dict) or not any(
+                k in state for k in ("enabled", "route", "home")):
+            continue
+        written_in = state.get("home")
+        if written_in and written_in != str(Path(home).resolve()):
+            return False
+        return state.get("enabled") is True
+    return None
 
 
 def setup_needed(targets):

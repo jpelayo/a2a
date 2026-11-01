@@ -502,6 +502,65 @@ def main() -> int:
           "agent is asking about",
           'api("GET", "/pending' not in inspect.getsource(b5._status), "")
 
+    # --- the doctor ------------------------------------------------------------
+    sent = []
+
+    def rec(meth, path, body=None, timeout=30):
+        sent.append((meth, path, body))
+        if path == "/me":
+            return {"agent": "x", "stations": ["acme"], "registered": True}
+        return {"channels": []} if path == "/channels" else {"ok": True}
+
+    b5.api = rec
+    reg = json.loads(b5._status({}))
+    ids = [c["check"] for c in reg.get("checks") or []]
+    check("doctor: every check, in the shared order",
+          ids == ["install", "identity", "settings", "switch", "broker",
+                  "client", "registered", "push_host", "stream", "version"],
+          str(ids))
+    check("doctor: each entry is exactly {check, ok, who, do, detail}, and "
+          "the first failing one is next_step",
+          all(set(c) == {"check", "ok", "who", "do", "detail"}
+              for c in reg["checks"])
+          and reg["next_step"] == next(c["do"] for c in reg["checks"]
+                                       if c["ok"] is False), str(reg)[:300])
+    report = [b for m, p, b in sent if p == "/me/state"]
+    check("doctor: it reports its finding with only the allowed keys",
+          report and set(report[-1]) == {"harness", "version", "switch",
+                                         "route", "receives", "settings",
+                                         "failing", "fixed"}
+          and report[-1]["harness"] == "codex"
+          and "push_host" in report[-1]["failing"], str(report[-1:]))
+    switch_before = b5._enabled.is_set()
+    b5._state.update(connected=True, last_line=time.time() - 3600)
+    with b5._ack_lock:
+        b5._to_ack.add("m-pending")
+    sent.clear()
+    fixed = json.loads(b5._status({"fix": True}))["fixed"]
+    check("doctor: fix=true with no thread looks for the socket again, asks "
+          "a silent stream to reconnect, and retries pending acks",
+          {f["check"] for f in fixed} == {"push_host", "stream"}
+          and b5._reconnect.is_set()
+          and any(p == "/ack" for m, p, b in sent), str(fixed))
+    check("doctor: and never touches the project switch",
+          b5._enabled.is_set() == switch_before
+          and (proj / ".a2a.json").read_text() == '{"enabled_codex": true}',
+          "")
+    b5._reconnect.clear()
+    b5._state.update(connected=False, last_line=0.0)
+
+    # Healthy: socket, thread, live stream — fix=true changes nothing.
+    b3.api = rec
+    b3._state.update(connected=True, last_line=time.time())
+    srv_before = b3.get_server()
+    st3 = json.loads(b3._status({"fix": True}))
+    check("doctor: on a healthy session fix=true repairs nothing — no "
+          "reconnect, the app-server connection kept",
+          st3["fixed"] == [] and not b3._reconnect.is_set()
+          and b3.get_server() is srv_before and st3["next_step"] is None,
+          f"{st3['fixed']} {st3['next_step']}")
+    b3._state.update(connected=False, last_line=0.0)
+
     check("that line is a single line of plain codex — no script, no wrapper, "
           "no path to anything we ship",
           "\n" not in b5.LAUNCH_LINE

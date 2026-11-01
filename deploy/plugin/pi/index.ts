@@ -184,7 +184,7 @@ const instructions = (name: string) =>
   `you are registered, whether push is alive, and which channels you are ` +
   `a MEMBER of — a reply posted to a room you are not in reaches nobody. ` +
   `Its next_step names the one thing to do, or is null when nothing is ` +
-  `wrong. It reads nothing from your inbox.\n\n` +
+  `wrong; checks lists every check and who must act, and fix=true repairs what it safely can on its own. It reads nothing from your inbox.\n\n` +
   `MESSAGES HAVE A SHELF LIFE. Yours last a year unless you say otherwise: ` +
   `pass expires_in ("10m", "2h", "7d") when what you are saying stops being ` +
   `worth reading — an expired message is never delivered, because acting on ` +
@@ -866,6 +866,13 @@ export default function (pi: ExtensionAPI) {
 
   // --- the pump -------------------------------------------------------------
   let warned = false;
+  // The live connection's own controller, aborted whenever `halt` is. The
+  // doctor (a2a_channel_status fix=true) aborts it ALONE to reconnect a silent
+  // stream — aborting `halt` itself from a tool would leave the loop running
+  // with a sleep that returns at once. Gone with its connection, so a request
+  // can never reach the next one.
+  let conn: AbortController | null = null;
+  let doctorAsked = false;
 
   async function pump() {
     // The store is the last word only when nothing chose an id for us. Same
@@ -891,12 +898,19 @@ export default function (pi: ExtensionAPI) {
       // acked under the new id, which acks nothing.
       const streamKey = key;
       const url = `${URL_BASE}/stream?agent=${encodeURIComponent(streamKey)}&format=json`;
+      const ctl = new AbortController();
+      const onHalt = () => ctl.abort();
+      if (halt.signal.aborted) ctl.abort();
+      else halt.signal.addEventListener("abort", onHalt, { once: true });
+      conn = ctl;
+      doctorAsked = false;
       try {
         // The client key rides on the stream too: the broker re-checks it on
-        // every keepalive. The signal is what closes it on session_shutdown.
+        // every keepalive. The signal is what closes it on session_shutdown
+        // (halt aborts it) — and what the doctor aborts alone.
         const res = await fetch(url, {
           headers: { Authorization: `Bearer ${TOKEN}`, ...(await clientHeader()) },
-          signal: halt.signal,
+          signal: ctl.signal,
         });
         if (!res.ok) {
           const body = (await res.text()).slice(0, 200);
@@ -959,12 +973,21 @@ export default function (pi: ExtensionAPI) {
       } catch (e) {
         pumpState.connected = false;
         if (stopped) break;
-        pumpState.lastError = String(e);
-        log(`stream error: ${e}`);
-        if (!warned) {
-          warned = true;      // once per process, not once per retry
-          notify(`not receiving messages: ${String(e).slice(0, 120)}`);
+        if (doctorAsked) {
+          // Asked for, not failed: no error kept, nobody notified.
+          doctorAsked = false;
+          log("the doctor asked for a fresh stream; reconnecting");
+        } else {
+          pumpState.lastError = String(e);
+          log(`stream error: ${e}`);
+          if (!warned) {
+            warned = true;      // once per process, not once per retry
+            notify(`not receiving messages: ${String(e).slice(0, 120)}`);
+          }
         }
+      } finally {
+        halt.signal.removeEventListener("abort", onHalt);
+        conn = null;
       }
       await sleep(wait);
     }
@@ -1075,7 +1098,20 @@ export default function (pi: ExtensionAPI) {
   // is push alive, which rooms am I in. An agent that could not ask any of
   // this replied into a channel it was not a member of, tried to DM a label,
   // and reported the probe as broken — three turns to learn nothing.
-  async function statusReport(): Promise<string> {
+  //
+  // It is a DOCTOR: `checks` lists every check, in one order shared by every
+  // client, each saying who must act and what to do; `fixed` is what this
+  // call repaired (repairNow, only with fix=true, only for a failing check —
+  // never the switch, the identity, or anything on the broker). The doctor's
+  // finding is the ONE thing this client ever reports about itself
+  // (POST /me/state), and only from here.
+  async function statusReport(fixed: any[] = []): Promise<string> {
+    const check = (id: string, ok: any, who?: any, todo?: any, detail?: any) => ({
+      check: id, ok,
+      who: ok === false ? who || null : null,
+      do: ok === false ? todo || null : null,
+      detail: detail === undefined ? null : detail,
+    });
     let me: any = {};
     try {
       me = JSON.parse(await api("GET", "/me")) || {};
@@ -1095,38 +1131,121 @@ export default function (pi: ExtensionAPI) {
     const quiet = pumpState.lastLine ? (Date.now() - pumpState.lastLine) / 1000 : null;
     const stale = quiet !== null && quiet > 60;
     const stations: string[] = me.stations || [];
-    // In order: exist, then be reachable, then be healthy. Only the first
-    // unmet condition is worth telling an agent about.
-    let step: string | null = null;
-    if (me.refused) {
-      // First: another client holds this agent, or this install is too old
-      // to send a client key, and nothing else will work until that is fixed.
-      step = `the broker refuses to act as this agent: ${me.refused}`;
-    } else if (!me.registered) {
-      step =
-        "you are not registered in this station yet: call propose_me with one " +
-        "line about this project, and an operator approves it with one " +
-        "keystroke — no restart needed";
-    } else if (sendOnly()) {
-      // No stream here by design, so nothing to wait for.
-      step = null;
-    } else if (!pumpState.connected) {
-      step =
-        "the push stream is not connected; it retries by itself, so wait — " +
-        "messages are held on the broker meanwhile";
-    } else if (stale) {
-      step = `the stream has been silent for ${Math.round(quiet!)}s; it reconnects by itself`;
+    // In order: be switched on, exist, be reachable, be healthy — "off"
+    // first, or an agent in a project that never opted in is told to wait for
+    // a stream that will never open (which is what Pi used to say).
+    const checks: any[] = [];
+    checks.push(URL_BASE && TOKEN
+      ? check("install", true)
+      : check("install", false, "user",
+        "no broker url or token in this install: run the installer and pick " +
+        "Pi (curl -fsSL <broker>/install | python3)"));
+    checks.push(check("identity", true, null, null, key));
+    checks.push(check("settings", null, null, null, "not applicable to Pi"));
+    checks.push(ENABLED
+      ? check("switch", true, null, null, PROJECT_FILE)
+      : check("switch", false, "human",
+        `a2a is off in this project: ${PROJECT_FILE} does not say ` +
+        `{"${ENABLE_KEY}": true}, so nothing is delivered here. That is the ` +
+        `user's decision: only if they ask for a2a in this project, call ` +
+        `enable_a2a_here(enabled=true)`));
+    if (me.error) {
+      checks.push(check("broker", false, "operator",
+        `the broker at ${URL_BASE} did not answer (${me.error}); nothing ` +
+        "works until it does", me.error));
+      checks.push(check("client", null, null, null, "skipped: the broker did not answer"));
+      checks.push(check("registered", null, null, null, "skipped: the broker did not answer"));
+    } else {
+      checks.push(check("broker", true, null, null, URL_BASE));
+      // Another client holds this agent, or this install is too old to send
+      // a client key: nothing else will work until that is fixed.
+      checks.push(me.refused
+        ? check("client", false, "operator",
+          `the broker refuses to act as this agent: ${me.refused}`)
+        : check("client", true));
+      checks.push(me.registered
+        ? check("registered", true)
+        : check("registered", false, "you",
+          "you are not registered in this station yet: call propose_me with " +
+          "one line about this project, and an operator approves it with one " +
+          "keystroke — no restart needed"));
     }
+    // A session with no UI only SENDS, by design: nothing to repair there.
+    checks.push(!ENABLED
+      ? check("push_host", null, null, null, "skipped: a2a is off")
+      : sendOnly()
+        ? check("push_host", true, null, null, "this session only sends, by design (no UI)")
+        : check("push_host", true, null, null, "this extension runs in the session it delivers to"));
+    if (!ENABLED) {
+      checks.push(check("stream", null, null, null, "skipped: a2a is off"));
+    } else if (sendOnly()) {
+      checks.push(check("stream", null, null, null, "no stream here by design"));
+    } else if (!me.registered) {
+      checks.push(check("stream", null, null, null, "skipped: not registered"));
+    } else if (!pumpState.connected) {
+      checks.push(check("stream", false, "auto",
+        "the push stream is not connected; it retries by itself, so wait — " +
+        "messages are held on the broker meanwhile", pumpState.lastError));
+    } else if (stale) {
+      checks.push(check("stream", false, "auto",
+        `the stream has been silent for ${Math.round(quiet!)}s; it reconnects ` +
+        "by itself (fix=true reconnects it now)"));
+    } else {
+      checks.push(check("stream", true));
+    }
+    let theirs: string | null = null;
+    try {
+      theirs = (JSON.parse(await api("GET", "/healthz")) || {}).clients || null;
+    } catch {
+      theirs = null;
+    }
+    const mineVersion = BAKED.version || "";
+    checks.push(!theirs || !mineVersion
+      ? check("version", null, null, null, "unknown")
+      : theirs === mineVersion
+        ? check("version", true, null, null, theirs)
+        : check("version", false, "user",
+          `this client is ${mineVersion}, the broker serves ${theirs}: run the ` +
+          `installer and pick Pi: curl -fsSL ${URL_BASE}/install | python3`));
+    // The doctor's finding, to the broker: one row per agent, overwritten.
+    // Best effort; its reply says whether a stream for this agent is live.
+    let reply: any = null;
+    if (me.registered) {
+      try {
+        reply = JSON.parse(await api("POST", "/me/state", {
+          harness: "pi", version: mineVersion, switch: ENABLED,
+          route: ENABLED ? "project" : null, receives: ENABLED && !sendOnly(),
+          settings: null,
+          failing: checks.filter((c: any) => c.ok === false).map((c: any) => c.check),
+          fixed: [...new Set(fixed.map((f: any) => f.check))].sort(),
+        }));
+      } catch {
+        reply = null;
+      }
+    }
+    const streamCheck = checks.find((c: any) => c.check === "stream");
+    if (reply && reply.stream_live && streamCheck.ok === false && !pumpState.connected) {
+      // This session should hold the stream and does not, while the broker
+      // serves one for this agent: another process has it.
+      Object.assign(streamCheck, check("stream", false, "user",
+        "another process holds this agent's stream (the broker serves one, " +
+        "and it is not this session's): close the other Pi using this agent, " +
+        "or give one of them its own name"));
+    }
+    const failing = checks.find((c: any) => c.ok === false);
+    const step: string | null = failing ? failing.do : null;
     return JSON.stringify(
       {
         agent: name,
         station: stations.length === 1 ? stations[0] : stations.length ? stations : null,
         registered: !!me.registered,
-        // false in a session with no UI: it sends as this agent and the
-        // terminal session receives.
-        receives: !sendOnly(),
         channels: mine,
+        checks,
+        fixed,
         push: {
+          // false in a session with no UI: it sends as this agent and the
+          // terminal session receives.
+          receives: !sendOnly(),
           enabled: pumpState.connected,
           stream_connected: pumpState.connected,
           seconds_since_last_line: quiet === null ? null : Math.round(quiet * 10) / 10,
@@ -1145,6 +1264,29 @@ export default function (pi: ExtensionAPI) {
       null,
       2,
     );
+  }
+
+  // fix=true: what this client would do by itself later, done now — and only
+  // when the stream check is failing, so a healthy session comes out exactly
+  // as it went in. Aborting this connection's own controller drops it; the
+  // pump reconnects and the broker replays what is unacked. Never the
+  // switch, the identity, or anything on the broker.
+  async function repairNow(): Promise<any[]> {
+    const fixed: any[] = [];
+    const quiet = pumpState.lastLine ? (Date.now() - pumpState.lastLine) / 1000 : null;
+    const stale = quiet !== null && quiet > 60;
+    if (ENABLED && !stopped && pumping && !sendOnly() && pumpState.connected
+        && stale && conn) {
+      doctorAsked = true;
+      conn.abort();
+      fixed.push({ check: "stream", did: "asked the silent stream to reconnect" });
+      if (toAck.size) {
+        const n = toAck.size;
+        await flushAcks();
+        fixed.push({ check: "stream", did: `retried ${n} pending ack(s)` });
+      }
+    }
+    return fixed;
   }
 
   // The project switch, for enable_a2a_here and for propose_me (signing up
@@ -1550,11 +1692,19 @@ export default function (pi: ExtensionAPI) {
       "registered, whether push is alive, and which channels you are a " +
       "MEMBER of. Call this first when something seems wrong — nothing " +
       "arriving, a tool refusing, a room that does not answer. `next_step` " +
-      "names the one thing to do about it, or is null when nothing is wrong. " +
-      "It reads nothing from your inbox, so it costs you no messages.",
-    parameters: Type.Object({}),
-    async execute() {
-      return text(await statusReport());
+      "names the one thing to do about it, or is null when nothing is wrong; " +
+      "`checks` lists every check with who must act. Pass fix=true and it " +
+      "repairs what it safely can on its own (a silent stream, pending acks) " +
+      "— everything else names who must act. It reads nothing from your " +
+      "inbox, so it costs you no messages.",
+    parameters: Type.Object({
+      fix: Type.Optional(Type.Boolean({
+        description: "repair what is safe to repair on its own",
+      })),
+    }),
+    async execute(_id: string, p: { fix?: boolean | string } = {}) {
+      const fix = !!p && (p.fix === true || String(p.fix) === "true");
+      return text(await statusReport(fix ? await repairNow() : []));
     },
   });
 

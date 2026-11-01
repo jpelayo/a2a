@@ -66,6 +66,12 @@ ONLY_CLIENTS = {
     # Writes <project>/.a2a.json, which is a fact about THIS MACHINE's install
     # scope. The broker has no opinion about which of your directories use it.
     "enable_a2a_here",
+    # The doctor. It inspects THIS client's process — the project switch, the
+    # stream, whether this process can push — none of which the broker can
+    # see. It reports its finding to the broker with POST /me/state, never as
+    # a broker tool. DIAGNOSTIC below stays empty, so every client must still
+    # carry it.
+    "a2a_channel_status",
 }
 
 # Tools that configure THIS install rather than name a capability, exempted
@@ -171,9 +177,14 @@ def status_shapes() -> dict:
         src = path.read_text()
         i = src.index("async function statusReport")
         body = _re.sub(r"^  ", "", src[i:src.index("\n  }", i) + 4], flags=_re.M)
+        # Every free name the lifted statusReport reads. A name missing here
+        # is a ReferenceError — which used to be caught, printed and the
+        # client SKIPPED: Pi's `sendOnly` went unchecked that way for months.
         pre = ('const key="x", name="x", toAck=new Set(), LOG="/tmp/x.log";\n'
                'const ENABLED=true, PROJECT_FILE="/tmp/.a2a.json", '
                'ENABLE_KEY="enabled_x";\n'
+               'const URL_BASE="http://127.0.0.1:1", TOKEN="t";\n'
+               'const sendOnly=()=>false;\n'
                'const BAKED={version:"0"};\n'
                'const pumpState={connected:true,lastLine:Date.now(),'
                'delivered:0,lastError:null,last:null};\n'
@@ -190,9 +201,24 @@ def status_shapes() -> dict:
         if "@@" in res.stdout:
             out[label] = _json.loads(res.stdout.split("@@", 1)[1])
         else:
-            print(f"  (could not run {label} statusReport: "
-                  f"{res.stderr.strip()[:160]})")
+            # A FAIL, not a note: a builder this test cannot run is a client
+            # whose status nobody checks.
+            out[label] = {"__error__": res.stderr.strip()[:300]}
     return out
+
+
+DOCTOR_CHECKS = ["install", "identity", "settings", "switch", "broker",
+                 "client", "registered", "push_host", "stream", "version"]
+# Where each client declares a2a_channel_status's `fix` argument.
+FIX_DECLARED = {
+    "claude": (PLUGIN / "a2a" / "server" / "a2a-channel.py",
+               '"fix": {"type": "boolean"}'),
+    "codex": (CODEX, '{"fix": {"type": "boolean"}}, [], _status'),
+    "hermes": (HERMES, '{"fix": {"type": "boolean"}}, [], lambda c, a: '
+                       'c.status(a)'),
+    "opencode": (OPENCODE, 'args: { fix: { type: ["boolean", "null"] } }'),
+    "pi": (PI, "fix: Type.Optional(Type.Boolean("),
+}
 
 
 def broker_tools() -> set[str]:
@@ -274,6 +300,30 @@ def main() -> int:
     # for key names, because a key that exists in the source and is never
     # emitted helps nobody.
     shapes = status_shapes()
+    broken = {k: v["__error__"] for k, v in shapes.items() if "__error__" in v}
+    check("every client's status builder RUNS here — a skipped one is "
+          "unchecked", not broken, str(broken))
+    shapes = {k: v for k, v in shapes.items() if "__error__" not in v}
+    check("all five clients were checked", sorted(shapes) == sorted(
+        ["claude", "codex", "hermes", "opencode", "pi"]), str(sorted(shapes)))
+    for label, shape in shapes.items():
+        ids = [c.get("check") for c in shape.get("checks") or []]
+        check(f"{label}: the doctor lists every check, in the shared order — "
+              f"one vocabulary, whichever harness answered",
+              ids == DOCTOR_CHECKS, str(ids))
+        check(f"{label}: each check is exactly {{check, ok, who, do, detail}}",
+              all(set(c) == {"check", "ok", "who", "do", "detail"}
+                  for c in shape.get("checks") or []),
+              str((shape.get("checks") or [])[:1]))
+        check(f"{label}: and next_step is the first failing check's `do`",
+              shape.get("next_step") == next(
+                  (c["do"] for c in shape.get("checks") or []
+                   if c["ok"] is False), None), str(shape.get("next_step")))
+        check(f"{label}: `fixed` is a list (empty: nothing was asked to fix)",
+              shape.get("fixed") == [], str(shape.get("fixed")))
+    for label, (path, decl) in FIX_DECLARED.items():
+        check(f"{label}: a2a_channel_status declares the optional `fix` "
+              f"argument", decl in path.read_text(), decl)
     for label, shape in shapes.items():
         check(f"{label}: a2a_channel_status answers the four questions — who "
               f"am I, am I registered, which rooms am I in, is push alive",

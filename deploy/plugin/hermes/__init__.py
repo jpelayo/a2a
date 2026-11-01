@@ -21,12 +21,16 @@ assignment just below this docstring.
 TWO KINDS OF ROUTE, ONE PROCESS EACH. a2a runs in ONE place of the bot — the
 ROUTE — and there are two kinds:
 
-  a conversation in the Hermes DESKTOP APP. The app runs a `hermes serve`
-  backend (HERMES_DESKTOP set) that publishes Hermes's TUI/desktop injector;
-  ctx.inject_message(text, session_key=<that conversation's key>) queues the
-  text on it, and an idle conversation starts a turn. Only a conversation
-  OPEN in the app is accepted. While it is closed the stream stays shut, so
-  the broker keeps new messages undelivered, and a read-only peek
+  a CONVERSATION served by Hermes's TUI gateway — a chat in the Hermes
+  desktop app, or a `hermes --tui`. Its turns carry the session source
+  "desktop" or "tui", and BOTH count: Hermes tags a chat "desktop" only when
+  the app said so or the backend runs with HERMES_DESKTOP, so a bot's own
+  chat on a gateway the app reaches by URL is "tui" (the app opens it with no
+  source). The process that serves it publishes Hermes's TUI/desktop
+  injector; ctx.inject_message(text, session_key=<that conversation's key>)
+  queues the text on it, and an idle conversation starts a turn. Only a
+  conversation OPEN there is accepted. While it is closed the stream stays
+  shut, so the broker keeps new messages undelivered, and a read-only peek
   (/pending/peek) every PEEK_S — or any turn there — finds it open again
   and hands over everything unacked, however old.
 
@@ -36,12 +40,32 @@ ROUTE — and there are two kinds:
 Hermes loads this plugin into the CLI, the TUI, cron, kanban, the gateway and
 the app's backend alike, and only one of them can render a turn for a given
 route — so the stream is claimed ONLY by the gateway for a chat route and
-ONLY by the app's backend for an app route. The two never both hold it. The
-app's backend is the process with the desktop injector where that
-conversation LIVES: HERMES_DESKTOP set, a turn of it run there, or Hermes's
-session table there holding it. The variable alone missed a backend started
-any other way, which then held the stream for nobody, silently; a process
-held back now says so in the log, once.
+ONLY by the process that serves a conversation route. The two never both
+hold it. That process is the one where Hermes's injector would accept the
+conversation: a turn of it ran there, or Hermes's session table there holds
+it — the same table, matched the same way, as the injector. HERMES_DESKTOP is
+NOT a sign: Hermes sets it in every shell the app opens, its terminal pane
+included, so a `hermes --tui` started there would have held the stream for a
+conversation it cannot reach. A process held back says so in the log, once.
+
+ITS OWN STATE, ITS OWN FOLDER. The switch, route, owner and agent id live in
+Hermes's per-plugin store (ctx.state: <profile>/plugin-data/<plugin>/
+state.json), with this plugin's log and client secret beside them. The
+plugin never writes the profile's config.yaml: that is the file the app's
+"new bot" clone copies whole, and a clone does not copy plugin-data/. A bot
+set up before this kept its settings in config.yaml; they are read from
+there, read only, until the first write carries them over. A client secret
+already at the profile root stays there: moving it would change the key the
+broker pins the agent to.
+
+A BOT CLONED FROM ANOTHER STARTS OFF. A clone still carries the old
+config.yaml section and the plugins folder with the id baked into it (and
+--clone-all copies plugin-data/ too). So the settings carry the profile home
+they were written in (`home`), and the baked line the profile it was
+installed for (`profile`); anything from another profile is ignored. Old
+settings without `home` are checked by their conversation instead: a route
+whose session is not in THIS profile's state.db (which a clone does not
+copy) is not this bot's.
 
 SIGNING UP TURNS IT ON. propose_me with a2a off runs enable_a2a_here first,
 with all its rules, so the bot receives as soon as its name is approved.
@@ -70,8 +94,11 @@ the pre_llm_call hook. One that is never seen is recovered by reopening the
 stream: the broker hands back what a closed connection took and nobody acked.
 
 AGENT ID: the plugin setting `agent` (rename_me writes it), else the id baked
-at install (?agent=), else the profile name. Hermes's default profile is
-called "default", which names no bot, so it needs ?agent= at install.
+at install (?agent=) for THIS profile, else the profile name. Hermes's default
+profile is called "default", which names no bot, so it needs ?agent= at
+install. A baked id is this profile's when the line names it (`profile`), or
+names none and the profile is a generic one — the only kind the installer
+ever gave an id; in a named bot an unmarked id was copied from `default`.
 
 Two agents must never share an id. Delivery on the broker is a destructive
 read — it hands each message to the first stream that asks — so a shared id
@@ -94,6 +121,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -197,26 +225,37 @@ def same_chat(a, b):
                for k in ("platform", "chat_id", "thread_id"))
 
 
-# A conversation in the Hermes DESKTOP APP is the other kind of route. Its
-# turns bind no platform and no user (tui_gateway's _set_session_context): the
-# conversation is named by its session key, HERMES_SESSION_KEY, and by the
-# app's own id for it, HERMES_UI_SESSION_ID. Hermes ROTATES the key when it
-# compresses a long conversation, and the app id changes instead when the app
-# reconnects — so a route keeps both and follows whichever one moved.
+# A conversation served by Hermes's TUI gateway — a chat in the desktop app,
+# or a `hermes --tui` — is the other kind of route. Its turns bind no platform
+# and no user (tui_gateway's _set_session_context): the conversation is named
+# by its session key, HERMES_SESSION_KEY, and by the app's own id for it,
+# HERMES_UI_SESSION_ID. Hermes ROTATES the key when it compresses a long
+# conversation, and the app id changes instead when the app reconnects — so a
+# route keeps both and follows whichever one moved. Stored routes say
+# `surface: desktop` for both sources; `source` only names it for a human.
 DESKTOP = "desktop"
+# The session sources such a conversation's turns carry. Hermes picks
+# "desktop" only when the app passed it or the backend has HERMES_DESKTOP (and
+# not HERMES_DESKTOP_TERMINAL), else "tui" (tui_gateway/agent_factory.py
+# _resolve_session_platform) — and the app opens a bot's own chat with no
+# source, so on a gateway it reaches by URL that chat is "tui". The injector
+# does not care which (tui_gateway/plugin_inject.py), so neither does this.
+CONVERSATION_SOURCES = ("desktop", "tui")
 # How often a route conversation that is closed in the app is looked at again.
 PEEK_S = 30.0
 
 
 def _desktop_here():
-    """The current turn's app conversation, or None outside one."""
-    if _session("HERMES_SESSION_SOURCE") != DESKTOP:
+    """The current turn's conversation, or None outside one."""
+    source = _session("HERMES_SESSION_SOURCE")
+    if source not in CONVERSATION_SOURCES:
         return None
     key = _session("HERMES_SESSION_KEY")
     if not key:
         return None
     return {"surface": DESKTOP, "session_key": key,
-            "ui_session_id": _session("HERMES_UI_SESSION_ID")}
+            "ui_session_id": _session("HERMES_UI_SESSION_ID"),
+            "source": source}
 
 
 def is_desktop(route):
@@ -234,14 +273,6 @@ def same_conversation(turn, route):
     return bool(ui) and ui == route.get("ui_session_id")
 
 
-def _desktop_process():
-    """Is this the desktop app's own backend? The app starts `hermes serve`
-    with HERMES_DESKTOP set. `hermes --tui` and the dashboard install the same
-    injector, but the app's conversations do not live there."""
-    v = os.environ.get("HERMES_DESKTOP", "").strip().lower()
-    return v not in ("", "0", "false", "no", "off")
-
-
 def _live_key(ui_session_id):
     """The current key of the app conversation `ui_session_id` names, read
     from the desktop backend's own session table — private to Hermes, so best
@@ -250,9 +281,7 @@ def _live_key(ui_session_id):
     turn would only ever come from a2a itself. "" when it cannot tell.
 
     Read only where Hermes already loaded the table: importing it fresh would
-    run a module that serves nothing here, and its table would be empty. That
-    also makes a non-empty answer the sign that THIS process holds the
-    conversation (`_desktop_backend`)."""
+    run a module that serves nothing here, and its table would be empty."""
     if not ui_session_id:
         return ""
     try:
@@ -266,6 +295,90 @@ def _live_key(ui_session_id):
         return ""
 
 
+def _table_holds(route):
+    """Does THIS process's Hermes session table hold the route conversation —
+    by the app's id for it, or by its key? The second is exactly the match
+    Hermes's injector makes (inject_tui_session_message: a live session whose
+    session_key is the one asked for), so this is "could a message be queued
+    on it here". Same private table as _live_key: read only, best effort,
+    False when it cannot tell."""
+    if not is_desktop(route):
+        return False
+    if _live_key(route.get("ui_session_id")):
+        return True
+    key = route.get("session_key")
+    if not key:
+        return False
+    try:
+        srv = sys.modules.get("tui_gateway.server")
+        if srv is None:
+            return False
+        with srv._sessions_lock:
+            rows = list(srv._sessions.values())
+        return any(isinstance(s, dict) and s.get("session_key") == key
+                   for s in rows)
+    except Exception:
+        return False
+
+
+# --- the doctor ------------------------------------------------------------------
+# a2a_channel_status lists EVERY check, in this order, in every client — the
+# same ids, so an agent reading one never has to know its harness. `ok` is
+# True, False or None (not applicable here, or not knowable now); a failing
+# one says WHO must act and WHAT to do. fix=true repairs only what the client
+# would repair by itself later anyway, and only when that check is failing:
+# never the switch, the route, the owner, the identity, or anything on the
+# broker — any chat can make the model call this tool.
+DOCTOR_CHECKS = ("install", "identity", "settings", "switch", "broker",
+                 "client", "registered", "push_host", "stream", "version")
+
+
+def _check(check, ok, who=None, do=None, detail=None):
+    return {"check": check, "ok": ok,
+            "who": who if ok is False else None,
+            "do": do if ok is False else None,
+            "detail": detail}
+
+
+def _next_step(checks):
+    """The one thing to do: the first failing check's, or None."""
+    return next((c["do"] for c in checks if c["ok"] is False), None)
+
+
+def _truthy(v):
+    return v is True or str(v).lower() == "true"
+
+
+def _home_id(home):
+    """A profile home as the settings record it: absolute, links resolved."""
+    try:
+        return str(Path(home).expanduser().resolve())
+    except Exception:
+        return str(home)
+
+
+def _session_known(home, key):
+    """Is `key` one of the sessions of the bot whose home this is? Read from
+    that profile's own state.db (hermes_state: get_hermes_home()/"state.db",
+    table `sessions`, id = the session key), which a cloned profile does not
+    copy. Read only. None when it cannot tell — no database, no key, any
+    error — and the caller then trusts the settings, as before."""
+    db = Path(home) / "state.db"
+    if not key or not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True,
+                              timeout=2)
+        try:
+            row = con.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                              (key,)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    return row is not None
+
+
 # --- the client key ------------------------------------------------------------
 # Which BOT this is. The broker pins each agent to the first client key that
 # acts as it, so no other harness, directory or bot — and no model in one —
@@ -276,10 +389,13 @@ def _live_key(ui_session_id):
 # which is written whole to a private temp file and link()ed into place —
 # link fails if another process got there first, so no two keys can exist.
 
-def derive_client_key(home, scope):
-    """The key for `scope` under `home`'s secret, '' if it cannot be had."""
+def derive_client_key(home, scope, legacy=None):
+    """The key for `scope` under `home`'s secret, '' if it cannot be had.
+    A secret already in `legacy` (the profile root, where it lived before
+    the plugin kept its own folder) is THE secret: read there, never moved."""
     try:
-        root = Path(home)
+        old = Path(legacy) / "a2a-client.secret" if legacy else None
+        root = old.parent if old is not None and old.is_file() else Path(home)
         root.mkdir(parents=True, exist_ok=True)
         path = root / "a2a-client.secret"
         if not path.exists():
@@ -472,7 +588,7 @@ def brief(name):
         "you are registered, whether push is alive, and which channels you "
         "are a MEMBER of — a reply posted to a room you are not in reaches "
         "nobody. Its next_step names the one thing to do, or is null when "
-        "nothing is wrong. It reads nothing from your inbox."
+        "nothing is wrong; checks lists every check and who must act, and fix=true repairs what it safely can on its own. It reads nothing from your inbox."
         "\n\n"
         "MESSAGES HAVE A SHELF LIFE. Yours last a year unless you say "
         'otherwise: pass expires_in ("10m", "2h", "7d") when what you are '
@@ -744,8 +860,11 @@ TOOLS = [
      "Diagnose this client: the id it announces, whether push is enabled and "
      "the stream is live, which chat a2a runs in, how many messages it has "
      "handed to the gateway, and where its log is. Read this first when a2a "
-     "seems quiet.",
-     {}, [], lambda c, a: c.status()),
+     "seems quiet. `checks` lists every check with who must act; pass "
+     "fix=true and it repairs what it safely can on its own (a silent "
+     "stream, pending acks, a conversation key Hermes rotated) — everything "
+     "else names who must act.",
+     {"fix": {"type": "boolean"}}, [], lambda c, a: c.status(a)),
 ]
 
 
@@ -765,18 +884,41 @@ class A2AHermes:
             self.profile = str(ctx.profile_name or "")
         except Exception:
             self.profile = ""
-        self.log_file = self.home / "logs" / "a2a.log"
+        # This plugin keeps its own state in its own folder — Hermes's public
+        # per-plugin store, ctx.state: <profile>/plugin-data/<plugin>/
+        # state.json — and never writes the profile's config.yaml. config.yaml
+        # is the file Hermes copies whole when it clones a bot (the app's "new
+        # bot" clones `default`), and a clone does not copy plugin-data/. A
+        # Hermes without ctx.state keeps the old place, config.yaml.
+        self._store = self._plugin_state(ctx)
+        self.data_dir = self._data_dir()
+        self.log_file = ((self.data_dir / "a2a.log") if self.data_dir
+                         else self.home / "logs" / "a2a.log")
         self._log_lock = threading.Lock()
         # Derived on first use (client_key), never at register(): loading the
         # plugin must not write anything.
         self._client_key = None
         self._key_lock = threading.Lock()
 
+        # Where the settings are read from: this plugin's own state once it
+        # has written any, else (a bot set up before it kept its own) the old
+        # config.yaml section — read only, judged by the copy checks below,
+        # and carried over into the state at the first write.
+        self._source = self._settings_source()
         self.agent_setting = str(self._get("agent") or "")
         self.enabled = self._get("enabled") is True
         route, owner = self._get("route"), self._get("owner")
         self.route = route if isinstance(route, dict) and route else None
         self.owner = owner if isinstance(owner, dict) and owner else None
+        # Whose settings these are. Decided here, in memory only — loading
+        # writes nothing; the first write (`_set`) clears what was copied.
+        self.home_id = _home_id(self.home)
+        stamp = self._get("home")
+        self._stamp = stamp if isinstance(stamp, str) else ""
+        self.copied = self._copied_from()
+        if self.copied:
+            self.agent_setting, self.enabled = "", False
+            self.route = self.owner = None
         self.name = self.key
 
         self._lock = threading.Lock()
@@ -800,6 +942,10 @@ class A2AHermes:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._ack_wake = threading.Event()
+        # Set by the doctor (fix=true) for a connected but silent stream; read
+        # on the stream's next line, and cleared whenever a connection opens,
+        # so a request made before a reconnect never cuts the next one.
+        self._reconnect = threading.Event()
         self._threads: list[threading.Thread] = []
 
         for name, desc, props, required, fn in TOOLS:
@@ -827,32 +973,170 @@ class A2AHermes:
                                  name=f"a2a-{label}-{self.profile or 'default'}")
             self._threads.append(t)
             t.start()
+        if getattr(self, "_state_error", None):
+            self.log(f"the plugin's own state could not be read "
+                     f"({self._state_error}); using the old settings in "
+                     f"config.yaml")
+        if self.copied:
+            self.log(f"the a2a settings in this profile are not its own "
+                     f"({self.copied}); they are ignored, and a2a is off "
+                     f"until someone says 'enable a2a here' in this bot's "
+                     f"chat")
+        if A2A_BAKED.get("agent") and not self._baked_agent():
+            self.log(f"the id baked into this plugin "
+                     f"({A2A_BAKED.get('agent')!r}) was installed for "
+                     f"another profile and copied here with it; it is "
+                     f"ignored")
         self.log(f"loaded as {self.key} in profile {self.profile!r}; "
                  + (f"a2a is on in {self._chat_label(self.route)}"
                     if self.enabled and self.route else
                     "a2a is off until its owner says 'enable a2a here'"))
 
+    def _copied_from(self):
+        """Why the a2a settings in this profile are another bot's, or None.
+
+        Hermes clones a profile by copying its config.yaml whole — the app's
+        "new bot" clones `default` unless told otherwise — so a new bot can
+        open holding another bot's switch, route, owner and name. Settings
+        written since `home` existed carry the home they were written in.
+        Older ones are judged by their conversation: a route whose session is
+        not in THIS profile's state.db (which a clone does not copy) was
+        never this bot's. Anything uncertain is trusted, as before."""
+        if self._stamp:
+            if self._stamp != self.home_id:
+                return f"copied from {self._stamp}"
+            return None
+        if is_desktop(self.route) and _session_known(
+                self.home, self.route.get("session_key")) is False:
+            return (f"{self._chat_label(self.route)} is not one of this "
+                    f"bot's conversations — copied from another bot, or "
+                    f"deleted")
+        return None
+
     # -- identity ------------------------------------------------------------
+    def _baked_agent(self):
+        """The id baked at install, if it was baked for THIS profile. The
+        line names its profile; an older line names none, and then the id is
+        this profile's only in a generic one — the only kind the installer
+        ever gave an id. In a named bot an unmarked id was copied with the
+        plugins folder from the profile it was cloned from."""
+        agent = A2A_BAKED.get("agent") or ""
+        if not agent:
+            return ""
+        meant = A2A_BAKED.get("profile") or ""
+        if meant:
+            return agent if meant == self.profile else ""
+        return agent if self.profile in GENERIC_PROFILES else ""
+
     @property
     def key(self):
-        return (self.agent_setting or A2A_BAKED.get("agent")
+        return (self.agent_setting or self._baked_agent()
                 or self.profile or "")
 
     @property
     def key_valid(self):
-        if self.agent_setting or A2A_BAKED.get("agent"):
+        if self.agent_setting or self._baked_agent():
             return True
         return self.profile not in GENERIC_PROFILES
 
     # -- plumbing ------------------------------------------------------------
-    def _get(self, key):
+    # The settings that say who this bot is on a2a and where it runs. Each
+    # write of one also records the home it was written in.
+    OWNED = ("enabled", "route", "owner", "agent")
+
+    @staticmethod
+    def _plugin_state(ctx):
+        """Hermes's per-plugin store (PluginContext.state), or None on a
+        Hermes that has none — then the settings stay in config.yaml."""
+        try:
+            store = getattr(ctx, "state", None)
+        except Exception:
+            return None
+        if store is None or not all(callable(getattr(store, m, None))
+                                    for m in ("get", "set")):
+            return None
+        return store
+
+    def _data_dir(self):
+        """This plugin's own folder (PluginState.data_dir), resolved under
+        the profile's home — None without a store."""
+        if self._store is None:
+            return None
+        try:
+            return Path(self._home_ctx.copy().run(
+                lambda: self._store.data_dir))
+        except Exception:
+            return None
+
+    def _state_get(self, key):
+        return self._home_ctx.copy().run(self._store.get, key, None)
+
+    def _cfg_get(self, key):
+        """The old place: this plugin's section of config.yaml. Read only."""
         try:
             return self._home_ctx.copy().run(self.ctx.get_config, key, None)
         except Exception:
             return None
 
+    def _settings_source(self):
+        """"state" once this plugin's own store holds any setting, else
+        "legacy" (config.yaml, read only)."""
+        if self._store is None:
+            return "legacy"
+        try:
+            if any(self._state_get(k) is not None
+                   for k in self.OWNED + ("home",)):
+                return "state"
+        except Exception as e:
+            # Logged once the instance is whole (log() needs the agent id).
+            self._state_error = repr(e)
+        return "legacy"
+
+    def _get(self, key):
+        if self._source == "state":
+            try:
+                return self._state_get(key)
+            except Exception:
+                return None
+        return self._cfg_get(key)
+
     def _set(self, key, value):
-        self._home_ctx.copy().run(self.ctx.set_config, key, value)
+        run = self._home_ctx.copy().run
+        if self._store is None:
+            # A Hermes without per-plugin state: config.yaml, as before.
+            if key in self.OWNED and self.copied:
+                for other in self.OWNED:
+                    if other != key:
+                        run(self.ctx.set_config, other, None)
+                self.copied = None
+            run(self.ctx.set_config, key, value)
+            if key in self.OWNED and self._stamp != self.home_id:
+                run(self.ctx.set_config, "home", self.home_id)
+                self._stamp = self.home_id
+            return
+        if key in self.OWNED and self._source != "state":
+            # The first write: the plugin's own state becomes the authority.
+            # It takes over what this bot had in config.yaml — nothing, when
+            # those settings were another bot's — and config.yaml is left as
+            # it is, never written.
+            if not self.copied:
+                for other in self.OWNED:
+                    v = self._cfg_get(other) if other != key else None
+                    if v is not None:
+                        run(self._store.set, other, v)
+            self._source = "state"
+            self.copied = None
+        elif key in self.OWNED and self.copied:
+            # A state copied with the whole profile (--clone-all): clear the
+            # rest, or recording this home below would adopt them.
+            for other in self.OWNED:
+                if other != key:
+                    run(self._store.set, other, None)
+            self.copied = None
+        run(self._store.set, key, value)
+        if key in self.OWNED and self._stamp != self.home_id:
+            run(self._store.set, "home", self.home_id)
+            self._stamp = self.home_id
 
     def log(self, msg):
         line = (f"{time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime())} "
@@ -876,8 +1160,13 @@ class A2AHermes:
         leaving the bot keyless, and refused, until it restarts."""
         with self._key_lock:
             if not self._client_key:
+                # A secret made before the plugin kept its own folder stays
+                # where it is, read from there for good: moving it would
+                # change the key, and the broker pins the agent to the key.
                 self._client_key = derive_client_key(
-                    self.home, f"profile:{self.profile or 'default'}")
+                    self.data_dir or self.home,
+                    f"profile:{self.profile or 'default'}",
+                    legacy=self.home if self.data_dir else None)
                 if not self._client_key:
                     self.log("no client key, so this bot can claim no agent")
             return self._client_key or ""
@@ -901,7 +1190,12 @@ class A2AHermes:
         if not route:
             return "no chat"
         if is_desktop(route):
-            return f"the Hermes app conversation {route.get('session_key')}"
+            # A "tui" conversation may be a chat in the app (a bot's own chat
+            # on a gateway reached by URL) or a terminal: name neither.
+            where = ("Hermes app conversation"
+                     if route.get("source", DESKTOP) == DESKTOP
+                     else "Hermes conversation")
+            return f"the {where} {route.get('session_key')}"
         s = f"{route.get('platform')} chat {route.get('chat_id')}"
         return s + (f" thread {route['thread_id']}"
                     if route.get("thread_id") else "")
@@ -924,21 +1218,21 @@ class A2AHermes:
             return False
 
     def _desktop_backend(self):
-        """Is this the process that serves the route's app conversation — the
-        one place a turn pushed into it can run? It needs Hermes's desktop
-        injector, and any one sign that the conversation lives HERE:
-        HERMES_DESKTOP (the app sets it on the backend it starts), a turn of
-        that conversation run in this process, or Hermes's session table in
-        this process holding it. Trusting the variable alone left a backend
-        started any other way holding nothing, silently. A `hermes --tui`
-        process never qualifies: its turns are not app turns, and its table
-        does not hold the app's conversation."""
+        """Is this the process that serves the route conversation — the one
+        place a message can be queued on it? It needs Hermes's TUI/desktop
+        injector, and a sign that the conversation lives HERE: a turn of it
+        ran in this process, or Hermes's session table in this process holds
+        it (`_table_holds` — the injector's own match). Where neither holds,
+        an injection would be refused anyway; once the conversation is open
+        here the guard sees it within GATE_POLL_S and the catch-up hands over
+        everything waiting. HERMES_DESKTOP does not count: Hermes sets it in
+        every shell the app opens (hermes_cli/process_identity.py), so a
+        `hermes --tui` in the app's terminal pane would have taken the stream
+        for a conversation it cannot reach — and a backend started without it
+        would have been passed over."""
         if not self._tui_injector():
             return False
-        if _desktop_process() or self._route_here:
-            return True
-        route = self.route or {}
-        return is_desktop(route) and bool(_live_key(route.get("ui_session_id")))
+        return self._route_here or _table_holds(self.route)
 
     def _route_ran_here(self):
         """A turn of the route conversation ran in this process."""
@@ -948,8 +1242,8 @@ class A2AHermes:
 
     def _host_ok(self):
         """Can THIS process deliver into the route? Exactly one process can:
-        the gateway for a messaging chat, the app's backend for an app
-        conversation — so the two never both hold one bot's stream."""
+        the gateway for a messaging chat, the process serving it for a
+        conversation — so no two ever hold one bot's stream."""
         return (self._desktop_backend() if is_desktop(self.route)
                 else self._gateway())
 
@@ -1047,7 +1341,8 @@ class A2AHermes:
             if not same_conversation(turn, self.route):
                 return (f"a2a runs in one conversation of this bot "
                         f"({self._chat_label(self.route)}), and this is not "
-                        f"it")
+                        f"it. To move it here, say 'enable a2a here' in "
+                        f"this conversation.")
             self._follow(turn)
             self._route_ran_here()
             return None
@@ -1094,9 +1389,9 @@ class A2AHermes:
                           and not same_conversation(desk, self.route))
         elif not _messaging():
             return json.dumps({"error": (
-                "a2a for a Hermes bot runs in one conversation of the Hermes "
-                "app, or in one of the bot's messaging chats. Ask for it "
-                "there, not here.")})
+                "a2a for a Hermes bot runs in one conversation (a chat in the "
+                "Hermes app, or a hermes --tui), or in one of the bot's "
+                "messaging chats. Ask for it there, not here.")})
         else:
             here = _here()
             if not (here["platform"] and here["chat_id"] and here["user_id"]):
@@ -1325,14 +1620,13 @@ class A2AHermes:
             self.log("not streaming here: the gateway may not start turns for "
                      "this plugin (plugins.entries.a2a.allow_gateway_injection)")
         elif is_desktop(self.route) and not self._tui_injector():
-            self.log(f"not streaming here: {label} is delivered by the Hermes "
-                     f"app's backend, and this process has no desktop "
-                     f"injector")
+            self.log(f"not streaming here: {label} is delivered by the process "
+                     f"that serves it (the Hermes app's backend or a TUI), "
+                     f"and this process has no TUI/desktop injector")
         elif is_desktop(self.route):
             self.log(f"not streaming here: this process does not serve {label} "
-                     f"yet (HERMES_DESKTOP: "
-                     f"{'yes' if _desktop_process() else 'no'}); it starts "
-                     f"when a turn there runs here")
+                     f"(not in its session table, no turn of it here); it "
+                     f"starts when that conversation is open in this process")
         else:
             self.log(f"not streaming here: {label} is delivered by the bot's "
                      f"gateway, and this process is not it")
@@ -1376,6 +1670,9 @@ class A2AHermes:
                     "the gateway went away; closing the stream")
         if self.key != stream_key:
             return "agent id changed; reconnecting"
+        if self._reconnect.is_set():
+            self._reconnect.clear()
+            return "the doctor asked for a fresh stream; reconnecting"
         return None
 
     def _peek(self):
@@ -1445,6 +1742,7 @@ class A2AHermes:
                     # A refusal stays on record until an injection succeeds.
                     self.state["error"] = ""
                 self.log(f"stream open as {stream_key}")
+                self._reconnect.clear()
                 for raw in resp:
                     self.state["last_line"] = time.time()
                     # Checked BEFORE delivering: a line read after the bot
@@ -1700,10 +1998,212 @@ class A2AHermes:
         self.log("unloaded")
 
     # -- status ----------------------------------------------------------------
-    def status(self):
+    def _quiet(self):
         quiet = ((time.time() - self.state["last_line"])
                  if self.state["last_line"] else None)
-        stale = bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
+        return quiet, bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
+
+    def _repair(self):
+        """fix=true: what this client would do by itself later, done now,
+        each only when its own check is failing. Writes no Hermes file and
+        touches no switch, route owner or identity: any chat can ask."""
+        fixed = []
+        if CREDENTIALS and self.blocker() is None and is_desktop(self.route):
+            now = _live_key(self.route.get("ui_session_id"))
+            if now and now != self.route.get("session_key"):
+                # The same conversation under the key Hermes gave it when it
+                # compressed — what _inject_app does on a refusal anyway.
+                self._follow({"session_key": now, "ui_session_id":
+                              self.route.get("ui_session_id") or ""})
+                fixed.append({"check": "push_host",
+                              "did": "followed the conversation's new key"})
+        quiet, stale = self._quiet()
+        if (CREDENTIALS and self.blocker() is None
+                and self.state["connected"] and stale):
+            # Connected yet silent: drop it now; the pump reconnects, and the
+            # broker replays what is unacked.
+            self._reconnect.set()
+            self._wake.set()
+            fixed.append({"check": "stream",
+                          "did": "asked the silent stream to reconnect"})
+            with self._lock:
+                pending = sum(len(v) for v in self._ackq.values())
+            if pending:
+                self._ack_wake.set()
+                fixed.append({"check": "stream", "did":
+                              f"retried {pending} pending ack(s)"})
+        return fixed
+
+    def _broker_version(self):
+        try:
+            out = api("GET", "/healthz", timeout=5)
+        except Exception:
+            return None
+        return (out or {}).get("clients") if isinstance(out, dict) else None
+
+    def _checks(self, block, me, registered, quiet, stale, counts):
+        """Every check, in DOCTOR_CHECKS order. The texts are the ones the
+        single next_step used to carry, so the first failing one is still
+        exactly what this tool used to say."""
+        c = []
+        if block == "credentials":
+            c.append(_check("install", False, "user",
+                            "no broker url or token in this install: "
+                            "reinstall with your broker's installer (curl "
+                            "-fsSL <broker>/install | python3)"))
+            c += [_check(k, None, detail="skipped: no broker configured")
+                  for k in DOCTOR_CHECKS[1:]]
+            return c
+        c.append(_check("install", True))
+        if block == "id":
+            c.append(_check("identity", False, "user",
+                            f"this bot runs in Hermes's {self.profile!r} "
+                            "profile, whose name is no agent id: reinstall "
+                            "and give it an id when the installer asks — "
+                            + self.install_line()))
+        else:
+            c.append(_check("identity", True, detail=self.key))
+        if self.copied:
+            c.append(_check("settings", False, "human",
+                            f"this bot's a2a settings are another bot's "
+                            f"({self.copied}) — Hermes copies them when a bot "
+                            f"is cloned — so they are ignored and a2a is off. "
+                            f"Say 'enable a2a here' in this bot's chat, or "
+                            f"call propose_me there, which turns it on first",
+                            detail=self.copied))
+        else:
+            c.append(_check("settings", True, detail="this bot's own"))
+        on = bool(self.enabled and self.route)
+        if not on:
+            c.append(_check("switch", False, "human",
+                            "a2a is off for this bot, so nothing is "
+                            "delivered. That is the user's decision: only if "
+                            "they ask for a2a, in the chat that should carry "
+                            "it, call enable_a2a_here(enabled=true)"))
+        else:
+            c.append(_check("switch", True,
+                            detail=self._chat_label(self.route)))
+        if me.get("error"):
+            c.append(_check("broker", False, "operator",
+                            f"the broker at {URL} did not answer "
+                            f"({me['error']}); nothing works until it does",
+                            detail=me["error"]))
+            c += [_check(k, None, detail="skipped: the broker did not answer")
+                  for k in ("client", "registered")]
+        else:
+            c.append(_check("broker", True, detail=URL))
+            if me.get("refused"):
+                # Another client holds this agent, or this install is too
+                # old to send a client key: nothing else works until fixed.
+                c.append(_check("client", False, "operator",
+                                f"the broker refuses to act as this agent: "
+                                f"{me['refused']}"))
+            else:
+                c.append(_check("client", True))
+            if not registered:
+                c.append(_check("registered", False, "you",
+                                "you are not registered in this station yet: "
+                                "call propose_me(note=\"what this bot is "
+                                "for\") and an operator approves it with one "
+                                "keystroke — no restart needed"))
+            else:
+                c.append(_check("registered", True))
+        label = self._chat_label(self.route)
+        if not on:
+            c.append(_check("push_host", None, detail="skipped: a2a is off"))
+        elif block == "host" and is_desktop(self.route):
+            c.append(_check("push_host", False, "user",
+                            "this process is not the Hermes app's backend, "
+                            "so nothing is delivered here; a2a messages "
+                            f"arrive in {label} while the app runs"))
+        elif block == "host":
+            c.append(_check("push_host", False, "user",
+                            "this process is not the bot's gateway (CLI, "
+                            "TUI, cron), so nothing is delivered here; a2a "
+                            f"messages arrive in {label} while the gateway "
+                            "runs"))
+        elif block == "injection":
+            c.append(_check("push_host", False, "user",
+                            "the gateway may not start turns for this "
+                            f"plugin: run hermes -p {self.profile or '<bot>'} "
+                            "config set plugins.entries.a2a."
+                            "allow_gateway_injection true, then quit the "
+                            "Hermes app and open it again (or restart the "
+                            "gateway however it is run)"))
+        elif self._closed_since is not None:
+            c.append(_check("push_host", False, "human",
+                            "the a2a conversation is not open in the Hermes "
+                            "app, so nothing can be delivered into it: ask "
+                            f"the human to open it ({label}). Messages wait "
+                            "on the broker meanwhile and arrive once it is "
+                            "open."))
+        else:
+            c.append(_check("push_host", True, detail=label))
+        push_ok = c[-1]["ok"] is True
+        if not push_ok:
+            c.append(_check("stream", None,
+                            detail="skipped: this process does not deliver"))
+        elif not registered:
+            c.append(_check("stream", None, detail="skipped: not registered"))
+        elif stale:
+            c.append(_check("stream", False, "auto",
+                            f"the stream has been silent for {quiet:.0f}s; it "
+                            "reconnects by itself, so wait rather than acting "
+                            "on this (fix=true reconnects it now)"))
+        elif counts.get("awaiting_replay"):
+            c.append(_check("stream", False, "auto",
+                            f"{counts['awaiting_replay']} message(s) reached "
+                            "the gateway but never a turn; the stream was "
+                            "reopened so the broker sends them again — wait "
+                            "rather than acting on this"))
+        elif not self.state["connected"]:
+            c.append(_check("stream", False, "auto",
+                            "the stream is not connected; it retries by "
+                            "itself, so wait rather than acting on this",
+                            detail=self.state["error"] or None))
+        else:
+            c.append(_check("stream", True))
+        theirs = self._broker_version()
+        if not theirs or not CLIENT_VERSION:
+            c.append(_check("version", None, detail="unknown"))
+        elif theirs != CLIENT_VERSION:
+            c.append(_check("version", False, "user",
+                            f"this client is {CLIENT_VERSION}, the broker "
+                            f"serves {theirs}: {self.install_line()}"))
+        else:
+            c.append(_check("version", True, detail=theirs))
+        return c
+
+    def _report(self, checks, fixed):
+        """The doctor's finding, to the broker — the ONLY time this client
+        reports its state (POST /me/state, one row per agent, overwritten).
+        Best effort: any refusal or error is logged once and ignored. The
+        reply says whether a stream for this agent is live anywhere."""
+        route = None
+        if is_desktop(self.route):
+            route = ("tui" if self.route.get("source") == "tui" else "app")
+        elif self.route:
+            route = "chat"
+        body = {"harness": "hermes", "version": CLIENT_VERSION or "",
+                "switch": bool(self.enabled and self.route), "route": route,
+                "receives": bool(self.enabled and self.route),
+                "settings": "copied" if self.copied else "own",
+                "failing": [c["check"] for c in checks if c["ok"] is False],
+                "fixed": sorted({f["check"] for f in fixed})}
+        try:
+            out = self.api("POST", "/me/state", body, timeout=5)
+        except Exception as e:
+            if not getattr(self, "_report_warned", False):
+                self._report_warned = True
+                self.log(f"could not report the doctor's finding to the "
+                         f"broker ({e!r}); going on without it")
+            return None
+        return out if isinstance(out, dict) else None
+
+    def status(self, a=None):
+        a = a if isinstance(a, dict) else {}
+        fixed = self._repair() if _truthy(a.get("fix")) else []
+        quiet, stale = self._quiet()
         with self._lock:
             counts: dict[str, int] = {}
             for d in self.deliveries.values():
@@ -1720,66 +2220,39 @@ class A2AHermes:
         registered = bool(me.get("registered"))
         stations = me.get("stations") or []
 
-        # In order: be installed, have a name, be switched on, exist, be
-        # reachable, be healthy. Only the first unmet condition is worth
-        # telling an agent about.
-        if block == "credentials":
-            step = ("no broker url or token in this install: reinstall with "
-                    "your broker's installer (curl -fsSL <broker>/install "
-                    "| python3)")
-        elif block == "id":
-            step = (f"this bot runs in Hermes's {self.profile!r} profile, "
-                    "whose name is no agent id: reinstall and give it an id "
-                    "when the installer asks — " + self.install_line())
-        elif block == "off":
-            step = ("a2a is off for this bot, so nothing is delivered. That "
-                    "is the user's decision: only if they ask for a2a, in the "
-                    "chat that should carry it, call "
-                    "enable_a2a_here(enabled=true)")
-        elif me.get("refused"):
-            # Another client holds this agent, or this install is too old to
-            # send a client key: nothing else will work until that is fixed.
-            step = f"the broker refuses to act as this agent: {me['refused']}"
-        elif not registered:
-            step = ("you are not registered in this station yet: call "
-                    "propose_me(note=\"what this bot is for\") and an "
-                    "operator approves it with one keystroke — no restart "
-                    "needed")
-        elif block == "host" and is_desktop(self.route):
-            step = ("this process is not the Hermes app's backend, so nothing "
-                    "is delivered here; a2a messages arrive in "
-                    f"{self._chat_label(self.route)} while the app runs")
-        elif block == "host":
-            step = ("this process is not the bot's gateway (CLI, TUI, cron), "
-                    "so nothing is delivered here; a2a messages arrive in "
-                    f"{self._chat_label(self.route)} while the gateway runs")
-        elif block == "injection":
-            step = ("the gateway may not start turns for this plugin: run "
-                    f"hermes -p {self.profile or '<bot>'} config set "
-                    "plugins.entries.a2a.allow_gateway_injection true, then "
-                    "quit the Hermes app and open it again (or restart the "
-                    "gateway however it is run)")
-        elif self._closed_since is not None:
-            step = ("the a2a conversation is not open in the Hermes app, so "
-                    "nothing can be delivered into it: ask the human to open "
-                    f"it ({self._chat_label(self.route)}). Messages wait on "
-                    "the broker meanwhile and arrive once it is open.")
-        elif stale:
-            step = (f"the stream has been silent for {quiet:.0f}s; it "
-                    "reconnects by itself, so wait rather than acting on this")
-        elif counts.get("awaiting_replay"):
-            step = (f"{counts['awaiting_replay']} message(s) reached the "
-                    "gateway but never a turn; the stream was reopened so the "
-                    "broker sends them again — wait rather than acting on this")
-        else:
-            step = None
+        checks = self._checks(block, me, registered, quiet, stale, counts)
+        reply = (self._report(checks, fixed)
+                 if CREDENTIALS and registered else None)
+        stream = next(c for c in checks if c["check"] == "stream")
+        if (reply and reply.get("stream_live") and stream["ok"] is False
+                and not self.state["connected"]):
+            # This process should hold the stream and does not, while the
+            # broker serves one for this agent: another process has it.
+            stream.update(_check(
+                "stream", False, "user",
+                "another process holds this agent's stream (the broker "
+                "serves one, and it is not this one): close the other Hermes "
+                "process running this bot, or leave it as the one that "
+                "receives"))
+        step = _next_step(checks)
 
         return json.dumps({
             "agent": self.name,
             "station": (stations[0] if len(stations) == 1 else stations) or None,
             "registered": registered,
             "channels": self._my_channels() if CREDENTIALS else [],
+            "checks": checks,
+            "fixed": fixed,
             "push": {
+                # Where this call was made, as Hermes tagged it: the fact a
+                # refusal in a conversation turns on. Inside `push`: the top
+                # level is shared by every client.
+                "this_turn": {
+                    "source": (_session("HERMES_SESSION_SOURCE")
+                               or _session("HERMES_SESSION_PLATFORM")
+                               or None),
+                    "conversation": _session("HERMES_SESSION_KEY") or None,
+                },
                 "enabled": block is None,
                 "stream_connected": self.state["connected"],
                 "seconds_since_last_line": round(quiet, 1) if quiet else None,

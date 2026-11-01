@@ -168,7 +168,12 @@ def database_half() -> None:
         ctx = None
 
         # --- a desktop-app conversation, closed past the replay window -------
+        # The backend that serves it: the conversation is in its session
+        # table (HERMES_DESKTOP alone is no sign — every shell the app opens
+        # inherits it).
         os.environ["HERMES_DESKTOP"] = "1"
+        th.hold_in_table({th.DESK["ui"]: {"session_key":
+                                          th.DESK["session_key"]}})
         plugin.PEEK_S = 0.5
         ctx = th.Ctx("bot", gateway=False, tui=True, config=th.DESK_ON)
         inst = th.start(plugin, ctx)
@@ -203,6 +208,7 @@ def database_half() -> None:
               str(receipt(d3)))
     finally:
         os.environ.pop("HERMES_DESKTOP", None)
+        th._no_tui_gateway()
         if ctx is not None:
             th.stop(ctx)
         proc.terminate()

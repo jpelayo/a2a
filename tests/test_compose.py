@@ -49,8 +49,8 @@ def main() -> int:
     try:
         import yaml
     except ImportError:
-        print("SKIP: pyyaml is not installed (pip3 install pyyaml)",
-              file=sys.stderr)
+        print("SKIP: pyyaml is not installed (python3 tests/run.py --setup "
+              "puts it in the repo's .venv)", file=sys.stderr)
         return 2
 
     raw = COMPOSE.read_text()

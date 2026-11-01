@@ -10,7 +10,9 @@ All data is partitioned per **station**; a token only sees its own station.
 The server never spawns an agent process and has no Claude/LLM dependency.
 
 Install:
-    pip3 install --break-system-packages mcp uvicorn starlette
+    The packages are in requirements.txt; the Docker image has them. To run
+    the tests on a machine, `python3 tests/run.py --setup` puts them in the
+    repo's .venv — never into a system Python.
 
 Run:
     python3 a2a-mcp.py serve
@@ -123,7 +125,15 @@ from starlette.routing import Mount, Route
 # each agent is pinned to the one harness-directory client that first used
 # it (agents.owner_client_hash, added in place). Clients must send the new
 # X-A2A-Client header to claim anything, so every install has to update.
-VERSION = "0.5.0"
+# 0.6.0: two tables added in place, nothing altered. station_links lets an
+# operator join two stations for DMs, both ways. agent_client_state keeps the
+# LAST finding of each client's doctor — a2a_channel_status now lists every
+# check with who must act and repairs what is safe on fix=true, in all five
+# clients. The Hermes plugin keeps its own state in its own folder (never in
+# config.yaml, which a cloned bot copies), ignores settings and baked ids
+# copied from another bot, and accepts "tui"-tagged conversations. Clients
+# must update to carry the doctor.
+VERSION = "0.6.0"
 
 # Storage is MariaDB (A2A_DB_HOST and friends, defined with the pool below).
 # A2A_DB_FILE survives as one thing only: where `migrate` starts looking for a
@@ -159,6 +169,13 @@ AUTH_DISABLED = os.environ.get("A2A_AUTH_DISABLED", "0") == "1"
 # The two live in different files, so changing one means checking the other —
 # see STREAM_READ_TIMEOUT in plugin/a2a/server/a2a-channel.py.
 STREAM_KEEPALIVE = float(os.environ.get("A2A_STREAM_KEEPALIVE", "5"))
+
+# The backstop of a stop. SIGTERM ends every /stream at once (_end_streams), so
+# this is only for a request that is NOT a stream and still does not finish:
+# after this many seconds uvicorn cancels it. Kept under Docker's 10 s stop
+# grace period (compose sets no stop_grace_period), so the cancel happens and
+# the lifespan's shutdown runs, instead of a SIGKILL that skips both.
+SHUTDOWN_GRACE_S = 5
 
 # Client plugin sources, shipped in the image. Both artifacts are produced
 # FROM THIS TREE at request time, never from a pre-built file, so a client can
@@ -454,6 +471,10 @@ TRANSFER_LOCKTIME = parse_duration(
 # against a 403; short enough that yesterday's diagnostics are never in today's
 # numbers.
 PING_TTL = parse_duration(os.environ.get("A2A_PING_TTL") or "10m")
+# How long a client's last doctor report (agent_client_state) is kept: past
+# it, collect() drops the row — a finding that old describes nothing current.
+CLIENT_STATE_TTL = parse_duration(
+    os.environ.get("A2A_CLIENT_STATE_TTL") or "30d")
 # How often `serve` runs the collector over EVERY station, on its own timer
 # (see _collector_loop). Floored at 1 s where it is used, so 0 cannot spin.
 COLLECT_INTERVAL = float(os.environ.get("A2A_COLLECT_INTERVAL", "300"))
@@ -784,6 +805,25 @@ CREATE TABLE IF NOT EXISTS station_links (
   KEY idx_links_b (station_b),
   FOREIGN KEY (station_a) REFERENCES stations(station_id) ON DELETE CASCADE,
   FOREIGN KEY (station_b) REFERENCES stations(station_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
+    """
+-- The doctor's LAST finding per agent (a client's a2a_channel_status, which
+-- reports it with POST /me/state) — and nothing else about clients. Written
+-- only when an agent runs its doctor, never at connect or on a keepalive, so
+-- a working client costs nothing. ONE row per agent, overwritten: never
+-- larger than the agents table. Bounded three ways: a 1 KB body of a fixed
+-- shape, one write per agent per 30 s, and collect() dropping rows past
+-- A2A_CLIENT_STATE_TTL. Deleted with its agent (move, rename, remove).
+CREATE TABLE IF NOT EXISTS agent_client_state (
+  station_id      VARCHAR(64)  NOT NULL,
+  agent_id        VARCHAR(128) NOT NULL,
+  harness         VARCHAR(16)  NOT NULL,
+  client_version  VARCHAR(32)  NOT NULL DEFAULT '',
+  state           TEXT         NOT NULL,
+  reported_at     DOUBLE       NOT NULL,
+  PRIMARY KEY (station_id, agent_id),
+  KEY idx_client_state_reported (reported_at),
+  FOREIGN KEY (station_id) REFERENCES stations(station_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;""",
     """
 -- Operational log and audit trail in one table, because the question that
@@ -1563,6 +1603,30 @@ _STREAM_OWNERS: dict[tuple[str, str], str] = {}
 
 def _wake_station(station_id: str) -> None:
     for ev in _stream_wakers.get(station_id) or ():
+        ev.set()
+
+
+# SIGTERM ends every /stream, so `serve` can exit by itself. uvicorn answers a
+# signal by closing the listener and then waiting — with no deadline — for
+# every open connection to finish, and a stream never finishes: on an active
+# response uvicorn only sets keep_alive=False, which the loop cannot see. So
+# every `docker compose stop` sat out Docker's 10 s and ended in SIGKILL,
+# which skips the stream's own `finally` — the claim release and the hand-back
+# of delivered-but-unacked messages — and the lifespan's shutdown half.
+# Set by _end_streams, scheduled from _cli_serve's handle_exit; read at the
+# top of the stream loop. Nothing reads it before a signal.
+_SHUTTING_DOWN = False
+
+
+def _end_streams(sig: int | None = None) -> None:
+    """Runs on the event loop once a stop signal has arrived: every parked
+    stream wakes, sees the flag and returns through its `finally`."""
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+    events = [ev for evs in list(_stream_wakers.values()) for ev in list(evs)]
+    log(f"serve stopping (signal {sig}): ending {len(events)} stream(s); "
+        "clients reconnect when the broker is back", event="serve.stop")
+    for ev in events:
         ev.set()
 
 
@@ -2363,6 +2427,12 @@ def collect(station_id: str | None = None) -> dict:
                 total.get("denials_expired", 0)
                 + PROPOSALS.sweep_denials(sid, now)
             )
+            # A client's last doctor report, past A2A_CLIENT_STATE_TTL: a
+            # finding that old describes nothing current.
+            total["client_states_expired"] = (
+                total.get("client_states_expired", 0)
+                + CLIENT_STATE.prune(sid, now)
+            )
         except Exception as e:
             failed.append(sid)
             log(f"collect failed: {e!r}\n{traceback.format_exc()}",
@@ -2570,6 +2640,9 @@ class StationRegistry:
                 "DELETE FROM station_links "
                 "WHERE station_a = %s OR station_b = %s", (sid, sid)
             )
+            CONN.execute(
+                "DELETE FROM agent_client_state WHERE station_id = %s", (sid,)
+            )
             cur = CONN.execute(
                 "DELETE FROM stations WHERE station_id = %s", (sid,)
             )
@@ -2772,6 +2845,181 @@ class LinkRegistry:
 
 
 LINKS = LinkRegistry()
+
+
+# The check ids every client's doctor (a2a_channel_status) lists, in order.
+DOCTOR_CHECKS = ("install", "identity", "settings", "switch", "broker",
+                 "client", "registered", "push_host", "stream", "version")
+
+
+class ClientStateRegistry:
+    """The doctor's last finding per agent, as its client reported it.
+
+    The only thing the broker keeps about a client, and only because an agent
+    ran its doctor (POST /me/state, from a2a_channel_status). Bounded so it
+    can never grow into the broker's problem: one row per agent (upsert, no
+    history), a 1 KB body of a fixed shape, at most one write per agent per
+    THROTTLE seconds, and collect() drops rows past CLIENT_STATE_TTL. Nothing
+    of it rides on a message, a stream line or /me. Sync, like the others."""
+
+    HARNESSES = ("claude", "codex", "opencode", "pi", "hermes")
+    ROUTES = ("project", "app", "tui", "chat")
+    SETTINGS = ("own", "copied")
+    KEYS = ("harness", "version", "switch", "route", "receives", "settings",
+            "failing", "fixed")
+    MAX_BODY = 1024
+    THROTTLE = 30.0
+
+    def __init__(self) -> None:
+        # (station, agent) -> time of the last WRITE, in this process. Bounded
+        # by the agents that have run a doctor; forget() drops an entry.
+        self._written: dict[tuple[str, str], float] = {}
+        self._lock = threading.Lock()
+
+    def validate(self, body) -> dict:
+        """The body as stored, or ValueError naming what is wrong. A fixed
+        shape: nothing a client sends beyond it (a chat id, a path, a token)
+        can be stored."""
+        if not isinstance(body, dict):
+            raise ValueError("the body must be a JSON object")
+        unknown = sorted(set(body) - set(self.KEYS))
+        if unknown:
+            raise ValueError(f"unknown key(s): {', '.join(unknown)}")
+        if body.get("harness") not in self.HARNESSES:
+            raise ValueError(
+                f"harness must be one of {', '.join(self.HARNESSES)}")
+        version = body.get("version") or ""
+        if (not isinstance(version, str) or len(version) > 32
+                or not re.fullmatch(r"[0-9A-Za-z.+_-]*", version)):
+            raise ValueError("version must be a short version string")
+        for key in ("switch", "receives"):
+            if body.get(key) is not None and not isinstance(body[key], bool):
+                raise ValueError(f"{key} must be true, false or null")
+        if body.get("route") is not None and body["route"] not in self.ROUTES:
+            raise ValueError(f"route must be one of {', '.join(self.ROUTES)} "
+                             f"or null")
+        if (body.get("settings") is not None
+                and body["settings"] not in self.SETTINGS):
+            raise ValueError("settings must be own, copied or null")
+        lists = {}
+        for key in ("failing", "fixed"):
+            ids = body.get(key) or []
+            if (not isinstance(ids, list)
+                    or not all(i in DOCTOR_CHECKS for i in ids)):
+                raise ValueError(f"{key} must list check ids "
+                                 f"({', '.join(DOCTOR_CHECKS)})")
+            lists[key] = [i for i in DOCTOR_CHECKS if i in ids]
+        return {"harness": body["harness"], "version": version,
+                "switch": body.get("switch"), "route": body.get("route"),
+                "receives": body.get("receives"),
+                "settings": body.get("settings"), **lists}
+
+    def report(self, station_id: str, agent_id: str, clean: dict,
+               now: float | None = None) -> bool:
+        """Store a validated finding, replacing the last. False (and nothing
+        written) when this agent wrote one less than THROTTLE seconds ago."""
+        now = now or time.time()
+        key = (station_id, agent_id)
+        with self._lock:
+            if now - self._written.get(key, 0.0) < self.THROTTLE:
+                return False
+            self._written[key] = now
+        state = json.dumps({k: clean[k] for k in self.KEYS
+                            if k not in ("harness", "version")},
+                           separators=(",", ":"))
+        CONN.execute(
+            "INSERT INTO agent_client_state (station_id, agent_id, harness, "
+            "client_version, state, reported_at) VALUES (%s,%s,%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE harness = VALUES(harness), "
+            "client_version = VALUES(client_version), "
+            "state = VALUES(state), reported_at = VALUES(reported_at)",
+            (station_id, agent_id, clean["harness"], clean["version"], state,
+             now),
+        )
+        return True
+
+    @staticmethod
+    def _row(r: dict) -> dict:
+        try:
+            state = json.loads(r.get("state") or "{}")
+        except ValueError:
+            state = {}
+        return {"station_id": r["station_id"], "agent_id": r["agent_id"],
+                "harness": r["harness"], "version": r["client_version"],
+                "reported_at": r["reported_at"],
+                **(state if isinstance(state, dict) else {})}
+
+    def get(self, station_id: str, agent_id: str) -> dict | None:
+        r = CONN.execute(
+            "SELECT * FROM agent_client_state "
+            "WHERE station_id = %s AND agent_id = %s",
+            (station_id, agent_id),
+        ).fetchone()
+        return self._row(r) if r else None
+
+    def all(self, station_id: str | None = None) -> list[dict]:
+        rows = (CONN.execute(
+            "SELECT * FROM agent_client_state WHERE station_id = %s "
+            "ORDER BY agent_id", (station_id,)
+        ) if station_id else CONN.execute(
+            "SELECT * FROM agent_client_state ORDER BY station_id, agent_id"
+        )).fetchall()
+        return [self._row(r) for r in rows]
+
+    def forget(self, station_id: str, agent_id: str) -> int:
+        """The agent left (moved, renamed, removed): its finding goes with
+        it. Runs inside the caller's transaction."""
+        with self._lock:
+            self._written.pop((station_id, agent_id), None)
+        return max(0, CONN.execute(
+            "DELETE FROM agent_client_state "
+            "WHERE station_id = %s AND agent_id = %s",
+            (station_id, agent_id),
+        ).rowcount)
+
+    def prune(self, station_id: str, now: float | None = None) -> int:
+        """Findings older than CLIENT_STATE_TTL — collect() calls this."""
+        now = now or time.time()
+        return max(0, CONN.execute(
+            "DELETE FROM agent_client_state "
+            "WHERE station_id = %s AND reported_at < %s",
+            (station_id, now - CLIENT_STATE_TTL),
+        ).rowcount)
+
+    @staticmethod
+    def drift(row: dict | None) -> list[str]:
+        """What an operator should look at, from a finding: its failing
+        checks and a client older than this broker. Empty = nothing."""
+        if not row:
+            return []
+        flags = []
+        if row.get("failing"):
+            flags.append("doctor fails: " + ", ".join(row["failing"]))
+        if row.get("version") and row["version"] != VERSION:
+            flags.append(f"client v{row['version']}, broker v{VERSION}")
+        return flags
+
+    @staticmethod
+    def describe(row: dict | None, now: float | None = None) -> str:
+        """One line for an operator: who reported what, how long ago."""
+        if not row:
+            return "no doctor run recorded"
+        now = now or time.time()
+        age = _short_duration(max(0.0, now - row["reported_at"]))
+        bits = [f"{row['harness']} {row.get('version') or '?'}",
+                f"switch {'on' if row.get('switch') else 'off' if row.get('switch') is False else '-'}",
+                f"route {row.get('route') or '-'}",
+                f"receives {'yes' if row.get('receives') else 'no'}"]
+        if row.get("settings"):
+            bits.append(f"settings {row['settings']}")
+        flags = ClientStateRegistry.drift(row)
+        if row.get("fixed"):
+            bits.append("fixed: " + ", ".join(row["fixed"]))
+        return (f"last doctor run {age} ago — " + ", ".join(bits)
+                + (" — ⚠ " + "; ".join(flags) if flags else " — all checks ok"))
+
+
+CLIENT_STATE = ClientStateRegistry()
 
 
 class TokenRegistry:
@@ -3185,6 +3433,8 @@ class AgentRegistry:
             # It no longer lives in `old`, so a link that named it there no
             # longer can.
             LINKS.forget_agent(old, agent_id)
+            # Nor does its doctor's last finding: its client reports again.
+            CLIENT_STATE.forget(old, agent_id)
         return True
 
     def bind(
@@ -3499,6 +3749,7 @@ class AgentRegistry:
                 # signed DMs with in the linked stations — a reply to the old
                 # string would now be refused as nobody.
                 LINKS.forget_agent(sid, agent_id, new_id)
+                CLIENT_STATE.forget(sid, agent_id)
                 for other in LINKS.linked_ids(sid):
                     CONN.execute(
                         "UPDATE dms SET sender = %s "
@@ -3582,6 +3833,7 @@ class AgentRegistry:
                 )
                 _rewrite_member_lists(sid, agent_id, None)
                 LINKS.forget_agent(sid, agent_id)
+                CLIENT_STATE.forget(sid, agent_id)
                 # transcripts.sender and dms.sender are deliberately untouched:
                 # they record what was said, and deleting an agent does not
                 # unsay it. message_addressees is left for the same reason —
@@ -6231,7 +6483,10 @@ def build_app() -> Starlette:
         same reason (a module docstring opens the file). plugin.yaml's
         `version:` is stamped with this broker's, so Hermes shows the tree the
         bot actually runs. `?agent=` is how the default profile, whose name
-        is "default", gets an id at all.
+        is "default", gets an id at all. `?profile=` names the bot it is
+        baked for: Hermes clones a bot by copying its plugins folder (the
+        app's "new bot" clones `default`), and the plugin honours a baked id
+        only in the profile the line names.
 
         Unknown, revoked and not-installed all answer 404 with the same body,
         so this cannot be used to probe which tokens exist.
@@ -6253,6 +6508,7 @@ def build_app() -> Starlette:
             "token": token,
             "station": request.query_params.get("station") or "",
             "agent": request.query_params.get("agent") or "",
+            "profile": request.query_params.get("profile") or "",
             "version": VERSION,
         })
         src = _bake_seam(client.read_bytes(), baked)
@@ -6429,6 +6685,12 @@ def build_app() -> Starlette:
                 replays_left = 2
                 while True:
                     if await request.is_disconnected():
+                        return
+                    # The broker is stopping (_end_streams woke us). Return
+                    # through the `finally` below, so the claim is released and
+                    # what this connection took unacked is handed back — the
+                    # client reconnects to the next broker as after any close.
+                    if _SHUTTING_DOWN:
                         return
                     # Superseded? A newer connection for this agent claimed
                     # the stream (its claim also woke us). Exit before
@@ -6654,6 +6916,35 @@ def build_app() -> Starlette:
                 "for a while, so do not retry in a loop."
             )
         return JSONResponse(out, status_code=201)
+
+    async def me_state_route(request: Request) -> JSONResponse:
+        """A client's doctor (a2a_channel_status) reporting what it found —
+        the ONLY time a client reports its state. One row per agent,
+        overwritten; a fixed 1 KB shape; one write per agent per 30 s.
+        Registered agents only, as themselves. The reply says whether a
+        stream for this agent is live in this broker, which is how a client
+        that is not connected learns another process holds its stream."""
+        station_id = require_station()
+        agent = current_agent()
+        if not agent:
+            return JSONResponse({"error": "name the agent (X-A2A-Agent)"},
+                                status_code=400)
+        raw = await request.body()
+        if len(raw) > CLIENT_STATE.MAX_BODY:
+            return JSONResponse(
+                {"error": f"a doctor report is at most "
+                          f"{CLIENT_STATE.MAX_BODY} bytes"}, status_code=400)
+        try:
+            clean = CLIENT_STATE.validate(json.loads(raw or b"{}"))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        stored = await _db(lambda: CLIENT_STATE.report(station_id, agent,
+                                                        clean))
+        return JSONResponse({
+            "stored": stored,
+            "stream_live": (station_id, agent) in _STREAM_OWNERS,
+            "version": VERSION,
+        })
 
     async def me_proposals_route(_: Request) -> JSONResponse:
         auth = require_auth()
@@ -7330,6 +7621,7 @@ def build_app() -> Starlette:
     routes.append(Route("/me", me_route, methods=["GET"]))
     routes.append(Route("/me/agents", me_agents_route, methods=["GET"]))
     # Specific before general, and both before /me/agents/{agent_id}.
+    routes.append(Route("/me/state", me_state_route, methods=["POST"]))
     routes.append(Route("/me/proposals", me_proposals_route, methods=["GET"]))
     routes.append(Route("/me/proposals", me_propose_route, methods=["POST"]))
     routes.append(Route("/me/proposals/{agent_id}",
@@ -7846,7 +8138,7 @@ class _Tui:
         # themselves (run() looks every REFRESH_MS).
         "agents":   "request: a approve · x reject (one key) · agent: n add · "
                     "f free · m move · b bind · s ack all · x remove · "
-                    "u unlock transfer · c collect",
+                    "u unlock transfer · ⏎ client state · c collect",
         # Read-only on purpose. Everything here is history; the way to
         # change it is to do something that gets logged.
         "logs":     "newest last (UTC) · ↑/↓ scroll · c collect",
@@ -7978,6 +8270,10 @@ class _Tui:
                 for p in PROPOSALS.list()
             ]
             agents = []
+            # Each client's last doctor finding: its first flag rides on the
+            # row, ⏎ shows the whole report.
+            states = {(s["station_id"], s["agent_id"]): s
+                      for s in CLIENT_STATE.all()}
             for r in AGENTS.list_all():
                 r = dict(r, kind="agent")
                 if not r.get("owner_token_hash"):
@@ -7986,6 +8282,10 @@ class _Tui:
                     r["status"] = "token revoked"
                 else:
                     r["status"] = "working"
+                drift = CLIENT_STATE.drift(
+                    states.get((r["station_id"], r["agent_id"])))
+                if drift:
+                    r["status"] += f" · ⚠ {drift[0]}"
                 agents.append(r)
             self.rows = pending + agents
         self.sel[self.view] = max(
@@ -8682,6 +8982,12 @@ class _Tui:
             return
         if ch == "a":
             self.msg = "nothing to approve on this row"
+        elif ch in ("\n", "\r") and row:
+            # What this agent's own client found, the last time its doctor
+            # ran there (a2a_channel_status) — the only thing the broker keeps
+            # about a client.
+            self.msg = (f"{row['agent_id']}: " + CLIENT_STATE.describe(
+                CLIENT_STATE.get(row["station_id"], row["agent_id"])))
         elif ch == "u" and row:
             # An accidental x would otherwise wedge a legitimate transfer for
             # the whole locktime, so the undo lives on the agent row too —
@@ -9085,7 +9391,7 @@ EXPECTED_TABLES = (
     "broadcasts", "bids", "dms", "md_files", "message_receipts",
     "message_addressees",
     "stream_cursors", "agent_proposals", "agent_transfer_denials", "logs",
-    "station_links",
+    "station_links", "agent_client_state",
 )
 
 
@@ -9234,6 +9540,8 @@ def _doctor_all() -> int:
         seen[a["agent_id"]] = seen.get(a["agent_id"], 0) + 1
     now = time.time()
     stale_agents: list[str] = []
+    # Each client's last doctor finding, where its agent ran one.
+    states = {(r["station_id"], r["agent_id"]): r for r in CLIENT_STATE.all()}
     for a in agents:
         sid, aid = a["station_id"], a["agent_id"]
         st = CONN.execute(
@@ -9265,6 +9573,13 @@ def _doctor_all() -> int:
         if oldest_days > MAX_RETENTION_DAYS * 0.75:
             flags.append(f"PINNING({oldest_days:.0f}d)")
             stale_agents.append(aid)
+        drift = CLIENT_STATE.drift(states.get((sid, aid)))
+        if drift:
+            flags.append("CLIENT")
+            problems.append(
+                f"agent {aid} ({a.get('station_name') or sid[:8]}): "
+                + CLIENT_STATE.describe(states[(sid, aid)], now)
+                + f"\n      detail: a2a-mcp.py doctor {aid}")
         age = f" oldest={oldest_days:.0f}d" if n_pending else ""
         print(f"  {aid:<26} {(a.get('station_name') or '')[:16]:<16} "
               f"pending={n_pending:<4}{age} {' '.join(flags)}")
@@ -9362,6 +9677,10 @@ def _cli_doctor(args: argparse.Namespace) -> int:
             time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ever))
             if ever else "never — this agent has never received anything"
         ))
+        # What its client's own doctor found, the last time it was run there
+        # (a2a_channel_status). Only ever reported by that call.
+        print("  client: " + CLIENT_STATE.describe(
+            CLIENT_STATE.get(sid, agent)))
         print(f"  UNACKED (pending): {st['n'] or 0} message(s), "
               f"{st['seen'] or 0} already pushed at least once")
         if st["oldest"]:
@@ -9482,6 +9801,9 @@ MIGRATION_TABLES = (
     "agent_transfer_denials",
     # Follows stations, both of its parents; absent from any sqlite source.
     "station_links",
+    # Follows stations; absent from any sqlite source. A doctor's last
+    # finding — carried so a restore shows what the operator last saw.
+    "agent_client_state",
     # AFTER transcripts, which it references: restore walks this tuple in
     # order, so a row here inserted before its parent would fail the FK.
     "message_addressees",
@@ -10294,8 +10616,38 @@ def _cli_serve(_args: argparse.Namespace) -> int:
     # forwarded_allow_ips="*" is safe only because this process is never
     # exposed directly: it is reachable solely through the proxy network (see
     # docker-compose.yml), so nothing else can forge those headers.
-    uvicorn.run(build_app(), host=HOST, port=PORT,
-                proxy_headers=True, forwarded_allow_ips="*")
+    #
+    # uvicorn.Server rather than uvicorn.run, for ONE hook: handle_exit is
+    # where SIGTERM/SIGINT arrive, and from there every /stream is told to end
+    # (_end_streams), so the broker exits by itself instead of waiting for
+    # streams that never finish. sse-starlette — the MCP SDK's SSE — hooks the
+    # same method for its own streams (a class-level patch at import), and
+    # super() chains through it to uvicorn's, so a second Ctrl+C still
+    # force-quits. Defined here so importing the broker needs nothing more
+    # from uvicorn.
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig, frame) -> None:
+            try:
+                # Out of a signal handler, onto the loop: the safe way.
+                asyncio.get_running_loop().call_soon_threadsafe(
+                    _end_streams, sig)
+            except RuntimeError:
+                pass                    # no loop running: nothing to end
+            super().handle_exit(sig, frame)
+
+    server = _Server(uvicorn.Config(
+        build_app(), host=HOST, port=PORT,
+        proxy_headers=True, forwarded_allow_ips="*",
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
+    ))
+    # What uvicorn.run does around Server.run(), kept: Ctrl+C is not a
+    # traceback, and a server that never started exits 3 (STARTUP_FAILURE).
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        return 3
     return 0
 
 

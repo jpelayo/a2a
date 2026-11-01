@@ -155,10 +155,12 @@ def main() -> int:
     check("tui_gateway/plugin_inject.py defines inject_tui_session_message",
           find(pi, ast.FunctionDef, "inject_tui_session_message") is not None,
           "")
-    ws = src / "hermes_cli" / "web_server.py"
+    # web_server.py until Hermes split it; web_server_app.py since.
+    ws = [p for p in (src / "hermes_cli" / "web_server.py",
+                      src / "hermes_cli" / "web_server_app.py") if p.is_file()]
     check("the desktop app's backend (hermes serve) installs the TUI injector",
-          ws.is_file() and "install_tui_message_injector" in ws.read_text(),
-          "")
+          any("install_tui_message_injector" in p.read_text() for p in ws),
+          str([p.name for p in ws]))
     check("a desktop turn binds HERMES_UI_SESSION_ID — the app's id the plugin "
           "follows a rotated key by", '"HERMES_UI_SESSION_ID"' in sc_text, "")
     check("'desktop' is the session source a desktop-app turn carries",
@@ -170,9 +172,72 @@ def main() -> int:
           re.search(r"^_sessions\s*[:=]", srv_text, re.M) is not None
           and re.search(r"^_sessions_lock\s*[:=]", srv_text, re.M) is not None,
           "")
-    desk = " ".join(p.read_text() for p in (ws, srv) if p.is_file())
-    check("HERMES_DESKTOP is what marks the app's own backend",
-          "HERMES_DESKTOP" in desk, "")
+    # The process that serves a conversation is the one whose table holds it:
+    # the injector queues only on a live session in THIS process's _sessions
+    # whose session_key matches — the match _table_holds makes.
+    pi_text = ((src / "tui_gateway" / "plugin_inject.py").read_text()
+               if (src / "tui_gateway" / "plugin_inject.py").is_file() else "")
+    check("the injector matches a session in _sessions by its session_key",
+          re.search(r'_sessions\.items\(\).*?session\.get\("session_key"\)\s*'
+                    r'==\s*session_key', pi_text, re.S) is not None, "")
+    # A conversation's turns carry "desktop" or "tui", and both are a route:
+    # Hermes picks "desktop" only from the app's own say-so or HERMES_DESKTOP,
+    # so a bot's own chat on a gateway reached by URL is "tui".
+    af = src / "tui_gateway" / "agent_factory.py"
+    af_text = af.read_text() if af.is_file() else ""
+    plat = (af_text.split("def _resolve_session_platform", 1) + [""])[1][:800]
+    check("_resolve_session_platform answers 'desktop' or else 'tui'",
+          '"desktop"' in plat and '"tui"' in plat
+          and "HERMES_DESKTOP" in plat, plat[:300])
+    nm = re.search(r"NON_MESSAGING_SESSION_SURFACES\s*=\s*frozenset\(\{(.*?)\}",
+                   sc_text, re.S)
+    check("'tui' and 'desktop' are not messaging surfaces — enable_a2a_here "
+          "takes them as conversations, not chats",
+          nm is not None and '"tui"' in nm.group(1)
+          and '"desktop"' in nm.group(1), "")
+    # Settings older than `home` are judged against the bot's own sessions.
+    common = src / "hermes_state_common.py"
+    common_text = common.read_text() if common.is_file() else ""
+    check("state.db keeps sessions(id …): the session key is that id",
+          re.search(r"CREATE TABLE IF NOT EXISTS sessions \(\s*id TEXT "
+                    r"PRIMARY KEY", common_text) is not None, "")
+    hs = src / "hermes_state.py"
+    check("state.db lives in the profile home",
+          hs.is_file() and 'get_hermes_home() / "state.db"' in hs.read_text(),
+          "")
+    reg = src / "tui_gateway" / "session_registry.py"
+    reg_text = reg.read_text() if reg.is_file() else ""
+    check("a conversation's session key is a new session id",
+          re.search(r"def _new_session_key\(\)[^:]*:\s*return new_session_id"
+                    r"\(\)", reg_text) is not None, "")
+    # The plugin's own state: ctx.state, Hermes's per-plugin store, instead
+    # of config.yaml (which a clone copies whole).
+    st_prop = method(ctx, "state")
+    check("PluginContext.state is a property — the plugin's own store",
+          st_prop is not None and is_property(st_prop), "")
+    ps_tree = tree(src, "hermes_cli/plugins_state.py")
+    ps = find(ps_tree, ast.ClassDef, "PluginState")
+    for name in ("get", "set", "data_dir"):
+        check(f"PluginState.{name} exists", ps is not None
+              and method(ps, name) is not None, "")
+    ps_text = ((src / "hermes_cli" / "plugins_state.py").read_text()
+               if (src / "hermes_cli" / "plugins_state.py").is_file() else "")
+    check("PluginState keeps state.json under <profile>/plugin-data",
+          '"plugin-data"' in ps_text and '"state.json"' in ps_text, "")
+    # Why a bot can arrive holding another's settings at all.
+    prof = src / "hermes_cli" / "profiles.py"
+    prof_text = prof.read_text() if prof.is_file() else ""
+    boot = (prof_text.split("def _bootstrap_profile_dir", 1) + [""])[1][:4000]
+    boot = boot.split("\ndef ", 1)[0]
+    check("the app's clone (_bootstrap_profile_dir) copies no plugin-data — "
+          "so the plugin's own state does not travel into a new bot",
+          bool(boot) and "plugin-data" not in boot, "")
+    files = re.search(r"_CLONE_CONFIG_FILES\s*=\s*\[([^\]]*)\]", prof_text)
+    check("a cloned profile copies config.yaml whole (this plugin's settings "
+          "in it) — and not state.db",
+          files is not None and '"config.yaml"' in files.group(1)
+          and "state.db" not in files.group(1),
+          files.group(0) if files else "")
 
     # Cron: a job may send as the bot if whoever created it could. The plugin
     # reads the running job through the plugin API and its creator from the

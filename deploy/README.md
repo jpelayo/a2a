@@ -117,7 +117,7 @@ It is served by *your* broker, with that broker's address already in it, and
 needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 
 1. **It finds your harnesses** — Claude Code, OpenCode, Pi, Codex, Hermes — and
-   shows a checklist of what each one has: *installed 0.4.0 → 0.5.0*, *found,
+   shows a checklist of what each one has: *installed 0.5.0 → 0.6.0*, *found,
    not installed*, *not found*. Installed ones start ticked, so an update is
    just ENTER. The keys are the ones `hermes plugins` uses: ↑↓/j/k move,
    SPACE ticks, ENTER confirms, ESC cancels.
@@ -660,7 +660,7 @@ from the container's tree, so a feature that looks missing is usually a
 container that was never rebuilt:
 
 ```bash
-curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.5.0","clients":"0.5.0"}
+curl -s https://a2a.example.com/healthz     # {"ok":true,"version":"0.6.0","clients":"0.6.0"}
 docker compose exec a2a-mcp python3 /app/a2a-mcp.py --version
 ```
 

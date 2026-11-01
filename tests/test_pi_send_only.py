@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PI = HERE.parent / "plugin" / "pi" / "index.ts"
-INSTANCES = 16
+INSTANCES = 18
 
 fails: list[str] = []
 
@@ -240,11 +240,12 @@ await shutdown(T2)
 const off = async (id, mode) => {
   writeFileSync(".a2a.json", "{}")
   const p = await instance(id, mode)
+  const offStatus = await status(p)
   const before = streams.length
   const r = await tool(p, "enable_a2a_here", { enabled: true })
   await sleep(600)
   const res = { opened_at_start: p.opened, opened_by_enable: streams.length - before,
-                result: r }
+                result: r, off_status: offStatus }
   await shutdown(p)
   return res
 }
@@ -254,6 +255,26 @@ out.enable = {
   print: await off("ses_ep", "print"),
 }
 writeFileSync(".a2a.json", '{"enabled_pi": true}')
+
+// 6. The doctor. fix=true on a healthy session changes nothing; on a stream
+// that is connected but silent it aborts THAT connection's controller, and
+// the pump comes back with a new stream — no notice, no error kept.
+const D = await instance("ses_d", "tui")
+const d0 = streams.length
+const healthy = JSON.parse((await tool(D, "a2a_channel_status", { fix: true })).text)
+await sleep(300)
+out.d = { healthy_fixed: healthy.fixed, healthy_step: healthy.next_step,
+          checks: healthy.checks, opened_after_healthy: streams.length - d0 }
+const realNow = Date.now
+Date.now = () => realNow() + 120_000      // as if nothing arrived for 2 min
+const silent = JSON.parse((await tool(D, "a2a_channel_status", { fix: true })).text)
+Date.now = realNow
+await sleep(6500)                          // RECONNECT_MS, then a new stream
+out.d.silent_fixed = silent.fixed
+out.d.opened_after_fix = streams.length - d0
+out.d.open_streams = openStreams()
+out.d.notes = [...D.st.notes]
+await shutdown(D)
 
 console.log("@@" + JSON.stringify(out))
 process.exit(0)
@@ -318,7 +339,7 @@ def verify_derived(out: dict) -> None:
     check("[derived id] the helper reports the stored id too, and that it does "
           "not receive",
           h["status"].get("agent") == "stored-id"
-          and h["status"].get("receives") is False,
+          and (h["status"].get("push") or {}).get("receives") is False,
           f"agent={h['status'].get('agent')} receives={h['status'].get('receives')} "
           f"(folder is {folder!r})")
     for name in ("send_dm", "post_to_channel"):
@@ -376,7 +397,7 @@ def main() -> int:
                   "error" not in r and made(r, method, path), json.dumps(r)[:300])
         s = o["status"]
         check(f"[{label}] status: receives, registered, connected, nothing to do",
-              s.get("receives") is True and s.get("registered") is True
+              (s.get("push") or {}).get("receives") is True and s.get("registered") is True
               and s["push"]["stream_connected"] is True and s.get("next_step") is None,
               json.dumps(s)[:300])
     t = out["t"]["session"]
@@ -418,7 +439,7 @@ def main() -> int:
     s = h["status"]
     check("the helper's status says it does not receive, and does not tell it "
           "to wait for a stream it will never open",
-          s.get("receives") is False and s.get("next_step") is None,
+          (s.get("push") or {}).get("receives") is False and s.get("next_step") is None,
           json.dumps(s)[:300])
 
     # --- json ------------------------------------------------------------------------
@@ -460,6 +481,31 @@ def main() -> int:
     check("a helper's enable_a2a_here connects nothing",
           r["opened_at_start"] == 0 and r["opened_by_enable"] == 0
           and "error" not in r["result"], json.dumps(r)[:300])
+    st = e["tui"]["off_status"]
+    sw = next((c for c in st.get("checks") or [] if c["check"] == "switch"), {})
+    check("a project that is off: status says so and names who decides — it "
+          "used to tell the agent to wait for a stream that never opens",
+          "a2a is off" in (st.get("next_step") or "")
+          and sw.get("ok") is False and sw.get("who") == "human",
+          json.dumps(st)[:300])
+
+    # --- the doctor ------------------------------------------------------------------
+    d = out["d"]
+    check("doctor: every check, in the shared order",
+          [c["check"] for c in d["checks"]]
+          == ["install", "identity", "settings", "switch", "broker", "client",
+              "registered", "push_host", "stream", "version"],
+          str([c["check"] for c in d["checks"]]))
+    check("doctor: fix=true on a healthy session repairs nothing and opens "
+          "no stream", d["healthy_fixed"] == [] and d["healthy_step"] is None
+          and d["opened_after_healthy"] == 0, json.dumps(d)[:300])
+    check("doctor: a connected but silent stream — fix=true aborts that "
+          "connection alone, and the pump opens a new one",
+          [f["check"] for f in d["silent_fixed"]] == ["stream"]
+          and d["opened_after_fix"] == 1 and d["open_streams"] == 1,
+          json.dumps(d)[:300])
+    check("doctor: and the user is not told about it — asked for, not failed",
+          not any("not receiving" in n for n in d["notes"]), str(d["notes"]))
 
     # --- a derived id, as on a real install ------------------------------------------
     verify_derived(derived)

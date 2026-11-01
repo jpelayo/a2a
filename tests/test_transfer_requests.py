@@ -152,8 +152,12 @@ def main() -> int:
     check("approving a transfer rebinds rather than creating a second agent",
           ok["kind"] == "transfer"
           and len(b.AGENTS.list_all(sid)) == n_before, str(ok))
+    # Ownership from the operator view: AGENTS.get is the agent's CARD and
+    # carries no hashes; list_all is what the TUI and CLI show an operator.
+    owner = next((a for a in b.AGENTS.list_all(sid)
+                  if a["agent_id"] == "acme-api"), {})
     check("the name now answers to the token that asked",
-          after["owner_token_hash"] == h2, str(after))
+          owner.get("owner_token_hash") == h2, str(owner))
     check("and it is taken from the one that held it",
           ok["taken_from"] == h1, str(ok))
     check("the agent itself is the same row — a transfer is an ownership "

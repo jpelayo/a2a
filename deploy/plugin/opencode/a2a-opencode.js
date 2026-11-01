@@ -166,7 +166,7 @@ const instructions = (name) =>
   `you are registered, whether push is alive, and which channels you are ` +
   `a MEMBER of — a reply posted to a room you are not in reaches nobody. ` +
   `Its next_step names the one thing to do, or is null when nothing is ` +
-  `wrong. It reads nothing from your inbox.\n\n` +
+  `wrong; checks lists every check and who must act, and fix=true repairs what it safely can on its own. It reads nothing from your inbox.\n\n` +
   `MESSAGES HAVE A SHELF LIFE. Yours last a year unless you say otherwise: ` +
   `pass expires_in ("10m", "2h", "7d") when what you are saying stops being ` +
   `worth reading — an expired message is never delivered, because acting on ` +
@@ -1221,7 +1221,20 @@ async function core(host) {
   // is push alive, which rooms am I in. An agent that could not ask any of
   // this replied into a channel it was not a member of, tried to DM a label,
   // and reported the probe as broken — three turns to learn nothing.
-  async function statusReport() {
+  //
+  // It is a DOCTOR: `checks` lists every check, in one order shared by every
+  // client, each saying who must act and what to do; `fixed` is what this
+  // call repaired (repairNow, only with fix=true, only for a failing check —
+  // never the switch, the identity, or anything on the broker). The doctor's
+  // finding is the ONE thing this client ever reports about itself
+  // (POST /me/state), and only from here.
+  async function statusReport(fixed = []) {
+    const check = (id, ok, who, todo, detail) => ({
+      check: id, ok,
+      who: ok === false ? who || null : null,
+      do: ok === false ? todo || null : null,
+      detail: detail === undefined ? null : detail,
+    })
     let me = {}
     try {
       me = JSON.parse(await api("GET", "/me")) || {}
@@ -1241,41 +1254,112 @@ async function core(host) {
     const quiet = pumpState.lastLine ? (Date.now() - pumpState.lastLine) / 1000 : null
     const stale = quiet !== null && quiet > 60
     const stations = me.stations || []
-    // In order: be switched on, exist, be reachable, be healthy. Only the
-    // first unmet condition is worth telling an agent about — and "off" comes
+    // In order: be switched on, exist, be reachable, be healthy — "off"
     // first, or an agent in a project that never opted in is told to
     // register, or to wait for a stream that will never open. Worded like
     // Codex's, so the answer does not depend on the harness.
-    let step = null
-    if (ENABLED && me.refused) {
-      // Before everything but the switch: another client holds this agent,
-      // or this install is too old to send a client key, and nothing else
-      // worth suggesting will work until that is fixed.
-      step = `the broker refuses to act as this agent: ${me.refused}`
-    } else if (!ENABLED) {
-      step =
+    const checks = []
+    checks.push(URL_BASE && TOKEN
+      ? check("install", true)
+      : check("install", false, "user",
+        "no broker url or token in this install: run the installer and pick " +
+        "OpenCode (curl -fsSL <broker>/install | python3)"))
+    checks.push(check("identity", true, null, null, key))
+    checks.push(check("settings", null, null, null, "not applicable to OpenCode"))
+    checks.push(ENABLED
+      ? check("switch", true, null, null, PROJECT_FILE)
+      : check("switch", false, "human",
         `a2a is off in this project: ${PROJECT_FILE} does not say ` +
         `{"${ENABLE_KEY}": true}, so nothing is delivered here. That is the ` +
         `user's decision: only if they ask for a2a in this project, call ` +
-        `enable_a2a_here(enabled=true)`
-    } else if (!me.registered) {
-      step =
-        "you are not registered in this station yet: call propose_me with one " +
-        "line about this project, and an operator approves it with one " +
-        "keystroke — no restart needed"
-    } else if (!pumpState.connected) {
-      step =
-        "the push stream is not connected; it retries by itself, so wait — " +
-        "messages are held on the broker meanwhile"
-    } else if (stale) {
-      step = `the stream has been silent for ${Math.round(quiet)}s; it reconnects by itself`
+        `enable_a2a_here(enabled=true)`))
+    if (me.error) {
+      checks.push(check("broker", false, "operator",
+        `the broker at ${URL_BASE} did not answer (${me.error}); nothing ` +
+        "works until it does", me.error))
+      checks.push(check("client", null, null, null, "skipped: the broker did not answer"))
+      checks.push(check("registered", null, null, null, "skipped: the broker did not answer"))
+    } else {
+      checks.push(check("broker", true, null, null, URL_BASE))
+      // Another client holds this agent, or this install is too old to send
+      // a client key: nothing else worth suggesting works until it is fixed.
+      checks.push(me.refused
+        ? check("client", false, "operator",
+          `the broker refuses to act as this agent: ${me.refused}`)
+        : check("client", true))
+      checks.push(me.registered
+        ? check("registered", true)
+        : check("registered", false, "you",
+          "you are not registered in this station yet: call propose_me with " +
+          "one line about this project, and an operator approves it with one " +
+          "keystroke — no restart needed"))
     }
+    checks.push(ENABLED
+      ? check("push_host", true, null, null, "this plugin runs in the process it delivers to")
+      : check("push_host", null, null, null, "skipped: a2a is off"))
+    if (!ENABLED) {
+      checks.push(check("stream", null, null, null, "skipped: a2a is off"))
+    } else if (!me.registered) {
+      checks.push(check("stream", null, null, null, "skipped: not registered"))
+    } else if (!pumpState.connected) {
+      checks.push(check("stream", false, "auto",
+        "the push stream is not connected; it retries by itself, so wait — " +
+        "messages are held on the broker meanwhile", pumpState.lastError))
+    } else if (stale) {
+      checks.push(check("stream", false, "auto",
+        `the stream has been silent for ${Math.round(quiet)}s; it reconnects ` +
+        "by itself (fix=true reconnects it now)"))
+    } else {
+      checks.push(check("stream", true))
+    }
+    let theirs = null
+    try {
+      theirs = (JSON.parse(await api("GET", "/healthz")) || {}).clients || null
+    } catch {
+      theirs = null
+    }
+    const mineVersion = BAKED.version || ""
+    checks.push(!theirs || !mineVersion
+      ? check("version", null, null, null, "unknown")
+      : theirs === mineVersion
+        ? check("version", true, null, null, theirs)
+        : check("version", false, "user",
+          `this client is ${mineVersion}, the broker serves ${theirs}: run the ` +
+          `installer and pick OpenCode: curl -fsSL ${URL_BASE}/install | python3`))
+    // The doctor's finding, to the broker: one row per agent, overwritten.
+    // Best effort; its reply says whether a stream for this agent is live.
+    let reply = null
+    if (me.registered) {
+      try {
+        reply = JSON.parse(await api("POST", "/me/state", {
+          harness: "opencode", version: mineVersion, switch: ENABLED,
+          route: ENABLED ? "project" : null, receives: ENABLED, settings: null,
+          failing: checks.filter((c) => c.ok === false).map((c) => c.check),
+          fixed: [...new Set(fixed.map((f) => f.check))].sort(),
+        }))
+      } catch {
+        reply = null
+      }
+    }
+    const streamCheck = checks.find((c) => c.check === "stream")
+    if (reply && reply.stream_live && streamCheck.ok === false && !pumpState.connected) {
+      // This process should hold the stream and does not, while the broker
+      // serves one for this agent: another process has it.
+      Object.assign(streamCheck, check("stream", false, "user",
+        "another process holds this agent's stream (the broker serves one, " +
+        "and it is not this one): close the other OpenCode using this agent, " +
+        "or give one of them its own name"))
+    }
+    const failing = checks.find((c) => c.ok === false)
+    const step = failing ? failing.do : null
     return JSON.stringify(
       {
         agent: name,
         station: stations.length === 1 ? stations[0] : stations.length ? stations : null,
         registered: !!me.registered,
         channels: mine,
+        checks,
+        fixed,
         push: {
           enabled: pumpState.connected,
           stream_connected: pumpState.connected,
@@ -1296,6 +1380,27 @@ async function core(host) {
       null,
       2,
     )
+  }
+
+  // fix=true: what this client would do by itself later, done now — and only
+  // when the stream check is failing, so a healthy install comes out exactly
+  // as it went in. Aborting the live connection is what a rename or the
+  // switch already do; the pump reconnects and the broker replays what is
+  // unacked. Never the switch, the identity, or anything on the broker.
+  async function repairNow() {
+    const fixed = []
+    const quiet = pumpState.lastLine ? (Date.now() - pumpState.lastLine) / 1000 : null
+    const stale = quiet !== null && quiet > 60
+    if (ENABLED && !stopped && pumpState.connected && stale && stream) {
+      stream.abort()
+      fixed.push({ check: "stream", did: "asked the silent stream to reconnect" })
+      if (toAck.size) {
+        const n = toAck.size
+        await flushAcks()
+        fixed.push({ check: "stream", did: `retried ${n} pending ack(s)` })
+      }
+    }
+    return fixed
   }
 
   /** What an event says, whichever OpenCode sent it: its type, and its
@@ -1687,10 +1792,11 @@ async function core(host) {
 
     a2a_channel_status: {
       description:
-        "Orient yourself: the id the broker resolves you to, whether you are registered, whether push is alive, and which channels you are a MEMBER of. Call this first when something seems wrong — nothing arriving, a tool refusing, a room that does not answer. `next_step` names the one thing to do about it, or is null when nothing is wrong. It reads nothing from your inbox, so it costs you no messages.",
-      args: {},
-      async execute() {
-        return await statusReport()
+        "Orient yourself: the id the broker resolves you to, whether you are registered, whether push is alive, and which channels you are a MEMBER of. Call this first when something seems wrong — nothing arriving, a tool refusing, a room that does not answer. `next_step` names the one thing to do about it, or is null when nothing is wrong; `checks` lists every check with who must act. Pass fix=true and it repairs what it safely can on its own (a silent stream, pending acks) — everything else names who must act. It reads nothing from your inbox, so it costs you no messages.",
+      args: { fix: { type: ["boolean", "null"] } },
+      async execute(a) {
+        const fix = !!a && (a.fix === true || String(a.fix) === "true")
+        return await statusReport(fix ? await repairNow() : [])
       },
     },
 

@@ -135,12 +135,14 @@ def with_db(b) -> None:
     check("and nothing was written — the check runs before the transcript, so "
           "an oversized post cannot leave a row nobody can read back",
           not [m for m in asyncio.run(
-              b.CHANNELS.messages_since(sid, "room", limit=50))
+              b.CHANNELS.messages_since(sid, "room", None, limit=50))
               if len(m["text"]) > b.MAX_MESSAGE_SIZE])
     out = asyncio.run(b.CHANNELS.post(sid, "room", "sender", fits))
+    post = out.get("post") or {}
     check("a post exactly at the ceiling goes through and gets receipts, so "
           "the limit is a limit and not a margin",
-          bool(out.get("id")), str(out)[:200])
+          bool(post.get("id")) and post.get("audience") == ["peer"],
+          str({k: v for k, v in post.items() if k != "text"})[:200])
 
     check("a DM is capped the same way — it is the same read on the other end",
           bool(refused(lambda: asyncio.run(

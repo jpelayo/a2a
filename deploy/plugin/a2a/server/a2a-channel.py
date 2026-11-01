@@ -213,7 +213,9 @@ def _me_view() -> dict:
             return out if isinstance(out, dict) else {}
     except Exception as e:
         _log(f"could not read /me ({e!r})")
-        return {}
+        # The doctor's `broker` check: an unreachable broker is not "not
+        # registered", which is what an empty answer used to read as.
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _my_channels() -> list[str]:
@@ -530,7 +532,7 @@ def _instructions(agent: str) -> str:
     "you are registered, whether push is alive, and which channels you "
     "are a MEMBER of — a reply posted to a room you are not in reaches "
     "nobody. Its next_step names the one thing to do, or is null when "
-    "nothing is wrong. It reads nothing from your inbox."
+    "nothing is wrong; checks lists every check and who must act, and fix=true repairs what it safely can on its own. It reads nothing from your inbox."
     "\n\n"
         "MESSAGES HAVE A SHELF LIFE. Yours last a year unless you say otherwise: "
     "pass expires_in (\"10m\", \"2h\", \"7d\") when what you are saying "
@@ -584,6 +586,13 @@ _out_lock = threading.Lock()
 # checked against reality instead of taken on trust.
 _state = {"connected": False, "delivered": 0, "last": "", "error": "",
           "last_line": 0.0, "greeted": False}
+# Set by the doctor (a2a_channel_status fix=true) for a connected but silent
+# stream; read on the stream's next line, and cleared whenever a connection
+# opens, so a request made before a reconnect never cuts the next one.
+_reconnect = threading.Event()
+# Held while the doctor checks for, and starts, a missing pump thread: two
+# pumps would open two streams for one agent.
+_pump_lock = threading.Lock()
 
 # How long the stream may be silent before we treat it as dead. The broker
 # writes a keepalive newline every few seconds (A2A_STREAM_KEEPALIVE, default
@@ -654,6 +663,186 @@ def _notify(content: str, meta: dict) -> None:
     })
 
 
+# --- the doctor ----------------------------------------------------------------
+# a2a_channel_status lists EVERY check, in this order, in every client — the
+# same ids, so an agent reading one never has to know its harness. `ok` is
+# True, False or None (not applicable here, or not knowable now); a failing
+# one says WHO must act and WHAT to do. fix=true repairs only what this client
+# would repair by itself later anyway, and only when that check is failing:
+# never the identity store, the name, or anything on the broker.
+DOCTOR_CHECKS = ("install", "identity", "settings", "switch", "broker",
+                 "client", "registered", "push_host", "stream", "version")
+
+
+def _check(check: str, ok, who=None, do=None, detail=None) -> dict:
+    return {"check": check, "ok": ok,
+            "who": who if ok is False else None,
+            "do": do if ok is False else None,
+            "detail": detail}
+
+
+def _quiet():
+    quiet = (time.time() - _state["last_line"]
+             if _state["last_line"] else None)
+    return quiet, bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
+
+
+def _pump_alive() -> bool:
+    return any(t.name == "a2a-pump" and t.is_alive()
+               for t in threading.enumerate())
+
+
+def _repair() -> list[dict]:
+    """fix=true: what this client would do by itself, done now, each only
+    when its own check is failing."""
+    fixed = []
+    with _pump_lock:
+        if URL and not _pump_alive():
+            # _pump_guard already restarts a crashed pump; a thread that is
+            # gone altogether is started again, once — never a second one.
+            threading.Thread(target=_pump_guard, daemon=True,
+                             name="a2a-pump").start()
+            fixed.append({"check": "push_host",
+                          "did": "started the receiving thread again"})
+    quiet, stale = _quiet()
+    if _state["connected"] and stale:
+        _reconnect.set()
+        fixed.append({"check": "stream",
+                      "did": "asked the silent stream to reconnect"})
+        with _ack_lock:
+            pending = len(_to_ack)
+        if pending:
+            _flush_acks()
+            fixed.append({"check": "stream",
+                          "did": f"retried {pending} pending ack(s)"})
+    return fixed
+
+
+def _broker_version() -> str | None:
+    try:
+        req = urllib.request.Request(f"{URL}/healthz", headers=_headers())
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = json.load(resp)
+        return out.get("clients") if isinstance(out, dict) else None
+    except Exception:
+        return None
+
+
+def _checks(me: dict, registered: bool, alive: bool, quiet, stale) -> list:
+    """Every check, in DOCTOR_CHECKS order. The texts are the ones the single
+    next_step used to carry, in the same order — a refusal first, because
+    nothing else works until it is fixed."""
+    c = []
+    if not (URL and TOKEN):
+        c.append(_check("install", False, "user",
+                        "no broker url or token in this install: reinstall "
+                        "the plugin with your broker's installer (curl -fsSL "
+                        "<broker>/install | python3)"))
+        return c + [_check(k, None, detail="skipped: no broker configured")
+                    for k in DOCTOR_CHECKS[1:]]
+    c.append(_check("install", True))
+    c.append(_check("identity", True, detail=KEY))
+    c.append(_check("settings", None, detail="not applicable to Claude Code"))
+    c.append(_check("switch", None,
+                    detail="Claude Code has no project switch"))
+    if me.get("error"):
+        c.append(_check("broker", False, "operator",
+                        f"the broker at {URL} did not answer ({me['error']}); "
+                        "nothing works until it does", detail=me["error"]))
+        c += [_check(k, None, detail="skipped: the broker did not answer")
+              for k in ("client", "registered")]
+    else:
+        c.append(_check("broker", True, detail=URL))
+        refused = me.get("refused")
+        if refused:
+            c.append(_check("client", False, "operator",
+                            f"the broker refuses to act as this agent: "
+                            f"{refused}"))
+        else:
+            c.append(_check("client", True))
+        if not registered:
+            c.append(_check("registered", False, "you",
+                            "you are not registered in this station yet: "
+                            "call propose_me with one line about this "
+                            "project, and an operator approves it with one "
+                            "keystroke — no restart"))
+        else:
+            c.append(_check("registered", True))
+    if not alive:
+        c.append(_check("push_host", False, "auto",
+                        "the receiving thread is not running; restart the "
+                        "session — messages are safe on the broker meanwhile "
+                        "(fix=true starts it again)"))
+    elif _state["delivered"] == 0 and _state["greeted"]:
+        c.append(_check("push_host", False, "user",
+                        "nothing has been pushed into this session yet. If "
+                        "that seems wrong, Claude Code only renders pushes "
+                        "when it was started with "
+                        "`--dangerously-load-development-channels "
+                        "plugin:a2a@skills-dir` — without it the broker "
+                        "delivers and nothing is shown"))
+    else:
+        c.append(_check("push_host", True))
+    if not alive:
+        c.append(_check("stream", None,
+                        detail="skipped: no receiving thread"))
+    elif not registered:
+        c.append(_check("stream", None, detail="skipped: not registered"))
+    elif stale:
+        c.append(_check("stream", False, "auto",
+                        f"the stream has been silent for {quiet:.0f}s; it "
+                        "reconnects by itself, so wait rather than acting "
+                        "(fix=true reconnects it now)"))
+    elif not _state["connected"]:
+        c.append(_check("stream", False, "auto",
+                        "the stream is not connected; it retries by itself, "
+                        "so wait rather than acting",
+                        detail=_state["error"] or None))
+    else:
+        c.append(_check("stream", True))
+    mine = os.environ.get("A2A_CLIENT_VERSION") or ""
+    theirs = _broker_version()
+    if not theirs or not mine:
+        c.append(_check("version", None, detail="unknown"))
+    elif theirs != mine:
+        c.append(_check("version", False, "user",
+                        f"this client is {mine}, the broker serves {theirs}: "
+                        f"reinstall with curl -fsSL {URL}/install | python3"))
+    else:
+        c.append(_check("version", True, detail=theirs))
+    return c
+
+
+_report_warned = False
+
+
+def _report(checks: list, fixed: list, alive: bool) -> dict | None:
+    """The doctor's finding, to the broker — the ONLY time this client reports
+    its state (POST /me/state, one row per agent, overwritten). Best effort:
+    any refusal or error is logged once and ignored."""
+    global _report_warned
+    body = {"harness": "claude",
+            "version": os.environ.get("A2A_CLIENT_VERSION") or "",
+            "switch": None, "route": None, "receives": bool(alive),
+            "settings": None,
+            "failing": [c["check"] for c in checks if c["ok"] is False],
+            "fixed": sorted({f["check"] for f in fixed})}
+    try:
+        req = urllib.request.Request(
+            f"{URL}/me/state", data=json.dumps(body).encode(),
+            headers=_headers({"Content-Type": "application/json"}),
+            method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = json.load(resp)
+        return out if isinstance(out, dict) else None
+    except Exception as e:
+        if not _report_warned:
+            _report_warned = True
+            _log(f"could not report the doctor's finding to the broker "
+                 f"({e!r}); going on without it")
+        return None
+
+
 def _handle(msg: dict) -> None:
     global NAME
     method = msg.get("method")
@@ -700,9 +889,14 @@ def _handle(msg: dict) -> None:
                 "Report whether this agent's a2a push channel is connected to "
                 "the broker, and how many messages it has delivered into this "
                 "session. Use it when you suspect messages are not arriving. "
-                "For what is waiting for you server-side, use my_pending."
+                "For what is waiting for you server-side, use my_pending. "
+                "`checks` lists every check with who must act; pass fix=true "
+                "and it repairs what it safely can on its own (a silent "
+                "stream, pending acks, a stopped receiving thread) — "
+                "everything else names who must act."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
+            "inputSchema": {"type": "object", "properties": {
+                "fix": {"type": "boolean"}}},
         }, {
             # Renaming lives HERE, not on the broker, because it is two writes:
             # the agent row and this machine's identity store. A broker-side
@@ -759,47 +953,35 @@ def _handle(msg: dict) -> None:
     elif method == "tools/call":
         params = msg.get("params") or {}
         if params.get("name") == "a2a_channel_status":
+            args = params.get("arguments") or {}
+            fix = (args.get("fix") is True
+                   or str(args.get("fix")).lower() == "true")
+            fixed = _repair() if fix else []
             # `stream_connected` alone used to be the whole answer, and it
             # lied: a half-open socket left it True forever while nothing
             # arrived. The seconds-since-last-line is the honest number —
             # keepalives make it small on a live link — and `stale` names the
             # state the old field could not distinguish.
-            quiet = (time.time() - _state["last_line"]
-                     if _state["last_line"] else None)
-            stale = bool(quiet is not None and quiet > STREAM_READ_TIMEOUT)
-            alive = any(t.name == "a2a-pump" and t.is_alive()
-                        for t in threading.enumerate())
+            quiet, stale = _quiet()
+            alive = _pump_alive()
             me = _me_view()
             registered = bool(me.get("registered"))
             stations = me.get("stations") or []
 
-            # In order: be allowed, exist, then be reachable, then be healthy.
-            # Only the first unmet condition is worth telling an agent about —
-            # and a refusal comes first, because nothing else will work until
-            # it is fixed (another client holds this agent, or this install
-            # is too old to send a client key).
-            refused = me.get("refused")
-            if refused:
-                step = f"the broker refuses to act as this agent: {refused}"
-            elif not registered:
-                step = ("you are not registered in this station yet: call "
-                        "propose_me with one line about this project, and an "
-                        "operator approves it with one keystroke — no restart")
-            elif not alive:
-                step = ("the receiving thread is not running; restart the "
-                        "session — messages are safe on the broker meanwhile")
-            elif _state["delivered"] == 0 and _state["greeted"]:
-                step = ("nothing has been pushed into this session yet. If "
-                        "that seems wrong, Claude Code only renders pushes "
-                        "when it was started with "
-                        "`--dangerously-load-development-channels "
-                        "plugin:a2a@skills-dir` — without it the broker "
-                        "delivers and nothing is shown")
-            elif stale:
-                step = (f"the stream has been silent for {quiet:.0f}s; it "
-                        f"reconnects by itself, so wait rather than acting")
-            else:
-                step = None
+            checks = _checks(me, registered, alive, quiet, stale)
+            reply = _report(checks, fixed, alive) if registered else None
+            stream = next(c for c in checks if c["check"] == "stream")
+            if (reply and reply.get("stream_live") and stream["ok"] is False
+                    and not _state["connected"]):
+                # This session should hold the stream and does not, while the
+                # broker serves one for this agent: another process has it.
+                stream.update(_check(
+                    "stream", False, "user",
+                    "another process holds this agent's stream (the broker "
+                    "serves one, and it is not this session's): close the "
+                    "other Claude Code session using this agent, or give one "
+                    "of them its own name with rename_me"))
+            step = next((c["do"] for c in checks if c["ok"] is False), None)
 
             body = json.dumps({
                 "agent": NAME,
@@ -807,6 +989,8 @@ def _handle(msg: dict) -> None:
                             else stations) or None,
                 "registered": registered,
                 "channels": _my_channels(),
+                "checks": checks,
+                "fixed": fixed,
                 "push": {
                     "enabled": alive and _state["connected"],
                     "stream_connected": _state["connected"],
@@ -1007,6 +1191,7 @@ def _pump() -> None:
             # macOS's own idle default is two hours. The visible symptom was a
             # channel that stopped delivering after a lid close and came back
             # only on a full restart of the session.
+            asked = False
             with urllib.request.urlopen(req, timeout=STREAM_READ_TIMEOUT) as resp:
                 _log(f"stream connected (attempt {attempt}, "
                      f"http {resp.status})")
@@ -1014,6 +1199,7 @@ def _pump() -> None:
                 _state["connected"] = True
                 _state["error"] = ""
                 _state["last_line"] = time.time()
+                _reconnect.clear()
                 for raw in resp:  # one line per message; blank = keepalive
                     # Keepalives count. The broker sends one every few
                     # seconds, so this is the proof the link is alive, and
@@ -1028,6 +1214,12 @@ def _pump() -> None:
                         _log(f"agent id changed {stream_key!r} -> {KEY!r}; "
                              "reconnecting under the new id")
                         break
+                    if _reconnect.is_set():
+                        _reconnect.clear()
+                        _log("the doctor asked for a fresh stream; "
+                             "reconnecting")
+                        asked = True
+                        break
                     s = raw.decode("utf-8", "replace").strip()
                     if s:
                         _emit(s)
@@ -1039,7 +1231,8 @@ def _pump() -> None:
                     _flush_acks()
             _flush_acks()
             _state["connected"] = False
-            _log("stream closed by server; reconnecting")
+            if not asked:
+                _log("stream closed by server; reconnecting")
         except TimeoutError:
             # Its own case, not a generic error. After this long with not even
             # a keepalive the connection is already long dead, so there is

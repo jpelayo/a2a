@@ -113,6 +113,9 @@ def main() -> int:
     b.AGENTS.remove = lambda aid, sid: done.append(("remove", sid, aid))
     b.TOKENS.list = lambda *a, **k: []
     b._pending_rows = lambda sid, aid, n: [{}, {}]
+    # No client has run its doctor here (test_tui_client_state.py covers the
+    # flag that a finding puts on an agent row).
+    b.CLIENT_STATE.all = lambda *a, **k: []
 
     def make(keys=()):
         t = b._Tui(Scr(keys))

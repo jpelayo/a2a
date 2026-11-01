@@ -8,3 +8,6 @@ plugin/*.zip
 *.db
 *.db-wal
 *.db-shm
+# The test suite's own environment (python3 tests/run.py --setup). Hundreds
+# of MB of packages for this machine, none of which the image may carry.
+.venv
