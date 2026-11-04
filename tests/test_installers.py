@@ -268,6 +268,61 @@ def main() -> int:
         check("opencode: is the plugin source with credentials prepended",
               body[:24].decode("utf8", "replace").startswith("const A2A_BAKED = {"),
               body[:60].decode("utf8", "replace"))
+        oc_src = (ROOT / "deploy" / "plugin" / "opencode" / "a2a-opencode.js").read_text()
+
+        # --- Kilo Code: its OWN file, never OpenCode's ----------------------
+        code, body, ctype = get(f"{base}/install/kilocode/{token}")
+        ksrc = body.decode("utf8", "replace")
+        kilo_src = (ROOT / "deploy" / "plugin" / "kilocode" / "a2a-kilocode.js").read_text()
+        check("kilocode: served", code == 200, f"HTTP {code}")
+        check("kilocode: is javascript", "javascript" in ctype, ctype)
+        head, _, rest = ksrc.partition("\n")
+        check("kilocode: its own client with credentials prepended — the "
+              "baked line, then exactly plugin/kilocode/a2a-kilocode.js",
+              head.startswith("const A2A_BAKED = {") and rest == kilo_src,
+              head[:80])
+        check("kilocode: and NOT OpenCode's file — every harness its plugin",
+              rest != oc_src, "the Kilo route serves OpenCode's client")
+        check("kilocode: the baked line carries the token and the version",
+              token in head and f'"version": "{health.get("version")}"' in head,
+              "")
+
+        # --- dsh: a bundle package with its own client -----------------------
+        code, body, ctype = get(f"{base}/install/dsh/{token}")
+        check("dsh: served", code == 200, f"HTTP {code}")
+        check("dsh: is application/gzip", "gzip" in ctype, ctype)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as t:
+                dmembers = {m.name: t.extractfile(m).read().decode()
+                            for m in t.getmembers() if m.isfile()}
+        except Exception as e:
+            dmembers = {}
+            check("dsh: extracts as a gzipped tar", False, repr(e))
+        check("dsh: exactly the package — package.json, cordis.patch.yml, "
+              "index.js and dsh's own a2a-dsh.js",
+              sorted(dmembers) == ["a2a-dsh.js", "cordis.patch.yml", "index.js",
+                                   "package.json"], str(sorted(dmembers)))
+        dhead, _, drest = dmembers.get("a2a-dsh.js", "").partition("\n")
+        dsh_src = (ROOT / "deploy" / "plugin" / "dsh" / "a2a-dsh.js").read_text()
+        check("dsh: a2a-dsh.js is dsh's own client with credentials prepended",
+              dhead.startswith("const A2A_BAKED = {") and drest == dsh_src
+              and token in dhead, dhead[:80])
+        check("dsh: and NOT OpenCode's file", drest != oc_src, "")
+        try:
+            dpkg = json.loads(dmembers.get("package.json", "{}"))
+        except ValueError:
+            dpkg = {}
+        check("dsh: package.json is the a2a-dsh bundle, its version stamped",
+              dpkg.get("name") == "a2a-dsh"
+              and dpkg.get("version") == health.get("version")
+              and (dpkg.get("dsh") or {}).get("bundle") == {"patch": "./cordis.patch.yml"},
+              str(dpkg)[:200])
+        check("dsh: the entry imports a2a-dsh.js and has no default export",
+              './a2a-dsh.js"' in dmembers.get("index.js", "")
+              and "export default" not in dmembers.get("index.js", ""), "")
+        old = get(f"{base}/install/kilo/{token}")
+        check("the shared-file route /install/kilo is gone", old[0] == 404,
+              str(old[0]))
 
         # --- the installer: public, and carrying no secret -------------------
         # Reached with NO bearer: it is what a user runs before they have
@@ -291,6 +346,14 @@ def main() -> int:
         bad_cx = get(f"{base}/install/codex/a2a_st_wrong")
         bad_hx = get(f"{base}/install/hermes/a2a_st_wrong")
         bad_oc = get(f"{base}/install/a2a_st_wrong")
+        bad_kc = get(f"{base}/install/kilocode/a2a_st_wrong")
+        bad_ds = get(f"{base}/install/dsh/a2a_st_wrong")
+        check("a bad token 404s on the kilocode route", bad_kc[0] == 404,
+              str(bad_kc[0]))
+        check("a bad token 404s on the dsh route", bad_ds[0] == 404,
+              str(bad_ds[0]))
+        check("and those refusals are the same bytes as the others",
+              bad_kc[1] == bad_ds[1] == bad_oc[1], f"{bad_kc[1]!r} {bad_ds[1]!r}")
         check("a bad token 404s on the pi route", bad_pi[0] == 404, str(bad_pi[0]))
         # Grok Build was removed as a client. Its route must be gone too, or
         # the image keeps serving a plugin that is no longer in the tree.

@@ -38,6 +38,8 @@ PLUGIN = HERE.parent / "deploy" / "plugin"
 BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 
 KEY = "Atlas"            # the project directory, sent forever
 NAME = "atlas-desk"      # what the agent renames itself to
@@ -146,6 +148,34 @@ def main() -> int:
                   not signed_with_key
                   and ("sender: name" in seg or "agent_id: name" in seg),
                   seg[:200])
+
+        # --- Kilo Code's and dsh's own clients ------------------------------
+        # They sign through signer(), which IS the resolved name: /me's
+        # answer, asked once by a process that only sends (it never pumps,
+        # so it never learns the name the way a receiving one does).
+        for label, path in (("kilocode", KILOCODE), ("dsh", DSH)):
+            src = path.read_text()
+            body = src[src.index("const instructions ="):src.index("const esc =")]
+            js = subprocess.run(
+                ["node", "-e", body + ";process.stdout.write(instructions("
+                 + json.dumps(NAME) + "))"],
+                capture_output=True, text=True, check=True).stdout
+            check(f"{label} brief names whatever it is given", NAME in js,
+                  js[:160])
+            for tool in ("post_to_channel", "send_dm", "submit_bid"):
+                seg = src[src.index(f"{tool}: {{"):]
+                seg = seg[:seg.index("},\n\n") + 1] if "},\n\n" in seg else seg[:600]
+                check(f"{label}: {tool} signs with the resolved name, not the key",
+                      "sender: key" not in seg and "agent_id: key" not in seg
+                      and ("sender: await signer()" in seg
+                           or "agent_id: await signer()" in seg),
+                      seg[:200])
+            sig = src[src.index("async function signer()"):]
+            sig = sig[:sig.index("\n  }\n") + 4]
+            check(f"{label}: and signer() returns the resolved name, never "
+                  "the key",
+                  "return name" in sig and "return key" not in sig
+                  and '(await json("GET", "/me")).agent' in sig, sig[:300])
     finally:
         if ch:
             ch.terminate()

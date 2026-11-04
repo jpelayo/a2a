@@ -295,6 +295,49 @@ what to ask for. Its id defaults to the project directory name and is kept in
 broker together. Two clients in one directory start on the same default id and
 would split one inbox, because delivery is a destructive read — rename one.
 
+### Kilo Code
+
+Its own client, one file — never OpenCode's, though Kilo is a fork of OpenCode
+and loads OpenCode V1 plugins. The installer writes it; by hand:
+
+```bash
+mkdir -p ~/.config/kilo/plugins && \
+  curl -fsSL https://a2a.example.com/install/kilocode/<token> -o ~/.config/kilo/plugins/a2a-kilocode.js
+```
+
+One copy only: Kilo scans both `plugin/` and `plugins/` and would load a second
+copy twice. Switch key `enabled_kilocode`; identity in
+`~/.config/kilo/a2a-identity.json`, client secret in
+`~/.local/share/kilo/a2a-client.secret`; it logs to Kilo's own log. Every Kilo
+process loads it, and only the terminal app's own server (`kilo`, a Worker
+thread with `KILO_PROCESS_ROLE=worker`) receives; a `kilo daemon`, the VS Code
+and JetBrains extensions' servers and `kilo run` only send. Deliveries wait
+while a session runs a turn — Kilo would supersede the turn. Kilo's vendor
+settings (telemetry, its gateway, transcript upload when signed in) are the
+user's; README lists them.
+
+### DeepSeek Harness (dsh)
+
+A dsh bundle package: `package.json`, `cordis.patch.yml`, the `index.js` entry
+(no default export — dsh's loader takes `module.default ?? module`) and dsh's
+own client `a2a-dsh.js`, which carries the credentials. dsh loads plugins from
+a profile, and only its own command adds one (it needs `pnpm` on PATH):
+
+```bash
+mkdir -p ~/.dsh/a2a/plugin && \
+  curl -fsSL https://a2a.example.com/install/dsh/<token> | tar -xzf - -C ~/.dsh/a2a/plugin
+dsh plugin --profile web add link:$HOME/.dsh/a2a/plugin
+```
+
+The Desktop app's profile changes only through the app's own `dsh` ("Manage
+dsh Command…", quit the app, `--profile desktop`, reopen). `$DSH_HOME` moves
+all of it. Switch key `enabled_dsh`; everything the client keeps is in
+`~/.dsh/a2a/` (identity, settings, secret, `log/`), outside every profile
+root. One Host serves every project, and each project is its own agent,
+streaming once a session there is used; `web` and `desktop` profiles receive,
+any other only sends. Deliveries use `agent.followup`, which queues behind a
+running turn.
+
 ### Pi
 
 A directory, because the extension declares `typebox` and Pi installs declared
@@ -390,6 +433,8 @@ client's identity store:
 | harness     | file                          | `read_on_init` default |
 |-------------|-------------------------------|------------------------|
 | OpenCode    | `~/.config/opencode/a2a.json` | `true`                 |
+| Kilo Code   | `~/.config/kilo/a2a.json`     | `true`                 |
+| DeepSeek Harness | `~/.dsh/a2a/a2a.json`    | `true`                 |
 | Pi          | `~/.pi/agent/a2a.json`        | `true`                 |
 | Claude Code | `<plugin data>/a2a.json`      | `false`                |
 
@@ -491,7 +536,7 @@ server {
         chunked_transfer_encoding on;
     }
 
-    # The OpenCode installer carries its token in the URL path, which nginx
+    # Every client route carries its token in the URL path, which nginx
     # would otherwise write to disk in cleartext on every install.
     location /install/ {
         proxy_pass http://a2a_backend;
@@ -821,6 +866,8 @@ docker compose exec a2a-mcp python3 /app/a2a-mcp.py logs --tail 50
 #   Claude Code   a2a-channel.log, beside the identity store (~/.claude)
 #   Pi            ~/.pi/agent/a2a.log
 #   OpenCode      ~/.local/share/opencode/log/opencode.log
+#   Kilo Code     Kilo's own log, ~/.local/share/kilo/log/
+#   DeepSeek H.   ~/.dsh/a2a/log/a2a.log
 #   Hermes        <profile>/logs/a2a.log (512 KB, one rotation)
 
 # Liveness (public, no auth). From INSIDE the container: the broker binds no
@@ -935,6 +982,8 @@ All optional; sensible defaults baked into the image.
 | OpenCode installs but never comes online         | Token grants several stations and the plugin refuses to guess; reinstall with `?station=<name>`. It says so in the session. |
 | OpenCode 2 does not check its channels when you start `opencode` | Its plugins run in the background service, which never sees a CLI start; the check runs only when the service starts. Run `opencode service set disabled true` once: each `opencode` then starts its own server and the check runs on every start. |
 | A message reaches only one of two harnesses      | Both are streaming the same agent id. Delivery is a destructive read; give each its own agent (`-oc` suffix). |
+| Kilo Code has the tools but nothing arrives      | It is not the terminal app: a `kilo daemon`, an editor's Kilo or `kilo run` only sends (`a2a_channel_status`: *only sends, by design*). Use plain `kilo`; `kilo daemon stop` ends a daemon. |
+| DeepSeek Harness loads no a2a                    | `dsh plugin --profile web add` never ran (it needs `pnpm`), or dsh was not restarted after it. Desktop: only the app's own `dsh` may add to its profile. |
 | 502 Bad Gateway from a containerised proxy       | `127.0.0.1` from inside the proxy is the proxy itself. See §5.1.             |
 
 ## 12. Uninstall

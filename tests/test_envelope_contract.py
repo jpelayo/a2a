@@ -34,6 +34,8 @@ HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "deploy" / "plugin"
 CLAUDE = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
@@ -168,7 +170,8 @@ def main() -> int:
           str(room_meta))
 
     # --- OpenCode and Pi: the rendered attribute string ---------------------
-    for label, path in (("opencode", OPENCODE), ("pi", PI)):
+    for label, path in (("opencode", OPENCODE), ("kilocode", KILOCODE),
+                        ("dsh", DSH), ("pi", PI)):
         named, room = node_envelopes(path)
         check(f"{label}: renders audience and addressed as attributes",
               'audience="alice,carol"' in named
@@ -228,11 +231,13 @@ def main() -> int:
     spec.loader.exec_module(cl)
     rendered = {"codex": cl.envelope(LINKED), "hermes": hx.envelope(LINKED),
                 "opencode": node_envelopes(OPENCODE, (LINKED,))[0],
+                "kilocode": node_envelopes(KILOCODE, (LINKED,))[0],
+                "dsh": node_envelopes(DSH, (LINKED,))[0],
                 "pi": node_envelopes(PI, (LINKED,))[0]}
     for label, env in rendered.items():
         check(f"link: {label} renders sender=\"alice@A\" untouched",
               'sender="alice@A"' in env and 'channel="dm"' in env, env)
-    check("link: all four render the linked DM byte-identically",
+    check("link: every client renders the linked DM byte-identically",
           len(set(rendered.values())) == 1, str(rendered))
 
     # --- posting returns a receipt, not the message back ---------------------
@@ -257,7 +262,8 @@ def main() -> int:
     spec.loader.exec_module(br)
     trimmed["broker"] = json.dumps(br._receipt(RAW))
 
-    for label, path in (("opencode", OPENCODE), ("pi", PI)):
+    for label, path in (("opencode", OPENCODE), ("kilocode", KILOCODE),
+                        ("dsh", DSH), ("pi", PI)):
         src = path.read_text()
         i = src.index("function receipt")
         body = src[i:src.index("\n}", i) + 2]
@@ -285,6 +291,7 @@ def main() -> int:
     # Only two words are allowed to name these two concepts. A third would put
     # us straight back where this started.
     for label, path in (("claude", CLAUDE), ("opencode", OPENCODE),
+                        ("kilocode", KILOCODE), ("dsh", DSH),
                         ("pi", PI), ("codex", CODEX), ("hermes", HERMES)):
         src = path.read_text()
         check(f"{label}: no delivered field is called 'to' any more",

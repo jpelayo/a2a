@@ -1,0 +1,10 @@
+{
+  "name": "a2a-dsh",
+  "version": "0.0.0",
+  "private": true,
+  "description": "a2a client for DeepSeek Harness: push from an a2a broker into the live session, and the tools to answer.",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "a2a-dsh.js", "cordis.patch.yml"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

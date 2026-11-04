@@ -39,6 +39,8 @@ CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 PI = PLUGIN / "pi" / "index.ts"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 
 # What the agent passes, in order, and the body each must produce.
 CALLS = [{"note": "n1", "station": "bots"},
@@ -164,6 +166,62 @@ process.exit(0)
 '''
 
 
+# Kilo Code receives only in its TUI's server, a Worker thread marked
+# KILO_PROCESS_ROLE=worker, so its own client runs inside one here; the
+# Worker hands its answer back to the main thread, which prints it.
+KILOCODE_HARNESS = r'''
+import { Worker, isMainThread, parentPort } from "node:worker_threads"
+if (isMainThread) {
+  const w = new Worker(new URL(import.meta.url),
+                       { env: { ...process.env, KILO_PROCESS_ROLE: "worker" } })
+  w.on("message", (m) => { console.log(m); process.exit(0) })
+  w.on("error", (e) => { console.log("worker error " + e); process.exit(1) })
+} else {
+  const client = {
+    app: { log: async () => {} },
+    session: { list: async () => [], status: async () => ({}),
+               promptAsync: async () => ({}) },
+  }
+  const mod = await import(PLUGIN_PATH)
+  const s = await mod.default.server({ client, directory: process.cwd() })
+  const t = s.tool.propose_me
+  const out = { schema: Object.keys(t.args || {}), results: [] }
+  for (const params of CALLS) {
+    try { out.results.push(String(await t.execute(params))) }
+    catch (e) { out.results.push("ERR " + (e?.message || e)) }
+  }
+  await new Promise((r) => setTimeout(r, 1500))   // let a started pump connect
+  parentPort.postMessage("@@" + JSON.stringify(out))
+}
+'''
+
+# dsh: one Host, its tools registered once and routed by the caller's cwd;
+# the web profile receives.
+DSH_HARNESS = r'''
+const tools = {}
+const ctx = {
+  get: (n) => n === "profileContext" ? { name: "web", cwd: process.cwd() }
+    : n === "sessionController" ? { list: async () => [], resolveAgent: async () => ({}) }
+    : undefined,
+  agents: { list: () => [] },
+  tools: { register: (t) => { tools[t.name] = t } },
+  on: () => {}, effect: () => {},
+}
+const mod = await import(PLUGIN_PATH)
+await mod.default.dsh(ctx)
+const t = tools.propose_me
+const exec = { agent: { session: { header: { cwd: process.cwd() } } } }
+const out = { schema: Object.keys(t.parameters?.properties || {}), results: [] }
+for (const params of CALLS) {
+  try { out.results.push(String(await t.execute(params, exec))) }
+  catch (e) { out.results.push("ERR " + (e?.message || e)) }
+}
+await new Promise((r) => setTimeout(r, 1500))   // let a started pump connect
+console.log("@@" + JSON.stringify(out))
+process.exit(0)
+'''
+
+
 def project_file(d: Path) -> dict | None:
     try:
         return json.loads((d / ".a2a.json").read_text())
@@ -196,6 +254,20 @@ def run_opencode(fb, tmp) -> dict:
     return dict(node("run.mjs", base_env(fb, tmp), work), project=work)
 
 
+def run_own_js(label: str, plugin: Path, harness: str):
+    """Kilo Code's or dsh's own client, under its harness above."""
+    def go(fb, tmp) -> dict:
+        work = tmp / label
+        work.mkdir()
+        (work / ".a2a.json").write_text(json.dumps(PROJECT))
+        (work / "run.mjs").write_text(
+            f"const CALLS = {json.dumps(CALLS)}\n"
+            f"const PLUGIN_PATH = {json.dumps(str(plugin))}\n" + harness)
+        env = dict(base_env(fb, tmp), DSH_HOME=str(tmp / "dsh-home"))
+        return dict(node("run.mjs", env, work), project=work)
+    return go
+
+
 def run_channel(fb, tmp) -> dict:
     store = tmp / "cc"
     store.mkdir()
@@ -218,12 +290,14 @@ def run_codex(fb, tmp) -> dict:
 
 # The clients with a project switch, and the key each writes.
 SWITCH = {"Codex": "enabled_codex", "Pi": "enabled_pi",
-          "OpenCode": "enabled_opencode"}
+          "OpenCode": "enabled_opencode", "Kilo Code": "enabled_kilocode",
+          "DeepSeek Harness": "enabled_dsh"}
 # What a pump that started asks first. Codex opens /stream only with the
 # launch line's socket — a session that cannot render must not take the
 # inbox (test_codex_client) — so there it is the pump's /me; and an OFF
 # Codex asks the broker nothing at all (test_project_gate).
-STARTED = {"Codex": "/me", "Pi": "/stream", "OpenCode": "/stream"}
+STARTED = {"Codex": "/me", "Pi": "/stream", "OpenCode": "/stream",
+           "Kilo Code": "/stream", "DeepSeek Harness": "/stream"}
 
 
 def run(label, fn, refuse=False):
@@ -240,7 +314,10 @@ def run(label, fn, refuse=False):
 
 def main() -> int:
     for label, fn in (("Claude Code", run_channel), ("Codex", run_codex),
-                      ("Pi", run_pi), ("OpenCode", run_opencode)):
+                      ("Pi", run_pi), ("OpenCode", run_opencode),
+                      ("Kilo Code", run_own_js("kilocode", KILOCODE,
+                                               KILOCODE_HARNESS)),
+                      ("DeepSeek Harness", run_own_js("dsh", DSH, DSH_HARNESS))):
         out, fb = run(label, fn)
         sent = [b for p, b in fb.bodies if p == "/me/proposals"]
         if "error" in out:

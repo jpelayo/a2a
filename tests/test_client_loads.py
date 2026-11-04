@@ -35,6 +35,8 @@ HERE = Path(__file__).resolve().parent
 # The clients live in plugin/; the suite lives here, beside it.
 PLUGIN = HERE.parent / "deploy" / "plugin"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 PI = PLUGIN / "pi" / "index.ts"
 CLAUDE = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
@@ -123,6 +125,42 @@ def main() -> int:
           "from the bare `export const A2A` this used to be; V1 1.18.28+ "
           "reads default.server; a second export could start it twice",
           ok and detail == "default|a2a,function,function", detail)
+
+    # --- Kilo Code: its OWN file, as the broker serves it into
+    # ~/.config/kilo/plugins — credentials prepended. Kilo's loader
+    # (readV1Plugin) reads default.server and requires default.id; nothing
+    # else may be exported.
+    work = Path(tempfile.mkdtemp(prefix="a2a-load-"))
+    baked = ('const A2A_BAKED = {"url": "http://127.0.0.1:1", "token": '
+             '"a2a_st_test", "version": "0"}\n')
+    kilo = work / "a2a-kilocode.js"
+    kilo.write_text(baked + KILOCODE.read_text())
+    ok, detail = imports_as_module(kilo)
+    check("kilocode: its own client IMPORTS, and its only export is default "
+          "{id, server}",
+          ok and detail == "default|a2a,function,undefined", detail)
+
+    # --- dsh: the package's entry beside dsh's own client, as the broker
+    # packs it. dsh's loader takes `module.default ?? module`: a default here
+    # would hide apply, so there must be NONE — only name, inject and apply.
+    pkg = work / "dsh"
+    pkg.mkdir()
+    shutil.copy(PLUGIN / "dsh" / "index.js", pkg / "index.js")
+    shutil.copy(PLUGIN / "dsh" / "package.json", pkg / "package.json")
+    (pkg / "a2a-dsh.js").write_text(baked + DSH.read_text())
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e",
+         f"import({str(pkg / 'index.js')!r}).then(m => console.log('@@' + "
+         f"Object.keys(m).sort().join(',') + '|' + m.name + '|' + "
+         f"typeof m.apply + '|' + JSON.stringify(m.inject)))"
+         f".catch(e => {{ console.log('!!' + e.message); process.exitCode = 1 }})"],
+        capture_output=True, text=True, timeout=90)
+    out = res.stdout.strip()
+    check("dsh: the package entry IMPORTS, with NO default export — only "
+          "name, inject and apply (a default would hide apply from dsh's "
+          "loader)",
+          out == '@@apply,inject,name|a2a|function|["agents","tools","systemPrompt"]',
+          out or res.stderr[:300])
 
     # --- Pi: typebox is not installed here, so a full import cannot resolve.
     # Module-goal parsing is the part that matters and is available.

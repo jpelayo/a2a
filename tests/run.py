@@ -17,7 +17,7 @@ database suites need no server. A2A_TEST_DB_REAL=1 points them at a real
 one instead (A2A_TEST_DB_HOST/_PORT/_USER/_PASSWORD).
 
 Exit 1 if anything failed. A contract test with no upstream checkout to read
-(HERMES_SRC, OPENCODE_SRC) is listed as needing one: it is an input, not a
+(HERMES_SRC, OPENCODE_SRC, KILO_SRC, DSH_SRC) is listed as needing one: it is an input, not a
 package, and nothing here fetches it. So is test_hermes_real.py without
 HERMES_PY, the Python of a venv with the Hermes checkout installed: it runs
 the real Hermes, and nothing here installs it.
@@ -42,6 +42,8 @@ DEPLOY = REPO / "deploy"
 # An input each needs, and what the test prints when it is missing.
 CHECKOUTS = {"test_hermes_contract.py": "HERMES_SRC",
              "test_opencode_contract.py": "OPENCODE_SRC",
+             "test_kilocode_contract.py": "KILO_SRC",
+             "test_dsh_contract.py": "DSH_SRC",
              "test_hermes_real.py": "HERMES_PY"}
 
 

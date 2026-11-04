@@ -23,7 +23,8 @@ What it does, in order:
      ENTER;
   6. writes the files — overwriting in place, deleting nothing;
   7. lists the harness commands still needed (`codex mcp add`, `hermes …
-     plugins enable`, …) and asks before running any of them;
+     plugins enable`, `dsh plugin --profile web add`, …) and asks before
+     running any of them;
   8. prints what is left for you: launch lines, "enable a2a here", approval.
 
 The screens are curses, like `hermes plugins`. With no terminal for them it
@@ -51,6 +52,10 @@ URL = (A2A_BAKED.get("url") or "").rstrip("/")
 VERSION = A2A_BAKED.get("version") or ""
 
 HOME = Path.home()
+# DeepSeek Harness's home, as dsh resolves it: $DSH_HOME unless blank, else
+# ~/.dsh. The a2a package and its state live in <it>/a2a.
+DSH_HOME = Path(os.environ.get("DSH_HOME", "").strip() or HOME / ".dsh")
+DSH_PACKAGE = "a2a-dsh"
 
 # Hermes counts a directory as a profile only when it holds one of these.
 # A bare directory is ignored by `profile list`, by gateways and by -p, so it
@@ -78,6 +83,8 @@ HARNESSES = (
     ("pi", "Pi", True, ".pi/agent", "pi"),
     ("codex", "Codex", True, ".codex", "codex"),
     ("hermes", "Hermes (bots)", True, ".hermes", "hermes"),
+    ("kilocode", "Kilo Code", True, ".config/kilo", "kilo"),
+    ("dsh", "DeepSeek Harness", True, ".dsh", "dsh"),
 )
 NAMES = {h[0]: h[1] for h in HARNESSES}
 
@@ -89,6 +96,12 @@ def install_dir(key, profile_home=None):
         "opencode": HOME / ".config" / "opencode" / "plugins",
         "pi": HOME / ".pi" / "agent" / "extensions" / "a2a",
         "codex": HOME / ".codex" / "a2a",
+        # Kilo scans {plugin,plugins}/ under ~/.config/kilo: ONE of them, or
+        # the same file loads twice.
+        "kilocode": HOME / ".config" / "kilo" / "plugins",
+        # A dsh package, added to a profile by dsh's own command. Outside
+        # every profile root, where dsh watches for changes.
+        "dsh": DSH_HOME / "a2a" / "plugin",
     }.get(key) or (profile_home / "plugins" / "a2a")
 
 
@@ -118,7 +131,8 @@ def client_file(key, profile_home=None):
     """The installed file that carries a client's baked line."""
     d = install_dir(key, profile_home)
     return {"opencode": d / "a2a-opencode.js", "pi": d / "index.ts",
-            "codex": d / "a2a-codex.py", "hermes": d / "__init__.py"}.get(key)
+            "codex": d / "a2a-codex.py", "hermes": d / "__init__.py",
+            "kilocode": d / "a2a-kilocode.js", "dsh": d / "a2a-dsh.js"}.get(key)
 
 
 def installed_version(key, profile_home=None):
@@ -149,7 +163,20 @@ def installed_version(key, profile_home=None):
 
 def harness_found(key):
     home, binary = next((h[3], h[4]) for h in HARNESSES if h[0] == key)
-    return (HOME / home).is_dir() or shutil.which(binary) is not None
+    where = DSH_HOME if key == "dsh" else HOME / home
+    return where.is_dir() or shutil.which(binary) is not None
+
+
+def dsh_profile_has(profile):
+    """Whether a dsh profile already lists the a2a package — `dsh plugin
+    add` writes it into the profile's package.json dependencies."""
+    try:
+        data = json.loads((DSH_HOME / "profiles" / profile / "package.json")
+                          .read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and \
+        DSH_PACKAGE in (data.get("dependencies") or {})
 
 
 def hermes_profiles():
@@ -301,7 +328,8 @@ def fetch(key, token, agent="", profile=""):
     q = urllib.parse.quote(token, safe="")
     path = {"claude": "/a2a-claudecode.tar.gz", "opencode": f"/install/{q}",
             "pi": f"/install/pi/{q}", "codex": f"/install/codex/{q}",
-            "hermes": f"/install/hermes/{q}"}[key]
+            "hermes": f"/install/hermes/{q}", "kilocode": f"/install/kilocode/{q}",
+            "dsh": f"/install/dsh/{q}"}[key]
     query = {}
     if key != "claude" and agent:
         query["agent"] = agent
@@ -790,8 +818,8 @@ def download(ui, targets):
         except Exception as e:
             raise SystemExit(redact(f"a2a: could not download the {t.label} "
                                     f"client: {e}; nothing was written."))
-        if t.key == "opencode":
-            t.files = [(t.dest / "a2a-opencode.js", data, 0o644)]
+        if t.key in ("opencode", "kilocode"):
+            t.files = [(client_file(t.key), data, 0o644)]
         else:
             try:
                 t.files = [(t.dest / rel, body, mode)
@@ -908,6 +936,21 @@ def setup_needed(targets):
                              p + ["config", "set",
                                   "plugins.entries.a2a.allow_gateway_injection",
                                   "true"]))
+        if t.key == "dsh":
+            # dsh's own command adds the package to a profile (and links it,
+            # so a later update needs no command). `web` is `dsh web`'s
+            # profile; `desktop` only when the Desktop app made one, and only
+            # its own `dsh` may change it — a refusal lands in next steps.
+            for profile, what in (("web", "add a2a to dsh web's profile"),
+                                  ("desktop", "add a2a to the Desktop app's "
+                                              "profile")):
+                if profile == "desktop" and not (
+                        DSH_HOME / "profiles" / "desktop").is_dir():
+                    continue
+                if not dsh_profile_has(profile):
+                    cmds.append((t.label, what,
+                                 ["dsh", "plugin", "--profile", profile,
+                                  "add", f"link:{t.dest}"]))
     return cmds
 
 
@@ -936,7 +979,7 @@ def _change(t):
 
 
 def _where(t):
-    if t.key == "opencode":
+    if t.key in ("opencode", "kilocode"):
         return tilde(t.files[0][0]) if t.files else tilde(t.dest)
     n = len(t.files)
     return f"{tilde(t.dest)}/ ({n} file{'s' if n != 1 else ''})"
@@ -1023,14 +1066,42 @@ def next_steps(targets, pending, hermes_touched):
     elif "claude" in changed:
         steps.append(["Claude Code: restart your sessions "
                       "(/reload-plugins does not pick up a new copy)."])
-    off = [NAMES[k] for k in ("opencode", "pi", "codex") if k in first]
+    if "dsh" in changed:
+        # Linked, not copied: dsh reads the package at startup, so a running
+        # dsh web or Desktop app has the old one until it starts again.
+        steps.append(["DeepSeek Harness: restart dsh web (Ctrl+C where it "
+                      "runs, then start it again), and quit and reopen the "
+                      "Desktop app if you use it."])
+    dsh_pending = [argv for _, _, argv in pending if argv[:2] == ["dsh", "plugin"]]
+    if dsh_pending and shutil.which("pnpm") is None:
+        steps.append(["DeepSeek Harness: `dsh plugin` needs pnpm on your PATH "
+                      "(npm install -g pnpm), then run the command above."])
+    if any("desktop" in argv for argv in dsh_pending):
+        steps.append(["DeepSeek Harness Desktop: only the app's own dsh may "
+                      "change its profile. In the app, use \"Manage dsh "
+                      "Command…\" to install it, quit the app, run the "
+                      "desktop command above, and open the app again."])
+    off = [NAMES[k] for k in ("opencode", "pi", "codex", "kilocode", "dsh")
+           if k in first]
     if off:
         names = (", ".join(off[:-1]) + " and " + off[-1] if len(off) > 1
                  else off[0])
         steps.append([f"{names}: a2a stays off in each project until you turn "
                       "it on there: ask the agent in that project to "
                       "\"enable a2a here\"."])
-    for key in ("opencode", "pi", "codex"):
+    if "kilocode" in first:
+        steps.append(["Kilo Code: a2a receives in plain `kilo` (the terminal "
+                      "app); a `kilo daemon` and the editor extensions only "
+                      "send. Its tools work in the code and debug modes, not "
+                      "in ask, plan, orchestrator or explore."])
+    vendor = [NAMES[k] for k in ("kilocode", "dsh") if k in first]
+    if vendor:
+        steps.append([f"{' and '.join(vendor)}: telemetry and the vendor's "
+                      "own services are on by default. The a2a README lists "
+                      "the settings that turn them off and point the harness "
+                      "at your own provider; this installer changes none of "
+                      "them."])
+    for key in ("opencode", "pi", "codex", "kilocode"):
         if key not in keys:
             continue
         if key == "codex" and "codex" in changed:
@@ -1108,7 +1179,8 @@ def main():
             if not any(r["enabled"] for r in rows):
                 ui.close()
                 print("a2a: no supported harness was found here (Claude Code, "
-                      "OpenCode, Pi, Codex, Hermes).")
+                      "OpenCode, Pi, Codex, Hermes, Kilo Code, DeepSeek "
+                      "Harness).")
                 return 1
             picked = ui.checklist("Install or update a2a for which "
                                   "harnesses?", rows)

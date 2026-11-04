@@ -204,7 +204,15 @@ CODEX_DIR = PLUGIN_SRC / "codex"
 # Hermes: GET /install/hermes/<token>. A directory plugin — plugin.yaml beside
 # __init__.py — extracted into one bot's profile.
 HERMES_DIR = PLUGIN_SRC / "hermes"
-# The installer: GET /install, public. One interactive program for all five
+# Kilo Code: GET /install/kilocode/<token>, its own client, one file, served
+# with the caller's token prepended exactly like OpenCode's — but never
+# OpenCode's file: every harness has its own plugin.
+KILOCODE_JS = PLUGIN_SRC / "kilocode" / "a2a-kilocode.js"
+# DeepSeek Harness (dsh): GET /install/dsh/<token>. A dsh bundle package —
+# package.json, cordis.patch.yml, the index.js entry and dsh's own client,
+# a2a-dsh.js, which carries the baked credentials.
+DSH_DIR = PLUGIN_SRC / "dsh"
+# The installer: GET /install, public. One interactive program for all seven
 # clients, served with the broker's url and version baked and NO token — the
 # token is typed into it, so it never sits in a URL or a shell history.
 INSTALLER_PY = PLUGIN_SRC / "installer" / "a2a-install.py"
@@ -2862,7 +2870,8 @@ class ClientStateRegistry:
     THROTTLE seconds, and collect() drops rows past CLIENT_STATE_TTL. Nothing
     of it rides on a message, a stream line or /me. Sync, like the others."""
 
-    HARNESSES = ("claude", "codex", "opencode", "pi", "hermes")
+    HARNESSES = ("claude", "codex", "opencode", "pi", "hermes", "kilocode",
+                 "dsh")
     ROUTES = ("project", "app", "tui", "chat")
     SETTINGS = ("own", "copied")
     KEYS = ("harness", "version", "switch", "route", "receives", "settings",
@@ -6583,6 +6592,76 @@ def build_app() -> Starlette:
             headers={"Cache-Control": "no-store, must-revalidate"},
         )
 
+    def _baked_line(request: Request, token: str) -> str:
+        """The credentials line a JS client starts with, as OpenCode's:
+        broker url, token, optional station and starting agent, version."""
+        base = PUBLIC_URL or f"{request.url.scheme}://{request.url.netloc}"
+        baked = json.dumps({
+            "url": base,
+            "token": token,
+            "station": request.query_params.get("station") or "",
+            "agent": request.query_params.get("agent") or "",
+            "version": VERSION,
+        })
+        return f"const A2A_BAKED = {baked}\n"
+
+    async def kilocode_install(request: Request):
+        """The Kilo Code client, its own file, credentials prepended — for
+        ~/.config/kilo/plugins/a2a-kilocode.js:
+
+            mkdir -p ~/.config/kilo/plugins && \
+            curl -fsSL https://<host>/install/kilocode/<token> \
+                 -o ~/.config/kilo/plugins/a2a-kilocode.js
+
+        Unknown, revoked and not-installed all answer the same 404."""
+        missing = JSONResponse(
+            {"error": "no installer available"}, status_code=404
+        )
+        token = request.path_params["token"]
+        if not KILOCODE_JS.is_file() or not await _db(
+            lambda: TOKENS.resolve(token)
+        ):
+            return missing
+        return PlainTextResponse(
+            _baked_line(request, token) + KILOCODE_JS.read_text(),
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
+
+    async def dsh_install(request: Request):
+        """The DeepSeek Harness client: a dsh bundle package, tar.gz —
+        package.json (its version stamped), cordis.patch.yml, the index.js
+        entry, and dsh's own client a2a-dsh.js with the credentials
+        prepended. The installer unpacks it into ~/.dsh/a2a/plugin and adds
+        it to a profile with dsh's own `dsh plugin --profile web add`.
+        Unknown, revoked and not-installed all answer the same 404."""
+        missing = JSONResponse(
+            {"error": "no installer available"}, status_code=404
+        )
+        token = request.path_params["token"]
+        client = DSH_DIR / "a2a-dsh.js"
+        if not (DSH_DIR / "index.js").is_file() or not client.is_file() \
+                or not await _db(lambda: TOKENS.resolve(token)):
+            return missing
+        manifest = json.loads((DSH_DIR / "package.json").read_text())
+        manifest["version"] = VERSION
+        body = await _db(lambda: _archive_dir(
+            DSH_DIR, "tar.gz",
+            rewrite={
+                "package.json":
+                    (json.dumps(manifest, indent=2) + "\n").encode(),
+                "a2a-dsh.js":
+                    (_baked_line(request, token) + client.read_text()).encode(),
+            },
+        ))
+        return Response(
+            body, media_type="application/gzip",
+            headers={
+                "Content-Disposition": 'attachment; filename="a2a-dsh.tar.gz"',
+                "Cache-Control": "no-store, must-revalidate",
+            },
+        )
+
     async def stream_route(request: Request) -> StreamingResponse:
         """Stream the caller's messages: pending first, then live.
 
@@ -7615,6 +7694,9 @@ def build_app() -> Starlette:
     routes.append(Route("/install/codex/{token}", codex_install, methods=["GET"]))
     routes.append(Route("/install/hermes/{token}", hermes_install,
                         methods=["GET"]))
+    routes.append(Route("/install/kilocode/{token}", kilocode_install,
+                        methods=["GET"]))
+    routes.append(Route("/install/dsh/{token}", dsh_install, methods=["GET"]))
     routes.append(Route("/install/{token}", opencode_install, methods=["GET"]))
     routes.append(Route("/stream", stream_route, methods=["GET"]))
 

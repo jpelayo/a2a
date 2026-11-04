@@ -567,6 +567,60 @@ def main() -> int:
         code, out = run_installer(installer, home, bin_, cwd, ["q"])
         check("cancelled: q at the first question writes nothing",
               code != 0 and snapshot(m3) == before, out[-400:])
+
+        # --- Kilo Code and dsh: each its own client ---------------------------
+        m6 = root / "m6"
+        home, bin_, cwd = m6 / "home", m6 / "bin", m6 / "cwd"
+        for d in (home / ".config" / "kilo", home / ".dsh" / "profiles" / "desktop",
+                  bin_, cwd):
+            d.mkdir(parents=True, exist_ok=True)
+        log = m6 / "commands.log"
+        for name in ("kilo", "dsh"):
+            p = bin_ / name
+            p.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n')
+            p.chmod(0o755)
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all",          # the two harnesses found: Kilo Code, dsh
+            TOKEN,
+            "",             # ENTER: both use it
+            "y",            # install
+            "y",            # run the commands
+        ])
+        check("kilo+dsh: the installer finishes", code == 0, out[-1500:])
+        kf = home / ".config" / "kilo" / "plugins" / "a2a-kilocode.js"
+        ksrc = (ROOT / "deploy" / "plugin" / "kilocode" / "a2a-kilocode.js").read_text()
+        khead, _, krest = (kf.read_text() if kf.is_file() else "").partition("\n")
+        check("kilo+dsh: Kilo Code lands as ONE file in ~/.config/kilo/plugins, "
+              "its own client with credentials baked",
+              khead.startswith("const A2A_BAKED = {") and f'"token": "{TOKEN}"' in khead
+              and krest == ksrc, khead[:80])
+        check("kilo+dsh: and only in plugins/ — Kilo also scans plugin/, and "
+              "a second copy would load twice",
+              not (home / ".config" / "kilo" / "plugin").exists())
+        pkg = home / ".dsh" / "a2a" / "plugin"
+        check("kilo+dsh: dsh's package lands in ~/.dsh/a2a/plugin",
+              sorted(p.name for p in pkg.iterdir()) == [
+                  "a2a-dsh.js", "cordis.patch.yml", "index.js", "package.json"]
+              if pkg.is_dir() else False,
+              str(sorted(p.name for p in pkg.iterdir())) if pkg.is_dir() else "absent")
+        dsrc = (ROOT / "deploy" / "plugin" / "dsh" / "a2a-dsh.js").read_text()
+        dhead, _, drest = ((pkg / "a2a-dsh.js").read_text()
+                           if (pkg / "a2a-dsh.js").is_file() else "").partition("\n")
+        check("kilo+dsh: with dsh's own client, credentials baked",
+              dhead.startswith("const A2A_BAKED = {") and drest == dsrc, dhead[:80])
+        ran = log.read_text().splitlines() if log.is_file() else []
+        check("kilo+dsh: it ran dsh's own command for dsh web's profile and, "
+              "since the Desktop app made one, for the desktop profile",
+              ran == [f"dsh plugin --profile web add link:{pkg}",
+                      f"dsh plugin --profile desktop add link:{pkg}"], str(ran))
+        check("kilo+dsh: and nothing for Kilo, whose folder is enough",
+              not any(r.startswith("kilo ") for r in ran), str(ran))
+        check("kilo+dsh: nothing is created for OpenCode",
+              not (home / ".config" / "opencode").exists())
+        check("kilo+dsh: the next steps say to restart dsh, where Kilo "
+              "receives, and where the privacy settings are",
+              "restart dsh web" in out and "plain `kilo`" in out
+              and "telemetry" in out and "README" in out, out[-1800:])
     finally:
         broker.close()
 

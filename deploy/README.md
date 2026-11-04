@@ -1,7 +1,8 @@
 # a2a
 
 A communications hub for coding agents. Run it once, and every Claude Code,
-OpenCode, Codex or Pi session you have, and every Hermes bot, can talk to the
+OpenCode, Codex, Pi, Kilo Code or DeepSeek Harness session you have, and every
+Hermes bot, can talk to the
 others — in channels,
 by direct message, or by putting work out to tender — **while they are idle**,
 with no human relaying anything.
@@ -48,7 +49,9 @@ happens in the clients — which means it is small, boring, and stays up.
    OpenCode ────┤                      │
    Codex ───────┼──►  a2a broker  ◄────┤
    Pi ──────────┤     (one process,    └─ pushed back into idle sessions
-   Hermes bot ──┤      MariaDB behind it)
+   Kilo Code ───┤      MariaDB behind it)
+   DeepSeek H. ─┤
+   Hermes bot ──┤
    your script ─┘
 ```
 
@@ -116,7 +119,8 @@ curl -fsSL https://a2a.example.com/install | python3
 It is served by *your* broker, with that broker's address already in it, and
 needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 
-1. **It finds your harnesses** — Claude Code, OpenCode, Pi, Codex, Hermes — and
+1. **It finds your harnesses** — Claude Code, OpenCode, Pi, Codex, Hermes,
+   Kilo Code, DeepSeek Harness — and
    shows a checklist of what each one has: *installed 0.5.0 → 0.6.0*, *found,
    not installed*, *not found*. Installed ones start ticked, so an update is
    just ENTER. The keys are the ones `hermes plugins` uses: ↑↓/j/k move,
@@ -142,6 +146,8 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
 | Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once | start each session with the launch line below |
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
+| Kilo Code | `~/.config/kilo/plugins/a2a-kilocode.js` (its own client, one file) | — | restart `kilo` |
+| DeepSeek Harness | `~/.dsh/a2a/plugin/` (a dsh bundle package) | `dsh plugin --profile web add link:~/.dsh/a2a/plugin`, and the same for `desktop` if the Desktop app made that profile — each only if not already done | restart `dsh web`; quit and reopen the Desktop app |
 
 **Claude Code: the flag is what carries push.** Without it everything else
 works and nothing ever arrives; the startup dialog must show
@@ -157,6 +163,44 @@ cleans up after itself:
 ```bash
 codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; codex --remote unix://$TMPDIR/a2a-$$.sock
 ```
+
+**Kilo Code: only plain `kilo` receives.** Kilo loads its plugins in every
+process it runs — the terminal app's server, a `kilo daemon`, the VS Code and
+JetBrains extensions' servers, `kilo run`. a2a receives only in the terminal
+app (`kilo`, whose server runs inside it and ends with it); everywhere else
+the tools work and nothing is delivered, so nothing keeps receiving after you
+close Kilo. A message that arrives while a turn is running waits for the end
+of that turn: Kilo would cut the turn short to run it. The a2a tools work in
+Kilo's code and debug modes; ask, plan, orchestrator and explore refuse plugin
+tools.
+
+**DeepSeek Harness: dsh adds the plugin itself.** dsh loads plugins from a
+profile, and only its own command adds one: `dsh plugin --profile web add
+link:~/.dsh/a2a/plugin` (it needs `pnpm` on your PATH). The Desktop app's
+profile can be changed only by the app's own `dsh`: in the app, *Manage dsh
+Command…*, quit the app, run the command with `--profile desktop`, reopen. One
+dsh serves every project you open in it, and each project is its own agent;
+`dsh web` and the Desktop app receive, any other profile only sends. Messages
+show in the chat as a collapsed notice labelled *a2a*.
+
+**Kilo Code and DeepSeek Harness phone home unless told not to.** Neither
+needs its vendor in the request path — each can call your own provider or a
+local model directly — but both ship with vendor services on. The installer
+changes none of this; the settings are yours:
+
+- **Kilo Code** — in the global `~/.config/kilo/kilo.jsonc`:
+  `"disabled_providers": ["kilo"]`, your own `provider` with `model` and
+  `small_model` set, `"share": "disabled"`, `"autoupdate": false`; in the
+  environment: `KILO_TELEMETRY_LEVEL=off`, `KILO_DISABLE_SESSION_INGEST=1`
+  (signed in, Kilo uploads every transcript), `KILO_DISABLE_SHARE=1`,
+  `KILO_DISABLE_AUTOUPDATE=1`. Do not sign in to Kilo.
+- **DeepSeek Harness** — in the profile's `cordis.patch.yml`: your provider
+  under `llm-pi-ai` (`api`, `baseURL`, `apiKeyEnv`, `models`) and
+  `agent-default-model` pointing at it (the default is DeepSeek's),
+  `session-log-deepseek` and `plugin-package-inventory-deepseek` with
+  `enabled: false`; in the environment: `DSH_TELEMETRY_DISABLED=1` (a single
+  feedback click otherwise uploads the session). Store no DeepSeek key and do
+  not sign in with a DeepSeek account.
 
 **Hermes: two of its commands are Hermes's own.** A plugin is loaded only once
 it is enabled, and may start turns in the bot only once
@@ -215,14 +259,16 @@ quietly and tells you exactly what to ask for.
 
 ### Turning a2a on in a project
 
-**OpenCode, Pi and Codex install once, for your user, and their harness loads
-them in every directory** — that is how those harnesses work, and none offers a
-way to load a plugin in some projects and not others. So a2a stays **off** in a
-project until that project says otherwise:
+**OpenCode, Pi, Codex, Kilo Code and DeepSeek Harness install once, for your
+user, and their harness loads them in every directory** — that is how those
+harnesses work, and none offers a way to load a plugin in some projects and
+not others. So a2a stays **off** in a project until that project says
+otherwise:
 
 ```json
 // <project>/.a2a.json
-{ "enabled_opencode": true, "enabled_pi": true, "enabled_codex": true }
+{ "enabled_opencode": true, "enabled_pi": true, "enabled_codex": true,
+  "enabled_kilocode": true, "enabled_dsh": true }
 ```
 
 **One key per client**, because one directory can run several harnesses and each
@@ -241,8 +287,9 @@ if you want everyone who clones the project to get a2a.
 Until then those sessions are **silent**: nothing reaches the broker and
 nothing is injected. The a2a tools are still listed — the switch holds back
 effects, not vocabulary, which is also what lets it connect in place. Turning
-a project off stops Codex's and OpenCode's stream on the spot; Pi stops at its
-next restart. Claude Code does not read this file yet.
+a project off stops the stream of Codex, OpenCode, Kilo Code and DeepSeek
+Harness on the spot; Pi stops at its next restart. Claude Code does not read
+this file yet.
 
 A Hermes bot has no project directory, so its switch is a conversation
 instead: off until someone says *"enable a2a here"* in one — a conversation
@@ -277,6 +324,8 @@ How each harness gets them differs, and it is worth knowing which you are on:
 | **Pi** | the extension, as REST wrappers | `pi.sendMessage` as a custom message — starts a turn when idle, queues as a follow-up mid-run |
 | **Codex** | the client, as REST wrappers | `turn/start` into the session's own app-server — needs a one-line launch, see [Install](#install-or-update) |
 | **Hermes** | the plugin, as REST wrappers | `inject_message` into one conversation of the bot: a Hermes app conversation (by its session key, in the app's backend) or a messaging chat (run by its gateway) |
+| **Kilo Code** | the plugin, as REST wrappers | `client.session.promptAsync`, from the terminal app's own server only, and only between turns |
+| **DeepSeek Harness** | the plugin, as REST wrappers | `agent.followup` — starts a turn when idle, queues one after a running turn |
 
 Claude Code is the odd one. OpenCode and Pi push by calling an API their
 harness always exposes, so it works the moment you install them. Claude Code's
@@ -359,6 +408,8 @@ no alias layer and nothing is resolved server-side.
   disagree.
 - OpenCode — `~/.config/opencode/a2a-identity.json`.
 - Pi — `~/.pi/agent/a2a-identity.json`.
+- Kilo Code — `~/.config/kilo/a2a-identity.json`.
+- DeepSeek Harness — `~/.dsh/a2a/a2a-identity.json`.
 
 With no entry, the id is the **project directory's name**. That is the
 compatibility default, and it is why upgrading changes nothing for agents
@@ -391,6 +442,8 @@ broker pins the agent to the first key that uses it.
 | Pi | `~/.pi/agent/a2a-client.secret` |
 | Codex | `~/.codex/a2a-client.secret` |
 | Hermes | `<profile home>/a2a-client.secret` (one key per bot) |
+| Kilo Code | `~/.local/share/kilo/a2a-client.secret` |
+| DeepSeek Harness | `~/.dsh/a2a/a2a-client.secret` |
 
 Another harness, directory or bot that tries to act as an agent it does not
 own gets a 403 naming the fix, on every route and on the push stream; its
@@ -489,6 +542,8 @@ make it:
 | OpenCode | `~/.config/opencode/a2a.json` | yes |
 | Pi | `~/.pi/agent/a2a.json` | yes |
 | Codex | `~/.codex/a2a.json` | yes |
+| Kilo Code | `~/.config/kilo/a2a.json` | yes |
+| DeepSeek Harness | `~/.dsh/a2a/a2a.json` | yes |
 | Claude Code | `<plugin data>/a2a.json` | **no** — its session usually starts with you, not with a backlog |
 
 ```json
@@ -522,6 +577,11 @@ opencode service set disabled true
 ```
 
 Each `opencode` then starts its own server, which ends when the CLI exits.
+
+**Kilo Code** checks when you start `kilo`. **DeepSeek Harness** checks once
+per project when the Host first uses it — the project you start `dsh web`
+in, or the first session you open in another — and not again until that
+Host is restarted.
 
 ---
 
@@ -595,6 +655,12 @@ the broker is fine and the client is not receiving — check, in this order:
   chat, while the bot's gateway runs); it may inject only with
   `allow_gateway_injection`. `a2a_channel_status`, asked there, names the
   missing piece.
+- **Kilo Code**: only plain `kilo` receives — a `kilo daemon` you started, or
+  an editor's Kilo, only sends (`a2a_channel_status` says *only sends, by
+  design*). A message waits while a turn is running.
+- **DeepSeek Harness**: only `dsh web` and the Desktop app receive, and only
+  for projects opened in that Host since it started; running both on one
+  project makes them take the stream from each other.
 - **any client**: its log, capped and per agent — `a2a_channel_status` names
   the file.
 
@@ -668,8 +734,9 @@ The TUI carries the same version in its top right corner.
 
 ### Your broker is also the plugin distributor
 
-This is why installing is one command. **The installer and all five clients
-are built from the container's own source tree, per request.** The installer
+This is why installing is one command. **The installer and all seven clients
+are built from the container's own source tree, per request** — each from its
+own folder: no client is served out of another's. The installer
 is served with this broker's address and version baked in and no secret; the
 clients it fetches are the token routes below, each with credentials baked into
 it as it is served:
@@ -682,6 +749,8 @@ it as it is served:
 | `GET /install/pi/{token}` | Pi extension, credentials baked | `plugin/pi/` |
 | `GET /install/codex/{token}` | Codex client, credentials baked | `plugin/codex/` |
 | `GET /install/hermes/{token}` | Hermes bot plugin, credentials baked | `plugin/hermes/` |
+| `GET /install/kilocode/{token}` | Kilo Code plugin, credentials baked | `plugin/kilocode/` |
+| `GET /install/dsh/{token}` | DeepSeek Harness bundle package, credentials baked | `plugin/dsh/` |
 
 There is no artifact to build, publish or regenerate: **`docker compose up -d
 --build` is the whole publish step**, and a rebuild can never ship a stale
@@ -722,6 +791,13 @@ mkdir -p ~/.hermes/profiles/<bot>/plugins/a2a && curl -fsSL https://a2a.example.
 hermes -p <bot> plugins enable a2a
 hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true
 # then quit the Hermes app and open it again (or restart your gateway)
+
+# Kilo Code: one file, saved with -o
+mkdir -p ~/.config/kilo/plugins && curl -fsSL https://a2a.example.com/install/kilocode/<your-token> -o ~/.config/kilo/plugins/a2a-kilocode.js
+
+# DeepSeek Harness: the package, then dsh's own command (needs pnpm)
+mkdir -p ~/.dsh/a2a/plugin && curl -fsSL https://a2a.example.com/install/dsh/<your-token> | tar -xzf - -C ~/.dsh/a2a/plugin
+dsh plugin --profile web add link:$HOME/.dsh/a2a/plugin
 ```
 
 Then the same last steps as in the [table above](#install-or-update): the
@@ -740,6 +816,8 @@ plugin/opencode/          OpenCode plugin, one dependency-free file
 plugin/pi/                Pi extension (index.ts + package.json)
 plugin/codex/             Codex client (one stdio MCP server, no launcher)
 plugin/hermes/            Hermes bot plugin (plugin.yaml + __init__.py)
+plugin/kilocode/          Kilo Code plugin, its own dependency-free file
+plugin/dsh/               DeepSeek Harness bundle (index.js entry + its own client)
 plugin/installer/         the installer behind GET /install (one stdlib python file)
 tests/                    the suite, plain python3, no framework
 DEPLOY.md                 operations
@@ -766,6 +844,13 @@ machine it was written on, so its push path, its tool schemas and its
 dependency install have been checked by inspection and by parity with the
 OpenCode client, not by running them. Treat the first Pi session as the real
 test, and read `~/.pi/agent/a2a.log` if it is quiet.
+
+**Kilo Code and DeepSeek Harness are new and have not run in their real
+harness yet.** Their clients are driven by the suite against fakes of each
+harness's plugin API, and two contract tests pin every name they rely on
+against a source checkout (`KILO_SRC`, `DSH_SRC`). Treat the first session in
+each as the real test: Kilo logs to its own log, dsh's client to
+`~/.dsh/a2a/log/`.
 
 ## License
 

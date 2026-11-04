@@ -36,6 +36,8 @@ CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
 PI = PLUGIN / "pi" / "index.ts"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 
 fails: list[str] = []
 
@@ -218,6 +220,64 @@ process.exit(0)
     ok, files = secret_state(race / "opencode", "a2a-client.secret")
     check("opencode: exactly one secret, mode 0600, no temp file left behind",
           ok, files)
+
+    # Kilo Code and dsh: their OWN files, their own secret folders, the same
+    # formula. Kilo's secret is under $XDG_DATA_HOME/kilo; dsh's under
+    # $DSH_HOME/a2a. Each sends its key on the first call, like OpenCode's.
+    def own_key(label: str, data: Path, directory: str) -> list[list[str]]:
+        script = tmp / f"{label}-{data.name}.mjs"
+        if label == "kilocode":
+            boot = f"""
+process.env.XDG_DATA_HOME = {json.dumps(str(data))}
+const mod = await import({json.dumps(str(KILOCODE))})
+const s = await mod.default.server({{ client: {{ app: {{ log: async () => {{}} }},
+  session: {{ status: async () => ({{}}) }} }}, directory: {json.dumps(directory)} }})
+await s.tool.whoami.execute({{}})
+"""
+        else:
+            boot = f"""
+process.env.DSH_HOME = {json.dumps(str(data))}
+const mod = await import({json.dumps(str(DSH))})
+const tools = {{}}
+await mod.default.dsh({{
+  get: (n) => n === "profileContext" ? {{ name: "headless", cwd: {json.dumps(directory)} }} : undefined,
+  agents: {{ list: () => [] }}, tools: {{ register: (t) => {{ tools[t.name] = t }} }},
+  on: () => {{}}, effect: () => {{}},
+}})
+await tools.whoami.execute({{}}, {{ agent: {{ session: {{ header: {{ cwd: {json.dumps(directory)} }} }} }} }})
+"""
+        script.write_text(f"""
+process.env.A2A_URL = "http://broker.invalid"
+process.env.A2A_TOKEN = "t"
+process.env.A2A_HELLO = "0"
+process.env.HOME = {json.dumps(str(tmp / f"{label}-home"))}
+delete process.env.A2A_AGENT
+let seen = ""
+globalThis.fetch = async (url, init = {{}}) => {{
+  seen = seen || init.headers?.["X-A2A-Client"] || ""
+  return {{ ok: true, status: 200, text: async () => "{{}}", json: async () => ({{}}) }}
+}}
+{boot}
+console.log(seen)
+process.exit(0)
+""")
+        return [["node", str(script)]]
+
+    for label, sub in (("kilocode", "kilo"), ("dsh", "a2a")):
+        data = tmp / f"{label}-data"
+        (data / sub).mkdir(parents=True)
+        (data / sub / "a2a-client.secret").write_text(secret_hex)
+        got = concurrently(own_key(label, data, project))
+        check(f"{label}: the same secret and scope give the same key as "
+              "Claude's — one formula in every client", got[0] == claude_key,
+              str(got))
+        race = tmp / f"{label}-race"
+        out = concurrently(own_key(label, race, "/p") * 6)
+        check(f"{label}: 6 processes racing on an empty folder send ONE key",
+              len(set(out)) == 1 and out[0].startswith("a2a_ck_"), str(out))
+        ok, files = secret_state(race / sub, "a2a-client.secret")
+        check(f"{label}: exactly one secret, mode 0600, no temp file left "
+              "behind", ok, files)
 
     shutil.rmtree(tmp, ignore_errors=True)
     print()

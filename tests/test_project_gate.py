@@ -240,6 +240,9 @@ const cases = async (go) => ({
   // Pi's key must not speak for OpenCode: one directory, several harnesses,
   // each its own agent.
   other: await go({ enabled_pi: true }),
+  // Kilo Code's and dsh's own keys: two more harnesses that may share the
+  // directory, each its own agent.
+  newcomers: await go({ enabled_kilocode: true, enabled_dsh: true }),
   bare: await go({ enabled: true }),
   on: await go({ enabled_opencode: true }),
 })
@@ -619,6 +622,9 @@ def main() -> int:
                             "stringy"),
                            ('{"enabled_pi": true} — ANOTHER client\'s key, '
                             "which must not speak for this one", "other"),
+                           ('{"enabled_kilocode": true, "enabled_dsh": true} '
+                            "— Kilo Code's and dsh's keys, which speak for "
+                            "their own clients only", "newcomers"),
                            ('{"enabled": true} — the bare key names no '
                             "client, so it enables none", "bare")):
             got = got_all[key]
@@ -775,7 +781,8 @@ def main() -> int:
                             ('{"enabled_codex": "true"} — a STRING', 
                              {"enabled_codex": "true"}),
                             ("ONLY the other clients' keys",
-                             {"enabled_opencode": True, "enabled_pi": True}),
+                             {"enabled_opencode": True, "enabled_pi": True,
+                              "enabled_kilocode": True, "enabled_dsh": True}),
                             ('{"enabled": true} — the bare key', 
                              {"enabled": True})):
         got = run_codex(contents)

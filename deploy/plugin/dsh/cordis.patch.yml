@@ -1,0 +1,5 @@
+# a2a bundle layer: one plugin, no configuration. The broker url and token
+# are baked into a2a.js when the broker serves this package.
+- insert:
+    - id: a2a
+      name: a2a-dsh

@@ -34,6 +34,9 @@ HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "deploy" / "plugin"
 BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
+# Kilo Code and dsh: each its OWN client file (never OpenCode's).
+KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
+DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
@@ -91,11 +94,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         fails.append(f"{name}: {detail}")
 
 
-def opencode_tools() -> set[str]:
+def opencode_tools(path: Path = OPENCODE) -> set[str]:
     """Names in the `const tools = { … }` table of the OpenCode plugin — the
     one table both entry points hand over (V1 as `tool`, V2 through
-    ctx.tool.transform)."""
-    src = OPENCODE.read_text()
+    ctx.tool.transform). Kilo's and dsh's own files keep the same
+    shape of table."""
+    src = path.read_text()
     start = src.index("\n  const tools = {\n")
     body = src[start:src.index("\n  }\n", start)]
     return set(re.findall(r"^    ([a-z_][a-z0-9_]*): \{", body, re.M))
@@ -173,14 +177,30 @@ def status_shapes() -> dict:
                 "params": {"name": "a2a_channel_status", "arguments": {}}})
     out["claude"] = _json.loads(sent[-1]["result"]["content"][0]["text"])
 
-    for label, path in (("opencode", OPENCODE), ("pi", PI)):
+    # Kilo Code and dsh have their OWN files; their builders read three more
+    # of core's names (their label, client, whether this process receives).
+    # "kilocode-send-only" is a Kilo daemon or editor server, which only
+    # sends — checked apart below, not counted as a client.
+    own = {
+        "kilocode": (KILOCODE, 'const LABEL="Kilo", CLIENT="kilocode", '
+                               'RECEIVES=true, host={};\n'),
+        "dsh": (DSH, 'const LABEL="DeepSeek Harness", CLIENT="dsh", '
+                     'RECEIVES=true, host={};\n'),
+        "kilocode-send-only": (KILOCODE, 'const LABEL="Kilo", '
+                               'CLIENT="kilocode", RECEIVES=false, '
+                               'host={why:"this is the Kilo daemon"};\n'),
+    }
+    runs = [("opencode", OPENCODE, ""), ("pi", PI, "")] + [
+        (k, p, extra) for k, (p, extra) in own.items()]
+    for label, path, extra in runs:
         src = path.read_text()
         i = src.index("async function statusReport")
         body = _re.sub(r"^  ", "", src[i:src.index("\n  }", i) + 4], flags=_re.M)
         # Every free name the lifted statusReport reads. A name missing here
         # is a ReferenceError — which used to be caught, printed and the
         # client SKIPPED: Pi's `sendOnly` went unchecked that way for months.
-        pre = ('const key="x", name="x", toAck=new Set(), LOG="/tmp/x.log";\n'
+        pre = (extra +
+               'const key="x", name="x", toAck=new Set(), LOG="/tmp/x.log";\n'
                'const ENABLED=true, PROJECT_FILE="/tmp/.a2a.json", '
                'ENABLE_KEY="enabled_x";\n'
                'const URL_BASE="http://127.0.0.1:1", TOKEN="t";\n'
@@ -217,6 +237,8 @@ FIX_DECLARED = {
     "hermes": (HERMES, '{"fix": {"type": "boolean"}}, [], lambda c, a: '
                        'c.status(a)'),
     "opencode": (OPENCODE, 'args: { fix: { type: ["boolean", "null"] } }'),
+    "kilocode": (KILOCODE, 'args: { fix: { type: ["boolean", "null"] } }'),
+    "dsh": (DSH, 'args: { fix: { type: ["boolean", "null"] } }'),
     "pi": (PI, "fix: Type.Optional(Type.Boolean("),
 }
 
@@ -264,6 +286,14 @@ def main() -> int:
           "runs it",
           hx == cx, f"only in hermes: {sorted(hx - cx)}; "
                     f"missing: {sorted(cx - hx)}")
+    # Kilo Code and dsh: their own files, the same vocabulary.
+    kc, dx = opencode_tools(KILOCODE), opencode_tools(DSH)
+    check("and Kilo Code's own client exposes exactly OpenCode's vocabulary",
+          kc == oc, f"only in kilocode: {sorted(kc - oc)}; "
+                    f"missing: {sorted(oc - kc)}")
+    check("and dsh's own client exposes exactly OpenCode's vocabulary",
+          dx == oc, f"only in dsh: {sorted(dx - oc)}; "
+                    f"missing: {sorted(oc - dx)}")
 
     # --- and neither may drift from the broker without a stated reason -----
     missing = (broker - oc) - ONLY_BROKER
@@ -304,8 +334,26 @@ def main() -> int:
     check("every client's status builder RUNS here — a skipped one is "
           "unchecked", not broken, str(broken))
     shapes = {k: v for k, v in shapes.items() if "__error__" not in v}
-    check("all five clients were checked", sorted(shapes) == sorted(
-        ["claude", "codex", "hermes", "opencode", "pi"]), str(sorted(shapes)))
+    send_only = shapes.pop("kilocode-send-only", None)
+    check("all seven clients were checked", sorted(shapes) == sorted(
+        ["claude", "codex", "hermes", "opencode", "pi", "kilocode", "dsh"]),
+        str(sorted(shapes)))
+    # A Kilo daemon or editor server only sends, like Pi's helper session:
+    # by design, so push_host holds and the stream is not applicable.
+    if send_only:
+        by = {c["check"]: c for c in send_only.get("checks") or []}
+        check("kilocode, send-only: push_host is ok and names the process",
+              by.get("push_host", {}).get("ok") is True
+              and "only sends" in str(by["push_host"].get("detail")),
+              str(by.get("push_host")))
+        check("kilocode, send-only: the stream is not applicable (null), so "
+              "nothing tells the human to wait for one",
+              by.get("stream", {}).get("ok") is None, str(by.get("stream")))
+        check("kilocode, send-only: push.receives is false, as in Pi",
+              (send_only.get("push") or {}).get("receives") is False,
+              str(send_only.get("push")))
+    else:
+        check("kilocode, send-only: the builder ran", False, "no shape")
     for label, shape in shapes.items():
         ids = [c.get("check") for c in shape.get("checks") or []]
         check(f"{label}: the doctor lists every check, in the shared order — "
@@ -355,6 +403,7 @@ def main() -> int:
     # being ready, and a brief that says "wait" invites the opposite.
     for label, path in (("claude", PLUGIN / "a2a" / "server" / "a2a-channel.py"),
                         ("opencode", PLUGIN / "opencode" / "a2a-opencode.js"),
+                        ("kilocode", KILOCODE), ("dsh", DSH),
                         ("pi", PLUGIN / "pi" / "index.ts"),
                         ("codex", CODEX), ("hermes", HERMES)):
         body = path.read_text()

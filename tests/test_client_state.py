@@ -144,6 +144,16 @@ def main() -> int:
         except ValueError as e:
             why = str(e)
         check(f"refused: {label}", word in why, why)
+    # Every client the broker serves can report — the two newest included —
+    # and a send-only process reports receives=false.
+    for harness in ("kilocode", "dsh"):
+        try:
+            CS.validate(dict(GOOD, harness=harness, route="project",
+                             receives=False))
+            why = ""
+        except ValueError as e:
+            why = str(e)
+        check(f"accepted: a finding from {harness}", why == "", why)
 
     # --- drift ----------------------------------------------------------------------
     flags = CS.drift(dict(CS.get(A, "alice"), failing=["switch", "stream"],
