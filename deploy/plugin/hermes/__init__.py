@@ -964,8 +964,12 @@ TOOLS = [
      "asking again for a while, so ask once and wait rather than retrying. "
      "If your token reaches several stations, pass station. Asking also "
      "turns a2a on here when it is off (as enable_a2a_here does, with the "
-     "same rules), so this bot receives as soon as it is approved.",
-     {"note": OPT_STR, "station": OPT_STR}, [],
+     "same rules), so this bot receives as soon as it is approved. Pass "
+     "name to ask for a name of your choosing instead of this bot's id; "
+     "once the broker takes the request, the bot goes by that name (as "
+     "rename_me keeps one) and connects under it when it is approved. The "
+     "operator approves or denies the name.",
+     {"name": OPT_STR, "note": OPT_STR, "station": OPT_STR}, [],
      lambda c, a: c.propose_me(a)),
 
     ("whoami",
@@ -1783,19 +1787,36 @@ class A2AHermes:
             if out.get("error"):
                 return json.dumps(out)
             turned_on = True
-        body = {"agent_id": self.key, "note": a.get("note") or ""}
+        # `name` asks for a name of the bot's choosing; without it, the bot's
+        # id as before. The operator approves or denies the name; this
+        # plugin never refuses one.
+        asked = (a.get("name") or "").strip() or self.key
+        body = {"agent_id": asked, "note": a.get("note") or ""}
         station = (a.get("station") or "").strip()
         if station:
             body["station"] = station
         text = self.api_text("POST", "/me/proposals", body)
-        if not turned_on:
-            return text
         try:
             out = json.loads(text)
         except ValueError:
             out = {"broker": text}
         if not isinstance(out, dict):
             out = {"broker": out}
+        moved = False
+        if not out.get("error"):
+            # The name as the broker filed it (it normalises), which is the
+            # name an operator approves. The bot goes by it from now on, the
+            # way rename_me adopts one, and connects under it once approved.
+            got = out.get("agent_id")
+            filed = got if isinstance(got, str) and got else asked
+            if filed != self.key:
+                was = self.key
+                self._become(filed, moved=False)
+                out["was"] = was
+                moved = True
+        if not turned_on:
+            return json.dumps(out, ensure_ascii=False, indent=2) if moved \
+                else text
         out["a2a"] = (f"on in {self._chat_label(self.route)}: this bot "
                       "receives there as soon as the name is approved")
         return json.dumps(out, ensure_ascii=False, indent=2)

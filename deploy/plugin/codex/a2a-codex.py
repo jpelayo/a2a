@@ -243,6 +243,12 @@ def legacy_id(project):
     return Path(project).name or "agent"
 
 
+# What propose_me asks for when given no name and the id is only the folder's
+# name: `<folder>-codex`, because every harness in a folder derives the same
+# name, and a request for it is a request for the other harnesses' name.
+PROPOSE_SUFFIX = "codex"
+
+
 def resolve_key():
     """(key, explicit) — the id this session announces.
 
@@ -1333,12 +1339,30 @@ def _enable_a2a_here(a):
     })
 
 
+def _default_proposal():
+    """What propose_me asks for when given no name: the current id, unless it
+    is only this folder's name, derived because nothing chose one (no
+    A2A_AGENT, nothing baked, nothing stored). Every harness in the folder
+    derives that same name, so the request is for `<folder>-codex`. Nothing
+    else reads this: the id itself is resolved exactly as before."""
+    project = os.getcwd()
+    if EXPLICIT or KEY != legacy_id(project):
+        return KEY
+    if _store_read().get(project):
+        return KEY
+    return f"{legacy_id(project)}-{PROPOSE_SUFFIX}"
+
+
 def _propose_me(a):
-    """Ask an operator for this id, and — once the broker has taken the
-    request — turn a2a on for this project if it is off, so the session
-    receives as soon as the name is approved. A refused request turns
-    nothing on."""
-    body = {"agent_id": KEY, "note": a.get("note") or ""}
+    """Ask an operator for a name — `name`, else _default_proposal() — and,
+    once the broker has taken the request, go by that name (kept for this
+    project, as rename_me keeps one) and turn a2a on for this project if it
+    is off, so the session receives as soon as the name is approved. A
+    refused request switches nothing and turns nothing on. The operator
+    approves or denies the name; this client never refuses one."""
+    global KEY, NAME
+    asked = (a.get("name") or "").strip() or _default_proposal()
+    body = {"agent_id": asked, "note": a.get("note") or ""}
     station = (a.get("station") or "").strip()
     if station:
         body["station"] = station
@@ -1349,8 +1373,22 @@ def _propose_me(a):
         out = {"broker": text}
     if not isinstance(out, dict):
         out = {"broker": out}
-    if out.get("error") or _enabled.is_set():
+    if out.get("error"):
         return text
+    # The name as the broker filed it (it normalises), which is the name an
+    # operator approves. The stream sees KEY change on its next line and
+    # reconnects under it, which connects once the name is approved.
+    filed = out.get("agent_id") if isinstance(out.get("agent_id"), str) \
+        and out.get("agent_id") else asked
+    moved = filed != KEY
+    if moved:
+        was = KEY
+        KEY = NAME = filed
+        pin(filed)
+        out["was"] = was
+        log(f"proposed {filed} (was {was}); going by it now")
+    if _enabled.is_set():
+        return json.dumps(out, ensure_ascii=False, indent=2) if moved else text
     switched = json.loads(_enable_a2a_here({"enabled": True}))
     if switched.get("error"):
         out["a2a"] = switched["error"]
@@ -1772,8 +1810,14 @@ TOOLS = [
      "asking again for a while, so ask once and wait rather than retrying. "
      "If your token reaches several stations, pass station. A request the "
      "broker accepts also turns a2a on for this project (as enable_a2a_here "
-     "does), so this session receives as soon as it is approved.",
-     {"note": OPT_STR, "station": OPT_STR}, [], _propose_me),
+     "does), so this session receives as soon as it is approved. Pass name "
+     "to ask for a name of your choosing; without it, an id that is only "
+     "this folder's name asks for \"<folder>-" + PROPOSE_SUFFIX + "\" "
+     "instead, so each harness in a folder asks for its own. Once the broker "
+     "takes a request for another name, this client goes by that name (kept "
+     "for this project, as rename_me keeps one) and connects under it when "
+     "it is approved. The operator approves or denies the name.",
+     {"name": OPT_STR, "note": OPT_STR, "station": OPT_STR}, [], _propose_me),
 
     ("whoami",
      "Report the name the broker resolves this session to, its station, and "

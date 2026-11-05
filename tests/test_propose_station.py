@@ -21,6 +21,14 @@ SIGNING UP TURNS PUSH ON. In a project that is off, a request the broker
 accepts switches a2a on there, as enable_a2a_here does — merged into
 .a2a.json, the pump started — so the agent receives the moment it is
 approved. A refused request turns nothing on. (Claude Code has no switch.)
+
+WHAT IS ASKED FOR. With no A2A_AGENT and nothing stored, the id is the
+folder's name, which every harness in that folder derives alike; so a
+propose_me with no `name` asks for `<folder>-<harness>` instead. `name` asks
+for anything. Once the broker takes the request the client goes by the name
+it asked for — stored, and on the very next request — and a refused request
+switches nothing. The operator approves or denies the name; no client refuses
+one. With A2A_AGENT set (the runs above) the default is that id, as before.
 """
 import json
 import os
@@ -62,12 +70,18 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         fails.append(f"{name}: {detail}")
 
 
+# True for the runs with no A2A_AGENT, where the id is derived from the folder.
+DERIVED = False
+
+
 def base_env(fb: FakeBroker, tmp: Path) -> dict:
     env = dict(os.environ, A2A_URL=fb.url, A2A_TOKEN="t", A2A_AGENT="probe",
                A2A_HELLO="0", A2A_READ_ON_INIT="0", HOME=str(tmp),
                XDG_DATA_HOME=str(tmp / "data"))
     for k in ("A2A_CATCHUP", "A2A_CLIENT_VERSION"):
         env.pop(k, None)
+    if DERIVED:
+        env.pop("A2A_AGENT", None)
     return env
 
 
@@ -306,10 +320,90 @@ def run(label, fn, refuse=False):
         fb.refuse.add("/me/proposals")
     tmp = Path(tempfile.mkdtemp(prefix="a2a-propose-")).resolve()
     try:
-        out = fn(fb, tmp)
+        out = dict(fn(fb, tmp), tmp=str(tmp))
     finally:
         fb.close()
     return out, fb
+
+
+# --- what propose_me asks for, with the id derived from the folder ---------
+# The folder each driver above runs the client in, and the harness suffix.
+FOLDER = {"Claude Code": "cc", "Codex": "codex-proj", "Pi": "pi",
+          "OpenCode": "opencode", "Kilo Code": "kilocode",
+          "DeepSeek Harness": "dsh"}
+SUFFIX = {"Claude Code": "claude", "Codex": "codex", "Pi": "pi",
+          "OpenCode": "opencode", "Kilo Code": "kilo",
+          "DeepSeek Harness": "dsh"}
+
+
+def asked(fb) -> list[tuple[str, str]]:
+    """(X-A2A-Agent it went out as, agent_id it asked for) per proposal."""
+    callers = [a for p, a in fb.agents if p == "/me/proposals"]
+    bodies = [b.get("agent_id") for p, b in fb.bodies if p == "/me/proposals"]
+    return list(zip(callers, bodies))
+
+
+def stored(out: dict) -> set[str]:
+    """Every id any identity store under the run's home holds."""
+    names: set[str] = set()
+    tmp = Path(out.get("tmp") or "/nonexistent")
+    for p in [*tmp.rglob("a2a-identity.json"), *tmp.rglob("identity.json")]:
+        try:
+            names |= {v for v in json.loads(p.read_text()).values()
+                      if isinstance(v, str)}
+        except Exception:
+            pass
+    return names
+
+
+def derived_run(label, fn, calls, refuse=False):
+    global CALLS, DERIVED
+    CALLS, DERIVED = calls, True
+    try:
+        return run(label, fn, refuse)
+    finally:
+        CALLS, DERIVED = ORIGINAL_CALLS, False
+
+
+ORIGINAL_CALLS = CALLS
+
+
+def check_naming(label, fn) -> None:
+    folder = FOLDER[label]
+    default = f"{folder}-{SUFFIX[label]}"
+
+    out, fb = derived_run(label, fn, [{"note": "d1"}, {"note": "d2"}])
+    if "error" in out:
+        check(f"{label} (derived id): the client ran", False, out["error"])
+        return
+    got = asked(fb)
+    check(f"{label}: propose_me offers a name argument",
+          "name" in (out.get("schema") or []), str(out.get("schema")))
+    check(f"{label}: with no name, an id that is only the folder's name asks "
+          f"for {default!r}, not {folder!r}",
+          got[:1] == [(folder, default)], str(got))
+    check(f"{label}: and once the broker took it, the client goes by it — "
+          "the next request is sent as it, and asks for it again",
+          got[1:2] == [(default, default)], str(got))
+    check(f"{label}: the name is stored for this project, as rename_me "
+          "stores one", default in stored(out), str(stored(out)))
+
+    out, fb = derived_run(label, fn, [{"name": "picked", "note": "p1"},
+                                      {"note": "p2"}])
+    got = asked(fb)
+    check(f"{label}: name asks for exactly that name",
+          got[:1] == [(folder, "picked")], str(got))
+    check(f"{label}: and the client goes by it from the next request on, "
+          "stored", got[1:2] == [("picked", "picked")]
+          and "picked" in stored(out), f"{got} {stored(out)}")
+
+    out, fb = derived_run(label, fn, [{"name": "picked", "note": "r1"},
+                                      {"note": "r2"}], refuse=True)
+    got = asked(fb)
+    check(f"{label}: a request the broker REFUSES switches nothing — the "
+          "next one goes out under the folder's name, asking for the default",
+          got[1:2] == [(folder, default)] and "picked" not in stored(out),
+          f"{got} {stored(out)}")
 
 
 def main() -> int:
@@ -346,14 +440,15 @@ def main() -> int:
         check(f"{label}: without one — absent or null — the body is exactly "
               "{agent_id, note}, as before",
               sent[1:3] == WANT[1:3], str(sent[1:3]))
+        check_naming(label, fn)
 
     print()
     for f in fails:
         print("FAIL", f)
     print("FAILED" if fails else
           "PASS — every client's propose_me can name the station, sends what "
-          "it always sent when it does not, and an accepted request turns "
-          "push on")
+          "it always sent when it does not, an accepted request turns push "
+          "on, and it asks for <folder>-<harness> or the name it is given")
     return 1 if fails else 0
 
 

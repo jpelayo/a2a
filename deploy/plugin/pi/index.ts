@@ -282,6 +282,10 @@ function envelope(m: Msg): string {
 export default function (pi: ExtensionAPI) {
   const project = process.cwd();
   const dir = project.split(/[/\\]/).filter(Boolean).pop() || "agent";
+  // What propose_me asks for when given no name and the id is only `dir`:
+  // `<folder>-pi`, because every harness in a folder derives the same `dir`,
+  // and a request for it is a request for the other harnesses' name.
+  const PROPOSE_SUFFIX = "pi";
 
   // --- the project switch ---------------------------------------------------
   // a2a is OFF in a project until <project>/.a2a.json says {"enabled": true}.
@@ -432,6 +436,17 @@ export default function (pi: ExtensionAPI) {
     } catch (e) {
       log(`could not persist identity: ${e}`);
     }
+  }
+  /** What propose_me asks for when given no name: the current id, unless it
+   *  is only this folder's name, derived because nothing chose one (no
+   *  A2A_AGENT, nothing baked, nothing stored). Every harness in the folder
+   *  derives that same name, so the request is for `<folder>-pi`. Nothing
+   *  else reads this: the id itself is resolved exactly as before. */
+  async function defaultProposal(): Promise<string> {
+    await adoptStoredId();
+    if (explicit || key !== dir) return key;
+    if ((await readStore())[project]) return key;
+    return `${dir}-${PROPOSE_SUFFIX}`;
   }
 
   // --- settings -------------------------------------------------------------
@@ -735,9 +750,11 @@ export default function (pi: ExtensionAPI) {
     // not something to interrupt the agent with — and delivering it would
     // trigger a turn per retry.
     const stations = (me.stations || []).join(", ") || "none";
+    const ask = await defaultProposal();
     notify(
-      `"${key}" is not registered. Call propose_me to put the name in ` +
-      `front of an operator — it appears in their console and they approve ` +
+      `"${key}" is not registered. Call propose_me to put a name in ` +
+      `front of an operator — "${ask}" unless you pass name=… — it ` +
+      `appears in their console and they approve ` +
       `it with one key, and this client connects with no restart. ` +
       `(This token can reach: ${stations}.) If you meant to BE an agent ` +
       `that already exists, ask me to rename_me to its id.`,
@@ -1651,8 +1668,18 @@ export default function (pi: ExtensionAPI) {
       "than retrying. If your token reaches several stations, pass station. " +
       "A request the broker accepts also turns a2a on for this project (as " +
       "enable_a2a_here does), so this agent receives as soon as it is " +
-      "approved.",
+      "approved. Pass name to ask for a name of your choosing; without it, " +
+      "an id that is only this folder's name asks for " +
+      `"<folder>-${PROPOSE_SUFFIX}" instead, so each harness in a folder ` +
+      "asks for its own. Once the broker takes a request for another name, " +
+      "this client goes by that name (kept for this project, as rename_me " +
+      "keeps one) and connects under it when it is approved. The operator " +
+      "approves or denies the name.",
     parameters: Type.Object({
+      name: Type.Optional(Type.String({
+        description: "the name to ask for; without it, your current id " +
+          `(or "<folder>-${PROPOSE_SUFFIX}" if that is only the folder's name)`,
+      })),
       note: Type.Optional(Type.String({
         description: "one line for the operator on what this agent is",
       })),
@@ -1661,20 +1688,37 @@ export default function (pi: ExtensionAPI) {
           "token reaches several (the error lists them)",
       })),
     }),
-    async execute(_id, a: { note?: string; station?: string }) {
+    async execute(_id, a: { name?: string; note?: string; station?: string }) {
       const station = (a.station || "").trim();
+      const asked = (a.name || "").trim() || await defaultProposal();
       // Throws on a refusal, so a request the broker did not take turns
-      // nothing on.
+      // nothing on and switches nothing.
       const out = await api("POST", "/me/proposals", {
-        agent_id: key,
+        agent_id: asked,
         note: a.note || "",
         ...(station ? { station } : {}),
       });
-      if (ENABLED) return text(out);
-      await setEnabled(true);
       let res: unknown;
       try { res = JSON.parse(out); } catch { res = { broker: out }; }
       if (!res || typeof res !== "object") res = { broker: res };
+      // The name as the broker filed it (it normalises), which is the name
+      // an operator approves.
+      const got = (res as Record<string, unknown>).agent_id;
+      const filed = typeof got === "string" && got ? got : asked;
+      const switched = filed !== key;
+      if (switched) {
+        // Go by the requested name from now on, kept for this project as
+        // rename_me keeps one. The pump sees the new key on its next line
+        // and reconnects under it, which connects once the name is approved.
+        const was = key;
+        await pin(filed);
+        key = filed;
+        name = filed;
+        res = { ...(res as Record<string, unknown>), was };
+        log(`proposed ${filed} (was ${was}); going by it now`);
+      }
+      if (ENABLED) return text(switched ? JSON.stringify(res) : out);
+      await setEnabled(true);
       return text(JSON.stringify({
         ...(res as Record<string, unknown>),
         enabled: true,

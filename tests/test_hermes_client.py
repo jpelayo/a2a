@@ -1289,7 +1289,7 @@ def propose() -> None:
     """propose_me can name the station. A token that reaches two stations
     cannot propose without it (the broker's 409 "name one with station"),
     and the tool used to send {agent_id, note} and nothing else. Without a
-    station the body must stay exactly that. The other four clients are in
+    station the body must stay exactly that. The other clients are in
     test_propose_station.py."""
     fb = FakeBroker()
     mod = load(fb.url)
@@ -1310,6 +1310,47 @@ def propose() -> None:
           "{agent_id, note}, as before",
           sent[1:] == [{"agent_id": "bot", "note": "n2"},
                        {"agent_id": "bot", "note": "n3"}], str(sent))
+    check("propose: the tool offers a name argument", "name" in props,
+          str(sorted(props)))
+    stop(ctx)
+    fb.close()
+
+    # `name` asks for a name of the bot's choosing. Once the broker takes the
+    # request the bot goes by it — its `agent` setting, as rename_me adopts
+    # one — and the next request already carries it. A request the broker
+    # refuses switches nothing. The operator approves or denies the name.
+    def proposals(fb):
+        callers = [a for p, a in fb.agents if p == "/me/proposals"]
+        bodies = [b.get("agent_id") for p, b in fb.bodies
+                  if p == "/me/proposals"]
+        return list(zip(callers, bodies))
+
+    fb = FakeBroker()
+    mod = load(fb.url)
+    ctx = Ctx("bot", config=ON)
+    start(mod, ctx)
+    ctx.call("propose_me", ALICE, {"name": "picked", "note": "p"})
+    ctx.call("propose_me", ALICE, {"note": "again"})
+    check("propose: name asks for exactly that name, the bot goes by it "
+          "(its agent setting) and the next request is sent as it",
+          proposals(fb) == [("bot", "picked"), ("picked", "picked")]
+          and ctx.saved.get("agent") == "picked",
+          f"{proposals(fb)} {ctx.saved.get('agent')}")
+    stop(ctx)
+    fb.close()
+
+    fb = FakeBroker()
+    fb.refuse.add("/me/proposals")
+    mod = load(fb.url)
+    ctx = Ctx("bot", config=ON)
+    start(mod, ctx)
+    ctx.call("propose_me", ALICE, {"name": "picked", "note": "r"})
+    ctx.call("propose_me", ALICE, {"note": "again"})
+    check("propose: a request the broker REFUSES switches nothing — the next "
+          "one goes out as the bot's id, asking for it",
+          proposals(fb) == [("bot", "picked"), ("bot", "bot")]
+          and not ctx.saved.get("agent"),
+          f"{proposals(fb)} {ctx.saved.get('agent')}")
     stop(ctx)
     fb.close()
 

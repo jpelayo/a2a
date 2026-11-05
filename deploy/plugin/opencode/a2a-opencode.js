@@ -295,6 +295,10 @@ async function core(host) {
   // directory's name — the compatibility anchor, because that is what every
   // client sent before the store existed and agents are registered under it.
   const dir = (directory || "").split("/").filter(Boolean).pop() || "agent"
+  // What propose_me asks for when given no name and the id is only `dir`:
+  // `<folder>-opencode`, because every harness in a folder derives the same
+  // `dir`, and a request for it is a request for the other harnesses' name.
+  const PROPOSE_SUFFIX = "opencode"
   const STORE = `${process.env.HOME || "."}/.config/opencode/a2a-identity.json`
 
   // node:fs rather than Bun.file, though OpenCode runs on Bun: a Bun-only API
@@ -387,6 +391,17 @@ async function core(host) {
   // Until /me answers, the best guess is that the key names us — which is true
   // for every client that has never renamed itself.
   let name = key
+
+  /** What propose_me asks for when given no name: the current id, unless it
+   *  is only this folder's name, derived because nothing chose one (no
+   *  A2A_AGENT, nothing baked, nothing stored). Every harness in the folder
+   *  derives that same name, so the request is for `<folder>-opencode`.
+   *  Nothing else reads this: the id itself is resolved exactly as before. */
+  async function defaultProposal() {
+    if (explicit || key !== dir) return key
+    if ((await readStore())[directory]) return key
+    return `${dir}-${PROPOSE_SUFFIX}`
+  }
 
   // Settings, from a file that normally is not there. Precedence: the file
   // when it states the key, then the environment, then whatever the installer
@@ -1003,10 +1018,12 @@ async function core(host) {
     // stream keeps running, so the moment an operator adds the id this
     // recovers on its own with no restart.
     const stations = (me.stations || []).join(", ") || "none"
+    const ask = await defaultProposal()
     setupHint =
       `"${key}" is not a registered agent, so the a2a tools will refuse ` +
-      `until it is. Call propose_me to put the name in front of an operator ` +
-      `— it shows up in their console and they approve it with one key, and ` +
+      `until it is. Call propose_me to put a name in front of an operator ` +
+      `— "${ask}" unless you pass name=… — it shows up in their console ` +
+      `and they approve it with one key, and ` +
       `this client connects with no restart. (This token can reach: ` +
       `${stations}.) If you meant to BE an agent that already exists, call ` +
       `rename_me with its id instead — no operator needed.`
@@ -1765,22 +1782,47 @@ async function core(host) {
         "If your token reaches several stations, pass station. A request " +
         "the broker accepts also turns a2a on for this project (as " +
         "enable_a2a_here does), so this agent receives as soon as it is " +
-        "approved.",
-      args: { note: optStr, station: optStr },
+        "approved. Pass name to ask for a name of your choosing; without " +
+        `it, an id that is only this folder's name asks for ` +
+        `"<folder>-${PROPOSE_SUFFIX}" instead, so each harness in a folder ` +
+        "asks for its own. Once the broker takes a request for another " +
+        "name, this client goes by that name (kept for this project, as " +
+        "rename_me keeps one) and connects under it when it is approved. " +
+        "The operator approves or denies the name.",
+      args: { name: optStr, note: optStr, station: optStr },
       async execute(a) {
         const station = (a.station || "").trim()
+        const asked = (a.name || "").trim() || await defaultProposal()
         // Throws on a refusal, so a request the broker did not take turns
-        // nothing on.
+        // nothing on and switches nothing.
         const out = await api("POST", "/me/proposals", {
-          agent_id: key,
+          agent_id: asked,
           note: a.note || "",
           ...(station ? { station } : {}),
         })
-        if (ENABLED) return out
-        await setEnabled(true)
         let res
         try { res = JSON.parse(out) } catch { res = { broker: out } }
         if (!res || typeof res !== "object") res = { broker: res }
+        // The name as the broker filed it (it normalises), which is the
+        // name an operator approves.
+        const filed = typeof res.agent_id === "string" && res.agent_id
+          ? res.agent_id : asked
+        const switched = filed !== key
+        if (switched) {
+          // Go by the requested name from now on, kept for this project as
+          // rename_me keeps one. The live stream still asks for the old id:
+          // closing it reconnects the pump under the new one, which connects
+          // the moment the name is approved.
+          const was = key
+          await pin(filed)
+          key = filed
+          name = filed
+          stream?.abort()
+          res = { ...res, was }
+          log("info", `proposed ${filed} (was ${was}); going by it now`)
+        }
+        if (ENABLED) return switched ? JSON.stringify(res) : out
+        await setEnabled(true)
         return JSON.stringify({
           ...res,
           enabled: true,

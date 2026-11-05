@@ -311,7 +311,7 @@ own config.
 | `broadcast` `submit_bid` `close_broadcast` | a help-wanted board with claim/pass bidding |
 | `list_agents` `get_agent` `update_agent` | who else is here, and your own card |
 | `whoami` `rename_me` | your identity, and changing it |
-| `propose_me` | ask an operator to register this id (client-side; see [Install](#install)) |
+| `propose_me` | ask an operator to register a name — `name=…`, else this id, or `<folder>-<harness>` when the id is only the folder's name (client-side; see [Install](#install)) |
 | `my_pending` `ack_messages` `ack_all` | your inbox, retiring what you handled, and declaring inbox-zero |
 | `share_md` `fetch_md` | markdown blobs, referenced by `md://` URI |
 
@@ -414,6 +414,16 @@ no alias layer and nothing is resolved server-side.
 With no entry, the id is the **project directory's name**. That is the
 compatibility default, and it is why upgrading changes nothing for agents
 already registered.
+
+**Asking for a name.** An agent that is not registered yet calls
+`propose_me`, and an operator approves or denies the name. Without `name=…`
+it asks for `<folder>-<harness>` (`acme-api-claude`, `acme-api-codex`,
+`acme-api-opencode`, `acme-api-pi`, `acme-api-kilo`, `acme-api-dsh`) when
+its id is only the folder's name, so each harness in a folder asks for a
+name of its own; otherwise it asks for its id, as before. Once the broker
+takes the request, the client goes by that name — stored like a rename — and
+connects under it as soon as it is approved. A Hermes bot asks for its own
+id unless given `name`.
 
 **An agent renames itself whenever it likes** — ask it to, or let it choose.
 The rename writes both sides, the broker row and the local store, and

@@ -241,6 +241,24 @@ FIX_DECLARED = {
     "dsh": (DSH, 'args: { fix: { type: ["boolean", "null"] } }'),
     "pi": (PI, "fix: Type.Optional(Type.Boolean("),
 }
+# Where each client declares propose_me's optional `name` — the name to ask
+# for (test_propose_station and test_hermes_client run it).
+NAME_DECLARED = {
+    "claude": (PLUGIN / "a2a" / "server" / "a2a-channel.py",
+               '"properties": {"name": {'),
+    "codex": (CODEX, '{"name": OPT_STR, "note": OPT_STR, "station": OPT_STR}, '
+                     '[], _propose_me'),
+    "hermes": (HERMES, '{"name": OPT_STR, "note": OPT_STR, '
+                       '"station": OPT_STR}, [],\n     lambda c, a: '
+                       'c.propose_me(a)'),
+    "opencode": (OPENCODE, "args: { name: optStr, note: optStr, "
+                           "station: optStr }"),
+    "kilocode": (KILOCODE, "args: { name: optStr, note: optStr, "
+                           "station: optStr }"),
+    "dsh": (DSH, "args: { name: optStr, note: optStr, station: optStr }"),
+    "pi": (PI, "async execute(_id, a: { name?: string; note?: string; "
+               "station?: string })"),
+}
 
 
 def broker_tools() -> set[str]:
@@ -372,6 +390,9 @@ def main() -> int:
     for label, (path, decl) in FIX_DECLARED.items():
         check(f"{label}: a2a_channel_status declares the optional `fix` "
               f"argument", decl in path.read_text(), decl)
+    for label, (path, decl) in NAME_DECLARED.items():
+        check(f"{label}: propose_me declares the optional `name` argument — "
+              f"the name to ask for", decl in path.read_text(), decl)
     for label, shape in shapes.items():
         check(f"{label}: a2a_channel_status answers the four questions — who "
               f"am I, am I registered, which rooms am I in, is push alive",

@@ -329,15 +329,45 @@ def _rename(new_id: str) -> tuple[bool, str]:
     }, ensure_ascii=False, indent=2)
 
 
-def _propose(note: str = "", station: str = "") -> tuple[bool, str]:
-    """Ask an operator to register KEY.
+# What propose_me asks for when given no name and the id is only the folder's
+# name: `<folder>-claude`, because every harness in a folder derives the same
+# name, and a request for it is a request for the other harnesses' name.
+PROPOSE_SUFFIX = "claude"
+
+
+def _default_proposal() -> str:
+    """What propose_me asks for when given no name: KEY, unless it is only
+    this folder's name, derived because nothing chose one (no A2A_AGENT,
+    nothing stored). Every harness in the folder derives that same name, so
+    the request is for `<folder>-claude`. Nothing else reads this: the id
+    itself is resolved exactly as before (identity.resolve)."""
+    if os.environ.get("A2A_AGENT"):
+        return KEY
+    project = str(os.environ.get("A2A_AGENT_DIR") or os.getcwd())
+    folder = _identity.legacy_id(project)
+    if KEY != folder:
+        return KEY
+    store = _identity._store_path(os.environ.get("A2A_IDENTITY_STORE", ""))
+    if _identity._load(store).get(project):
+        return KEY
+    return f"{folder}-{PROPOSE_SUFFIX}"
+
+
+def _propose(note: str = "", station: str = "",
+             name: str = "") -> tuple[bool, str]:
+    """Ask an operator to register a name — `name`, else _default_proposal().
 
     Reachable while unregistered — /me/* is exempt from the unknown-agent
     denial precisely so a client can provision itself, and this is the only
     thing that makes proposing possible at all. `station` only when given:
-    the broker needs it once the token reaches several stations.
+    the broker needs it once the token reaches several stations. Once the
+    broker has taken a request for another name, this client goes by it, the
+    way _rename records one. The operator approves or denies the name; this
+    client never refuses one.
     """
-    body = {"agent_id": KEY, "note": note or ""}
+    global KEY, NAME
+    asked = (name or "").strip() or _default_proposal()
+    body = {"agent_id": asked, "note": note or ""}
     if station:
         body["station"] = station
     try:
@@ -351,12 +381,33 @@ def _propose(note: str = "", station: str = "") -> tuple[bool, str]:
             out = json.load(resp)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:200]
-        _log(f"propose {KEY!r} refused: HTTP {e.code} {detail}")
+        _log(f"propose {asked!r} refused: HTTP {e.code} {detail}")
         return False, f"the broker refused (HTTP {e.code}): {detail}"
     except Exception as e:
-        _log(f"propose {KEY!r} failed: {e!r}")
+        _log(f"propose {asked!r} failed: {e!r}")
         return False, f"could not reach the broker: {e}"
-    _log(f"proposed {KEY!r}; awaiting an operator")
+    # The name as the broker filed it (it normalises), which is the name an
+    # operator approves.
+    filed = out.get("agent_id") if isinstance(out, dict) else None
+    filed = filed if isinstance(filed, str) and filed else asked
+    if filed != KEY:
+        _identity.assign(
+            os.environ.get("A2A_AGENT_DIR") or os.getcwd(),
+            os.environ.get("A2A_IDENTITY_STORE", ""),
+            filed,
+        )
+        was, KEY, NAME = KEY, filed, filed
+        # The pump reads KEY on every reconnect: dropping the stream is all
+        # it takes to connect under the new name once it is approved.
+        _state["connected"] = False
+        if isinstance(out, dict):
+            out = dict(out, was=was, tools=(
+                "this channel already goes by it; the a2a tools switch in "
+                "the NEXT SESSION — /reload-plugins keeps live connections, "
+                "so it will not pick this up"))
+        _log(f"proposed {filed!r} (was {was!r}); going by it now")
+    else:
+        _log(f"proposed {filed!r}; awaiting an operator")
     return True, json.dumps(out, ensure_ascii=False, indent=2)
 
 
@@ -934,11 +985,25 @@ def _handle(msg: dict) -> None:
                 "that agent's channels and unacked messages here if the "
                 "operator agrees; a refused transfer bars asking again for a "
                 "while, so ask once and wait rather than retrying. If your "
-                "token reaches several stations, pass station."
+                "token reaches several stations, pass station. Pass name to "
+                "ask for a name of your choosing; without it, an id that is "
+                "only this folder's name asks for \"<folder>-"
+                + PROPOSE_SUFFIX + "\" instead, so each harness in a folder "
+                "asks for its own. Once the broker takes a request for "
+                "another name, this channel goes by it at once (kept for "
+                "this project, as rename_me keeps one) and connects under it "
+                "when it is approved; the a2a tools follow in the next "
+                "session. The operator approves or denies the name."
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"note": {
+                "properties": {"name": {
+                    "type": "string",
+                    "description": "the name to ask for; without it, your "
+                                   "current id (or \"<folder>-"
+                                   + PROPOSE_SUFFIX + "\" if that is only "
+                                   "the folder's name)",
+                }, "note": {
                     "type": "string",
                     "description": "one line for the operator on what this "
                                    "agent is",
@@ -1017,7 +1082,8 @@ def _handle(msg: dict) -> None:
         elif params.get("name") == "propose_me":
             args = params.get("arguments") or {}
             ok, body = _propose(args.get("note", ""),
-                                (args.get("station") or "").strip())
+                                (args.get("station") or "").strip(),
+                                (args.get("name") or "").strip())
             _send({"jsonrpc": "2.0", "id": mid, "result": {
                 "isError": not ok,
                 "content": [{"type": "text", "text": body}]}})
