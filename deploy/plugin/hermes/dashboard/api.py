@@ -146,8 +146,8 @@ def run(stop=None, wait_s=WAIT_S, rescan_s=RESCAN_S, poll_s=POLL_S,
     while state != "ready":
         if state == "gateway":
             STATUS.update(waited="gateway", note=(
-                "a messaging gateway: no conversation of the Hermes app "
-                "lives here, so there is nothing to wake"))
+                "a gateway: it loads the plugins of every profile it serves "
+                "when it starts, so there is nothing to wake"))
             log.info("a2a: %s", STATUS["note"])
             return
         if time.monotonic() >= deadline or stop.wait(poll_s):

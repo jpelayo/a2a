@@ -831,6 +831,28 @@ def download(ui, targets):
         t.compare()
 
 
+_gateway_chats = []
+
+
+def hermes_runs_chats_in_gateway():
+    """Does this Hermes run its chats in a gateway (Desktop's `hermes gateway
+    ensure`: v0.23.0 and some v0.22.x)? Asked of Hermes itself, read-only and
+    once, because the version numbers would not say: v0.22.1 has it, v0.22.2
+    does not. Its output is read, never shown."""
+    if not _gateway_chats:
+        try:
+            r = subprocess.run(["hermes", "gateway", "--help"],
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT,
+                               text=True, errors="replace", timeout=30)
+            _gateway_chats.append(re.search(r"\bensure\b", r.stdout or "")
+                                  is not None)
+        except (OSError, subprocess.SubprocessError):
+            _gateway_chats.append(False)
+    return _gateway_chats[0]
+
+
 def _hermes_config(home):
     """(a2a plugin enabled, a2a may start turns, a2a switched on by "enable
     a2a here") from a bot's config.yaml.
@@ -1117,7 +1139,15 @@ def next_steps(targets, pending, hermes_touched):
                           + (" and the desktop app (OpenCode 2 reloads the "
                              "plugin by itself)" if key == "opencode"
                              else "") + "."])
-    if hermes_touched:
+    in_gateway = "hermes" in keys and hermes_runs_chats_in_gateway()
+    if hermes_touched and in_gateway:
+        # Its gateway outlives the app, so quitting would reload nothing.
+        steps.append(["Hermes: restart its gateway, so it loads a2a:",
+                      "   hermes gateway restart",
+                      "(Hermes keeps its gateway running after you quit the "
+                      "app, so a2a keeps receiving until you stop it with "
+                      "hermes gateway stop.)"])
+    elif hermes_touched:
         steps.append(["Hermes: quit the Hermes app and open it again, so it "
                       "loads a2a.",
                       "(If you run the Hermes gateway yourself instead, "
@@ -1128,6 +1158,9 @@ def next_steps(targets, pending, hermes_touched):
                           "conversation with this bot that should carry a2a "
                           "and say \"enable a2a here\" (a messaging chat with "
                           "the bot works too).",
+                          "a2a messages go into it while Hermes's gateway "
+                          "runs, whether or not the app shows it."
+                          if in_gateway else
                           "Keep that conversation open: a2a messages go into "
                           "it while it is open, and wait on the broker while "
                           "it is closed."])

@@ -40,6 +40,7 @@ What is pinned, and why each matters:
 Contract with Hermes itself — that these names and signatures exist — is
 tests/test_hermes_contract.py, against a Hermes checkout.
 """
+import contextlib
 import contextvars
 import importlib.util
 import json
@@ -110,7 +111,8 @@ session_context = types.ModuleType("gateway.session_context")
 session_context.get_session_env = (
     lambda name, default="": _TURN.get().get(VAR.get(name, name)) or default)
 session_context.session_is_messaging_surface = (
-    lambda: _TURN.get().get("platform") not in (None, "", "cli", "tui"))
+    lambda: _TURN.get().get("platform") not in (None, "", "cli", "tui",
+                                                "local"))
 gateway.session_context = session_context
 hermes_constants = types.ModuleType("hermes_constants")
 hermes_constants.get_hermes_home = lambda: _HOME.get()
@@ -337,6 +339,23 @@ DESK_ROUTE = {"surface": "desktop", "session_key": DESK["session_key"],
 DESK_ON = {"enabled": True, "route": DESK_ROUTE}
 TUI_ROUTE = {"surface": "desktop", "session_key": TUI["session_key"],
              "ui_session_id": TUI["ui"], "source": "tui"}
+# A chat on a Hermes that runs its chats in a gateway: what gateway/run.py
+# _set_session_env binds for a local session. Platform "local", the session id
+# as the chat id, a route key, and NO source and NO app id. `surface` is what
+# hermes_cli.plugin_session.session_surface() answers from the session's policy.
+GW_ID = "20261106_090000_gggggg"
+GW_KEY = f"agent:main:local:dm:{GW_ID}"
+GW = {"platform": "local", "chat_id": GW_ID, "chat_type": "dm",
+      "user_id": "owner", "session_key": GW_KEY, "surface": "desktop"}
+GW_TUI = dict(GW, surface="tui")
+GW_CLI = dict(GW, surface="cli")
+GW_ACP = dict(GW, surface="acp")
+# A turn with no session policy: session_surface() falls back to the platform.
+GW_BARE = dict(GW, surface="")
+GW_OTHER = dict(GW, chat_id="20261106_091000_hhhhhh",
+                session_key="agent:main:local:dm:20261106_091000_hhhhhh")
+GW_ROUTE = {"surface": "desktop", "session_key": GW_ID, "ui_session_id": "",
+            "source": "desktop", "gateway_key": GW_KEY}
 
 
 def msg(i, text="hello"):
@@ -705,6 +724,7 @@ def main() -> int:
 
     served_artifact()
     desktop()
+    gateway_chats()
     hold()
     tui_route()
     cloned()
@@ -759,6 +779,387 @@ def desktop() -> None:
             os.environ.pop("HERMES_DESKTOP", None)
         else:
             os.environ["HERMES_DESKTOP"] = saved
+
+
+class FakeGateway:
+    """A Hermes that runs its chats in a gateway, as the plugin's client sees
+    it: discovery (which starts nothing), Hermes's own client library, and the
+    chat receipt it writes into the bot's state.db. Hermes takes plugin
+    messages only for a LOADED chat, so opening one puts its key in `live_keys`
+    — and a chat from before the gateway has no receipt until then."""
+
+    def __init__(self, ctx, home):
+        self.ctx, self.home = ctx, home
+        self.calls: list = []
+        self.state = "ready"
+        self.refuse = ""            # session.resume refuses with this
+        self.moved: dict = {}       # an id Hermes answers under another
+        self.connects: list = []
+
+    def discover(self, home):
+        self.calls.append(("discover", Path(home).name))
+        return types.SimpleNamespace(state=self.state, endpoint="endpoint")
+
+    @contextlib.asynccontextmanager
+    async def connect(self, endpoint=None):
+        self.connects.append(endpoint)
+        yield self
+
+    async def rpc(self, method, **params):
+        self.calls.append((method, params))
+        if method != "session.resume":
+            return {"detached": True}
+        if self.refuse:
+            raise RuntimeError(self.refuse)
+        sid = self.moved.get(params["session_id"], params["session_id"])
+        key = f"agent:main:local:dm:{sid}"
+        con = sqlite3.connect(Path(self.home) / "state.db")
+        con.execute("CREATE TABLE IF NOT EXISTS state_meta "
+                    "(key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT OR REPLACE INTO state_meta VALUES (?, ?)",
+                    (f"gateway.local_policy.v1:{sid}",
+                     json.dumps({"session_id": sid, "route": key})))
+        con.commit()
+        con.close()
+        self.ctx.live_keys = set(self.ctx.live_keys) | {key}
+        return {"session_id": sid, "subscription_id": "sub-1"}
+
+    def rpcs(self):
+        return [c for c in self.calls if c[0] != "discover"]
+
+
+def gateway_hermes(on: bool):
+    """Launch on a Hermes that runs its chats in a gateway, or one that does
+    not: the modules that tell, and the ones it opens a chat with."""
+    names = ("hermes_cli", "hermes_cli.plugin_session",
+             "hermes_cli.gateway_runtime_cli", "hermes_cli.gateway_client",
+             "hermes_cli.gateway_runtime")
+    for name in names:
+        sys.modules.pop(name, None)
+    if not on:
+        return
+    pkg = types.ModuleType("hermes_cli")
+    pkg.__path__ = []
+    pkg.__version__ = "0.23.0"
+    surface = types.ModuleType("hermes_cli.plugin_session")
+    surface.session_surface = lambda: (_TURN.get().get("surface")
+                                       or _TURN.get().get("platform") or "")
+    ensure = types.ModuleType("hermes_cli.gateway_runtime_cli")
+    ensure.cmd_gateway_ensure = lambda args: 0
+    sys.modules.update({
+        "hermes_cli": pkg, "hermes_cli.plugin_session": surface,
+        "hermes_cli.gateway_runtime_cli": ensure,
+        "hermes_cli.gateway_client": types.ModuleType("hermes_cli.gateway_client"),
+        "hermes_cli.gateway_runtime":
+            types.ModuleType("hermes_cli.gateway_runtime")})
+
+
+def on_gateway(state=None, gateway=True, home=None):
+    """A bot launched on a gateway Hermes: (broker, plugin, ctx, gateway)."""
+    fb = FakeBroker()
+    mod = load(fb.url)
+    mod.PEEK_S = 0.3
+    ctx = Ctx("bot", gateway=gateway, tui=False, state=state)
+    home = home or tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    gw = FakeGateway(ctx, home)
+    sys.modules["hermes_cli.gateway_client"].connect_gateway = gw.connect
+    sys.modules["hermes_cli.gateway_runtime"].discover_gateway_endpoint = (
+        gw.discover)
+    start(mod, ctx, home)
+    return fb, mod, ctx, gw
+
+
+def gateway_chats() -> None:
+    """A Hermes that runs its chats in a gateway (v0.23.0, some v0.22.x).
+
+    Desktop runs `hermes gateway ensure`, so a chat's turns run in the gateway
+    process: its injector, no TUI injector, and turns that look like GW above.
+    The stubs live only here, so every other scenario in this file is an
+    older Hermes.
+    """
+    hermes_constants.set_hermes_home_override = lambda path: path
+    hermes_constants.reset_hermes_home_override = lambda token: None
+    gateway_hermes(True)
+    try:
+        _gateway_chat()
+        _gateway_working_bot()
+        _gateway_closed()
+        _gateway_restart()
+        _any_hermes()
+    finally:
+        gateway_hermes(False)
+    _older_dashboard()
+
+
+def _gateway_chat() -> None:
+    fb, mod, ctx, gw = on_gateway()
+    ctx.live_keys = {GW_KEY}
+    inst = ctx_inst(ctx)
+
+    for name, turn in (("the classic CLI", GW_CLI), ("an editor (ACP)", GW_ACP),
+                       ("a turn whose client Hermes did not name", GW_BARE)):
+        out = ctx.call("enable_a2a_here", turn, {"enabled": True})
+        check(f"gateway: {name} runs in the gateway too, and a2a cannot be "
+              "turned on there", "error" in out and not ctx.saved.get("route"),
+              str(out))
+
+    out = ctx.call("enable_a2a_here", GW, {"enabled": True})
+    check("gateway: 'enable a2a here' in a chat is accepted — it would refuse "
+          "every chat otherwise, since no session source is bound",
+          out.get("enabled") is True, str(out))
+    check("gateway: the route holds the chat's own id, and the key the "
+          "gateway delivers by", ctx.saved.get("route") == GW_ROUTE,
+          str(ctx.saved.get("route")))
+    check("gateway: the stream opens with no TUI injector at all",
+          until(lambda: "/stream" in fb.calls), str(fb.calls))
+    check("gateway: and no hold: nothing stays attached to the chat",
+          inst.hold["held"] is False and gw.connects == [], str(inst.hold))
+
+    fb.live.put(msg("g1"))
+    check("gateway: a message goes in by the gateway's key, with nothing "
+          "opened: the chat is loaded",
+          until(lambda: "g1" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": GW_KEY}
+          and gw.rpcs() == [], f"{ctx.injected[-1:]} {gw.rpcs()}")
+    content = ctx.injected[-1][0]
+    ctx.turn(GW_OTHER, "s9", content)
+    time.sleep(0.3)
+    check("gateway: a turn in another chat does not count",
+          "g1" not in fb.acked, str(fb.acked))
+    ctx.turn(GW, "s1", content)
+    check("gateway: a turn in the route shows it: acked",
+          until(lambda: "g1" in fb.acked), str(fb.acked))
+
+    fb.live.put(msg("g2"))
+    until(lambda: "g2" in ctx.ids_injected())
+    ctx.turn(GW_BARE, "s1", ctx.injected[-1][0])
+    check("gateway: a turn with no named client is still the route's, so an "
+          "injected message is never left unacked",
+          until(lambda: "g2" in fb.acked), str(fb.acked))
+
+    for name, turn in (("Desktop", GW), ("a TUI on the same chat", GW_TUI)):
+        who = ctx.call("whoami", turn)
+        check(f"gateway: the a2a tools work from {name}",
+              "error" not in json.dumps(who)[:40], str(who)[:200])
+    for name, turn in (("the classic CLI", dict(GW_CLI, chat_id="c",
+                                                session_key="k")),
+                       ("another chat", GW_OTHER)):
+        who = ctx.call("whoami", turn)
+        check(f"gateway: and refuse from {name}",
+              isinstance(who, dict) and "error" in who, str(who)[:200])
+
+    st = ctx.call("a2a_channel_status", GW)
+    check("gateway: the doctor reports the Hermes version and the path",
+          st["push"].get("hermes") == {"version": "0.23.0", "path": "gateway"},
+          str(st["push"].get("hermes")))
+    host = next(c for c in st["checks"] if c["check"] == "push_host")
+    check("gateway: and finds delivery healthy", host["ok"] is True, str(host))
+    stop(ctx)
+    settle()
+    fb.close()
+
+
+def _gateway_working_bot() -> None:
+    """The case that matters most: a bot set up on an older Hermes, whose
+    route is all it has, after Hermes was updated. Nobody opens it, nobody
+    types, and nobody says "enable a2a here"."""
+    saved = {"surface": "desktop", "session_key": GW_ID,
+             "ui_session_id": "a1b2", "source": "desktop"}
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": saved})
+    check("working bot: the stream opens with no turn and nobody there",
+          until(lambda: "/stream" in fb.calls), str(fb.calls))
+    fb.live.put(msg("w1"))
+    check("working bot: a message reaches it, by the key the gateway gave the "
+          "chat", until(lambda: "w1" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": GW_KEY},
+          str(ctx.injected[-1:]))
+    check("working bot: it opened the chat as `hermes sessions adopt` does: "
+          "resume without history, then a plain detach, which arms no close",
+          gw.rpcs() == [("session.resume", {"session_id": GW_ID,
+                                            "omit_messages": True}),
+                        ("session.detach", {"session_id": GW_ID,
+                                            "subscription_id": "sub-1"})],
+          str(gw.rpcs()))
+    check("working bot: it dialled a gateway it discovered, and never one it "
+          "would have to start", gw.connects == ["endpoint"], str(gw.connects))
+    check("working bot: the route keeps what it had and gains the key",
+          ctx.saved.get("route") == dict(saved, gateway_key=GW_KEY),
+          str(ctx.saved.get("route")))
+    ctx.turn(GW, "s1", ctx.injected[-1][0])
+    check("working bot: and the turn it started acks it",
+          until(lambda: "w1" in fb.acked), str(fb.acked))
+    stop(ctx)
+    settle()
+    fb.close()
+
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": saved})
+    gw.moved = {GW_ID: "20261106_099999_tiptip"}
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("w2"))
+    check("working bot: a chat Hermes answers under another id is followed",
+          until(lambda: "w2" in ctx.ids_injected())
+          and ctx.saved["route"]["session_key"] == "20261106_099999_tiptip",
+          str(ctx.saved.get("route")))
+    stop(ctx)
+    settle()
+    fb.close()
+
+
+def _gateway_closed() -> None:
+    """Hermes closes a chat nobody views, then refuses plugin messages into
+    it (gateway/run_plugin_injection.py _plugin_local_session)."""
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": GW_ROUTE})
+    inst = ctx_inst(ctx)
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("c1", "while it was closed"))
+    check("closed: a chat Hermes closed is opened again and delivered, with "
+          "nobody there", until(lambda: "c1" in ctx.ids_injected())
+          and inst._closed_since is None, str(ctx.ids_injected()))
+    stop(ctx)
+    settle()
+    fb.close()
+
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": GW_ROUTE})
+    inst = ctx_inst(ctx)
+    gw.refuse = "launch_credentials_unavailable"
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("c2"))
+    check("refused: what Hermes will not open counts as closed: nothing "
+          "delivered, nothing acked",
+          until(lambda: inst._closed_since is not None)
+          and "c2" not in ctx.ids_injected() and "c2" not in fb.acked,
+          f"{ctx.ids_injected()} {fb.acked}")
+    st = ctx.call("a2a_channel_status", GW)
+    check("refused: the doctor says why",
+          "launch_credentials_unavailable" in (st.get("next_step") or ""),
+          str(st.get("next_step")))
+    gw.refuse = ""
+    check("refused: the peek delivers once Hermes opens it, with no turn",
+          until(lambda: "c2" in ctx.ids_injected()), str(ctx.ids_injected()))
+    stop(ctx)
+    settle()
+    fb.close()
+
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": GW_ROUTE})
+    inst = ctx_inst(ctx)
+    gw.state = "starting"
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("c3"))
+    check("not ready: a gateway still starting is left alone, never dialled "
+          "or started", until(lambda: inst._closed_since is not None)
+          and gw.connects == [], str(gw.connects))
+    stop(ctx)
+    settle()
+    fb.close()
+
+
+def _gateway_restart() -> None:
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": GW_ROUTE})
+    ctx.live_keys = {GW_KEY}
+    check("restart: a saved route opens its stream with no turn",
+          until(lambda: "/stream" in fb.calls), str(fb.calls))
+    stop(ctx)
+    settle()
+    fb.close()
+
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": GW_ROUTE},
+                                  gateway=False)
+    time.sleep(0.3)
+    check("restart: and no process but the gateway takes it",
+          "/stream" not in fb.calls, str(fb.calls))
+    st = ctx.call("a2a_channel_status", GW)
+    host = next(c for c in st["checks"] if c["check"] == "push_host")
+    check("restart: that process says the gateway delivers it",
+          host["ok"] is False and "gateway" in (host["do"] or ""), str(host))
+    stop(ctx)
+    fb.close()
+
+
+def _any_hermes() -> None:
+    """ONE saved state, launched on whichever Hermes: a gateway one, an older
+    one, a gateway one again. Nobody does anything between them."""
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    fb, mod, ctx, gw = on_gateway({"enabled": True, "route": {
+        "surface": "desktop", "session_key": GW_ID, "ui_session_id": "a1b2",
+        "source": "desktop"}}, home=home)
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("v1"))
+    check("any Hermes: on a gateway, by the gateway's key",
+          until(lambda: "v1" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": GW_KEY},
+          str(ctx.injected[-1:]))
+    ctx.turn(GW, "s1", ctx.injected[-1][0])
+    until(lambda: "v1" in fb.acked)
+    stop(ctx)
+    settle()
+    fb.close()
+    saved = dict(ctx.saved)
+
+    gateway_hermes(False)
+    fb = FakeBroker()
+    mod = load(fb.url)
+    old = Ctx("bot", gateway=False, tui=True, state=saved)
+    old.live_keys = {GW_ID}
+    start(mod, old, home)
+    old.turn({"source": "desktop", "session_key": GW_ID, "ui": "a1b2"}, "s2",
+             "hello")
+    check("any Hermes: on an older one the same route opens its stream",
+          until(lambda: "/stream" in fb.calls), str(fb.calls))
+    fb.live.put(msg("v2"))
+    check("any Hermes: and delivers by the conversation's own key",
+          until(lambda: "v2" in old.ids_injected())
+          and old.injected[-1][1] == {"session_key": GW_ID},
+          str(old.injected[-1:]))
+    stop(old)
+    settle()
+    fb.close()
+    saved = dict(old.saved)
+
+    gateway_hermes(True)
+    fb, mod, ctx, gw = on_gateway(saved, home=home)
+    ctx.live_keys = {GW_KEY}
+    until(lambda: "/stream" in fb.calls)
+    fb.live.put(msg("v3"))
+    check("any Hermes: back on a gateway it needs nothing opened, and nobody "
+          "said 'enable a2a here' at any point",
+          until(lambda: "v3" in ctx.ids_injected())
+          and ctx.injected[-1][1] == {"session_key": GW_KEY}
+          and gw.rpcs() == [], f"{ctx.injected[-1:]} {gw.rpcs()}")
+    stop(ctx)
+    settle()
+    fb.close()
+
+    gateway_hermes(False)
+    fb = FakeBroker()
+    mod = load(fb.url)
+    plain = Ctx("bot", gateway=True, tui=False, state=saved)
+    start(mod, plain, home)
+    time.sleep(0.3)
+    check("any Hermes: a messaging gateway on a Hermes without `gateway "
+          "ensure` never takes a conversation it cannot reach",
+          "/stream" not in fb.calls, str(fb.calls))
+    stop(plain)
+    fb.close()
+    gateway_hermes(True)
+
+
+def _older_dashboard() -> None:
+    """A Hermes that had not split hermes_cli.web_server_app out (v0.21.7):
+    its dashboard's lifespan lives in hermes_cli.web_server, and the hold must
+    work there too, or the floor would have to rise."""
+    srv = hold_in_table({})
+    srv._methods = {"session.resume": lambda *a: None}
+    mod = load("http://127.0.0.1:1")
+    try:
+        check("floor: no dashboard modules, no dashboard",
+              mod._dashboard_server() is None)
+        sys.modules["hermes_cli.web_server"] = types.ModuleType(
+            "hermes_cli.web_server")
+        check("floor: hermes_cli.web_server counts as one",
+              mod._dashboard_server() is srv)
+    finally:
+        sys.modules.pop("hermes_cli.web_server", None)
+        _no_tui_gateway()
 
 
 def _desktop_route() -> None:

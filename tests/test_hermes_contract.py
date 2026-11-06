@@ -15,6 +15,17 @@ rise.
 The plugin was written against main ee36aed (2026-10-12), latest release
 v0.21.7.
 
+NAMES ARE NOT ENOUGH. Every name below still existed on v0.23.0, and this file
+passed there, while Desktop chats would have stopped working: Hermes had moved
+them into its gateway, whose turns look nothing like the ones the plugin knew.
+So gateway_chats() also pins WHERE a chat runs and what its turn binds. It runs
+on any tree with gateway/session_authority.py, and the tags are not in order
+(v0.22.1 has Desktop on the gateway, v0.22.2 does not), so the plugin decides
+from each turn and never from a version.
+
+The older checks accept either place a name has lived, because Hermes split
+web_server.py and server.py after v0.21.7, and the plugin's floor stays there.
+
 SKIPs (exit 2) when HERMES_SRC does not point at a checkout: nothing has been
 checked, and saying so is the only honest outcome.
 """
@@ -157,6 +168,119 @@ def is_property(fn) -> bool:
                ("property", "cached_property") for d in fn.decorator_list)
 
 
+def gateway_chats(src: Path) -> None:
+    """A Hermes that runs its chats in a gateway: where a chat runs, what its
+    turn binds, and what the plugin and the installer rely on there."""
+    if not (src / "gateway" / "session_authority.py").is_file():
+        print("---- no session authority in this tree: the gateway checks do "
+              "not apply")
+        return
+
+    def read(rel):
+        p = src / rel
+        return p.read_text() if p.is_file() else ""
+
+    def fn_text(rel, name):
+        text = read(rel)
+        fn = find(ast.parse(text), (ast.FunctionDef, ast.AsyncFunctionDef),
+                  name) if text else None
+        return (ast.get_source_segment(text, fn) or "") if fn else ""
+
+    check("Desktop starts a local profile's GATEWAY, not `hermes serve` — so "
+          "a chat's turns run there",
+          "['gateway', 'ensure', '--json']"
+          in read("apps/desktop/electron/main.ts"), "")
+    env = fn_text("gateway/run.py", "_set_session_env")
+    check("a gateway turn binds the platform, the chat id and the route key",
+          "platform=source.platform.value" in env
+          and "chat_id=source.chat_id" in env
+          and "session_key=context.session_key" in env, env[:300])
+    check("and NO session source and NO app id — why the plugin cannot know "
+          "a chat by HERMES_SESSION_SOURCE there",
+          env != "" and re.search(r"[(,\s]source=", env) is None
+          and "ui_session_id=" not in env, env[:300])
+    surface = fn_text("hermes_cli/plugin_session.py", "session_surface")
+    check("session_surface() names a local session's client from its policy",
+          "policy.platform" in surface
+          and "HERMES_SESSION_PLATFORM" in surface, surface[:300])
+    policy = read("gateway/session_policy.py")
+    check("a policy's platform is desktop, tui, cli or acp",
+          "SURFACES = {'cli': 'cli', 'tui': 'tui', 'gui': 'desktop', "
+          "'acp': 'acp'" in policy, "")
+    check("a local session's platform is LOCAL and its chat id the session id",
+          "SessionSource(platform=Platform.LOCAL, chat_id=chat_id"
+          in read("gateway/session_local_recovery.py")
+          and "local_source(authority, sid, actor.subject)"
+          in read("gateway/session_local.py"), "")
+    check("an old chat keeps its id when the gateway adopts it — what carries "
+          "a saved route over",
+          "historical ID becomes the stable logical owner"
+          in read("gateway/session_local_migration.py"), "")
+    inject = read("hermes_cli/plugins_injection.py")
+    check("inject_message(session_key=) with no TUI injector goes to the "
+          "gateway, for the plugin's own home",
+          '"session_key": session_key, "plugin_home": manager.home_path'
+          in inject, "")
+    live = fn_text("gateway/run_plugin_injection.py", "_plugin_local_session")
+    check("and the gateway takes it only for a chat that is LIVE, under that "
+          "key", "authority.sessions.get(source.chat_id)" in live
+          and "live.route == session_key" in live, live[:300])
+    check("a closed chat leaves the live map — why a chat must stay open",
+          "del authority.sessions[session_id]"
+          in read("gateway/session_retirement.py"), "")
+    adopt = read("hermes_cli/sessions_adopt.py")
+    check("session.resume then a plain session.detach is how Hermes itself "
+          "adopts an old chat: what the plugin does for a working bot",
+          "client.rpc('session.resume'" in adopt
+          and "client.rpc('session.detach'" in adopt, "")
+    check("session.resume takes omit_messages on the gateway's wire, which "
+          "refuses unknown keys",
+          "omit_messages: bool = False"
+          in read("tui_gateway/contracts/canonical_sessions.py"), "")
+    detach = fn_text("gateway/session_authority.py", "detach")
+    check("a detach with no reason closes nothing and arms no close: only "
+          "end_reason and a lost socket (orphaned) do",
+          "if end_reason:" in detach and "if orphaned:" in detach, detach[:300])
+    check("and session.resume reopens a chat Hermes closed: attach restores it",
+          "restore_local_session(authority, ref.session_id)"
+          in read("gateway/session_local_migration.py"), "")
+    owner = read("hermes_cli/sessions_owner.py")
+    check("discover_gateway_endpoint never starts a gateway, and "
+          "connect_gateway(endpoint) dials it as it is — Hermes's own "
+          "maintenance path, and the plugin's",
+          "Discovery only: never starts one" in owner
+          and "connect_gateway(endpoint)" in owner
+          and "def discover_gateway_endpoint("
+          in read("hermes_cli/gateway_runtime.py"), "")
+    check("the home override scopes it to this bot",
+          "def set_hermes_home_override(" in read("hermes_constants.py"), "")
+    state = read("hermes_state_local.py")
+    check("a chat's receipt is state_meta 'gateway.local_policy.v1:<id>', "
+          "with its route: the key the plugin delivers by",
+          "POLICY_PREFIX = 'gateway.local_policy.v1:'" in state
+          and "receipt['route']" in state, "")
+    load = fn_text("gateway/run_adapters.py", "_load_secondary_profile_config")
+    check("a multiplexed gateway loads each served profile's plugins at boot "
+          "— why nothing needs waking there",
+          "_profile_runtime_scope(profile_home" in load
+          and "discover_plugins()" in load, load[:300])
+    check("`hermes gateway ensure` is a listed subcommand: the installer "
+          "reads `hermes gateway --help` to tell",
+          re.search(r'add_parser\(\s*"ensure"',
+                    read("hermes_cli/subcommands/gateway.py")) is not None, "")
+    check("hermes_cli.__version__ exists: what the doctor reports",
+          "__version__" in read("hermes_cli/__init__.py"), "")
+    plugin = CLIENT.read_text()
+    check("the plugin reads the surface through hermes_cli.plugin_session",
+          "from hermes_cli.plugin_session import session_surface" in plugin, "")
+    check("and tells a gateway Hermes by cmd_gateway_ensure, which exists here",
+          "from hermes_cli.gateway_runtime_cli import cmd_gateway_ensure"
+          in plugin and "def cmd_gateway_ensure("
+          in read("hermes_cli/gateway_runtime_cli.py"), "")
+    check("its receipt prefix is Hermes's",
+          'CHAT_RECEIPT = "gateway.local_policy.v1:"' in plugin, "")
+
+
 def main() -> int:
     src = Path(os.environ.get("HERMES_SRC") or "")
     if not str(src) or not (src / "hermes_cli" / "plugins.py").is_file():
@@ -281,7 +405,8 @@ def main() -> int:
     # so a bot's own chat on a gateway reached by URL is "tui".
     af = src / "tui_gateway" / "agent_factory.py"
     af_text = af.read_text() if af.is_file() else ""
-    plat = (af_text.split("def _resolve_session_platform", 1) + [""])[1][:800]
+    plat = ((af_text + srv.read_text()).split(
+        "def _resolve_session_platform", 1) + [""])[1][:800]
     check("_resolve_session_platform answers 'desktop' or else 'tui'",
           '"desktop"' in plat and '"tui"' in plat
           and "HERMES_DESKTOP" in plat, plat[:300])
@@ -302,7 +427,7 @@ def main() -> int:
           hs.is_file() and 'get_hermes_home() / "state.db"' in hs.read_text(),
           "")
     reg = src / "tui_gateway" / "session_registry.py"
-    reg_text = reg.read_text() if reg.is_file() else ""
+    reg_text = (reg.read_text() if reg.is_file() else "") + srv.read_text()
     check("a conversation's session key is a new session id",
           re.search(r"def _new_session_key\(\)[^:]*:\s*return new_session_id"
                     r"\(\)", reg_text) is not None, "")
@@ -385,7 +510,7 @@ def main() -> int:
     check("a record made with nothing bound falls back to stdout — why the "
           "plugin always binds its own",
           "current_transport() or _stdio_transport"
-          in text_of("tui_gateway/session_registry.py"), "")
+          in text_of("tui_gateway/session_registry.py") + srv_text, "")
     ms = text_of("tui_gateway/methods_session.py")
     reuse = (ms.split("def _resume_reuse_live_locked", 1) + [""])[1][:1500]
     check("session.resume on a loaded conversation attaches the CALLER's "
@@ -431,8 +556,11 @@ def main() -> int:
           in text_of("tui_gateway/session_lifecycle.py"), "")
     check("server._profile_home resolves a profile name (None: the launch "
           "home)", "def _profile_home(profile" in srv_text, "")
-    check("the dashboard's modules are hermes_cli.web_server_app",
-          (src / "hermes_cli" / "web_server_app.py").is_file(), "")
+    check("the dashboard's modules are hermes_cli.web_server_app, or "
+          "hermes_cli.web_server before Hermes split it — both of which "
+          "_dashboard_server looks for",
+          (src / "hermes_cli" / "web_server_app.py").is_file()
+          or "async def _lifespan(" in text_of("hermes_cli/web_server.py"), "")
 
     # When a dashboard is one: the order `hermes serve` starts in. Added
     # 2026-11-01 after a real deploy: a plugin that decided at load never
@@ -466,13 +594,15 @@ def main() -> int:
     check("the dashboard's own lifespan installs the desktop injector — the "
           "end of startup the waker waits for",
           "install_tui_message_injector()"
-          in body(wsa, "standalone_lifespan", 9000), "")
-    check("a gateway that mounts the dashboard runs http_lifespan instead, "
-          "which installs no desktop injector",
-          "http_lifespan if getattr(app.state, \"gateway_runner\", None) is "
-          "not None else standalone_lifespan" in wsa
-          and "install_tui_message_injector" not in body(wsa, "http_lifespan"),
-          "")
+          in (body(wsa, "standalone_lifespan", 9000) if wsa
+              else body(ws, "_lifespan", 9000)), "")
+    if wsa:
+        check("a gateway that mounts the dashboard runs http_lifespan instead, "
+              "which installs no desktop injector",
+              "http_lifespan if getattr(app.state, \"gateway_runner\", None) "
+              "is not None else standalone_lifespan" in wsa
+              and "install_tui_message_injector"
+              not in body(wsa, "http_lifespan"), "")
     for prop in ("has_tui_message_injector", "has_gateway_message_injector"):
         fn = find(mgr, ast.FunctionDef, prop)
         check(f"PluginManager.{prop} is a property", fn is not None
@@ -532,6 +662,7 @@ def main() -> int:
     check("plugins_cmd._get_enabled_set reads plugins.enabled",
           re.search(r"_get_enabled_set\s*=.*\"plugins\",\s*\"enabled\"",
                     text_of("hermes_cli/plugins_cmd.py")) is not None, "")
+    gateway_chats(src)
 
     # plugin.yaml: every key the plugin's manifest uses is one Hermes reads.
     manifest_src = ""

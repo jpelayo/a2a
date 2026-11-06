@@ -227,6 +227,30 @@ a2a messages arrive as turns in **one place** of the bot, chosen by saying
 Say *"turn a2a off here"* to stop it; say *"enable a2a here"* somewhere else
 to move it.
 
+**Whichever Hermes you launch.** Newer Hermes runs its chats in a gateway
+instead of `hermes serve`. The plugin finds out which it is on at every launch
+and works on both, so a bot that works keeps working, on any of them and going
+back and forth, with nothing to do and nothing to enable again.
+`a2a_channel_status` shows what it found under `push.hermes`.
+
+| Hermes | Chats run in | Checked |
+|---|---|---|
+| v0.21.7, v0.22.0 | `hermes serve` | source read |
+| v0.23.0 | a gateway | source read |
+
+On a Hermes with the gateway:
+
+- A bot receives with nobody at the app: a2a opens the conversation itself when
+  a message needs it, the way `hermes sessions adopt` does. It changes no Hermes
+  setting and leaves nothing running of its own.
+- Restart with `hermes gateway restart`: quitting the app no longer reloads
+  a2a, because Hermes keeps its gateway running after the app closes.
+- For the same reason **a2a keeps receiving after you quit the app**, until you
+  run `hermes gateway stop`.
+
+Worked out from Hermes's source and tested against a fake of it, not yet run on
+a real one.
+
 **Updating** is the same command. A client that is behind the broker says so
 once — in the session, its log or its status — and names this command. Restart
 that harness's sessions afterwards: Claude Code's `/reload-plugins` does not
@@ -662,7 +686,8 @@ the broker is fine and the client is not receiving — check, in this order:
   push is on.
 - **Hermes**: a2a arrives only in the conversation it was enabled in, and
   only while that conversation is open in the Hermes app (or, for a messaging
-  chat, while the bot's gateway runs); it may inject only with
+  chat or a Hermes that runs its chats in a gateway, while that gateway runs);
+  it may inject only with
   `allow_gateway_injection`. `a2a_channel_status`, asked there, names the
   missing piece.
 - **Kilo Code**: only plain `kilo` receives — a `kilo daemon` you started, or

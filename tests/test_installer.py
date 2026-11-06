@@ -135,7 +135,9 @@ class FakeBroker:
 # A machine: HOME with harness folders, fake harness binaries on PATH
 # ---------------------------------------------------------------------------
 
-def machine(root: Path):
+def machine(root: Path, gateway_chats=False):
+    """`gateway_chats`: a Hermes that runs its chats in a gateway, which is
+    how the installer tells: `hermes gateway --help` lists `ensure`."""
     home, bin_, cwd = root / "home", root / "bin", root / "cwd"
     for d in (home / ".claude", home / ".config" / "opencode",
               home / ".pi" / "agent", home / ".codex",
@@ -152,10 +154,19 @@ def machine(root: Path):
         # gateway restart on a real machine with a screenful of text.
         p.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n'
                      'echo "JUNK-OUT $*"; echo "JUNK-ERR $*" >&2\n'
-                     'case "$*" in "-p bot1 plugins enable a2a") exit 1;; '
+                     + ('[ "$*" = "gateway --help" ] && echo "  ensure  '
+                        'Ensure a local runtime"\n'
+                        if gateway_chats and name == "hermes" else "")
+                     + 'case "$*" in "-p bot1 plugins enable a2a") exit 1;; '
                      'esac\n')
         p.chmod(0o755)
     return home, bin_, cwd, log
+
+
+def commands(log: Path) -> list:
+    """What was run, without the read-only look at `hermes gateway --help`."""
+    ran = log.read_text().splitlines() if log.is_file() else []
+    return [r for r in ran if r != "hermes gateway --help"]
 
 
 def snapshot(root: Path) -> dict:
@@ -319,7 +330,7 @@ def main() -> int:
               and '"profile": "bot1"' in (hb / "__init__.py").read_text())
         check("fresh: a profile folder with no Hermes identity file is no bot",
               not (home / ".hermes" / "profiles" / "empty" / "plugins").exists())
-        ran = log.read_text().splitlines() if log.is_file() else []
+        ran = commands(log)
         want = [f"codex mcp add a2a -- python3 {cx}",
                 "hermes -p default plugins enable a2a",
                 "hermes -p default config set "
@@ -341,6 +352,8 @@ def main() -> int:
         check("fresh: the Hermes step is to quit the app and open it again",
               "quit the Hermes app and open it again" in steps
               and "gateway restart" not in out, steps[:1200])
+        check("fresh: a Hermes with no gateway chats gets no warning and no "
+              "setting changed", "orphan_end_grace_s" not in out, out[-1500:])
         check("fresh: the next steps name what no installer can do",
               "plugin:a2a@skills-dir" in steps and "enable a2a here" in steps
               and "app-server --listen unix://" in steps, steps[:1500])
@@ -406,7 +419,7 @@ def main() -> int:
               "Hermes bot 'bot1': in the Hermes app" in steps
               and "Hermes bot 'default': in the Hermes app" not in steps,
               steps[:1500])
-        ran = log.read_text().splitlines() if log.is_file() else []
+        ran = commands(log)
         check("update: only the setup not yet done is offered — the default "
               "bot's config already has a2a enabled and allowed",
               ran == ["hermes -p bot1 plugins enable a2a",
@@ -621,6 +634,32 @@ def main() -> int:
               "receives, and where the privacy settings are",
               "restart dsh web" in out and "plain `kilo`" in out
               and "telemetry" in out and "README" in out, out[-1800:])
+
+        # --- a Hermes that runs its chats in a gateway ------------------------
+        m7 = root / "m7"
+        home, bin_, cwd, log = machine(m7, gateway_chats=True)
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all", TOKEN, "", "all", "botd",
+            "y",            # install
+            "y",            # run the commands
+        ])
+        check("gateway: the installer finishes", code == 0, out[-1500:])
+        ran = commands(log)
+        check("gateway: it changes no Hermes setting and warns of nothing: the "
+              "plugin opens a chat itself when a message needs it",
+              "orphan_end_grace_s" not in out + "\n".join(ran)
+              and "Warning" not in out, out[-1500:])
+        check("gateway: Hermes is asked once whether it runs chats in a "
+              "gateway", log.read_text().splitlines().count(
+                  "hermes gateway --help") == 1, log.read_text())
+        steps = out.split("Next steps", 1)[-1]
+        check("gateway: the next step restarts its gateway, since it outlives "
+              "the app — and the installer runs no restart itself",
+              "hermes gateway restart" in steps
+              and "quit the Hermes app" not in steps
+              and not any("gateway restart" in r for r in ran), steps[:1500])
+        check("gateway: and it says a2a keeps receiving after the app quits",
+              "keeps receiving" in steps, steps[:1500])
     finally:
         broker.close()
 

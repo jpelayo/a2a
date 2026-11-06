@@ -243,7 +243,8 @@ def main() -> int:
     check("gateway: with only the gateway's injector it stops at once, says "
           "so, and wakes nothing",
           CALLS == [] and mod.STATUS["waited"] == "gateway"
-          and "messaging gateway" in (mod.STATUS["note"] or "")
+          and "loads the plugins of every profile"
+          in (mod.STATUS["note"] or "")
           and time.time() - t0 < 5, f"{CALLS} {mod.STATUS}")
     MANAGER.has_gateway_message_injector = False
 

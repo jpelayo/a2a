@@ -42,6 +42,22 @@ ROUTE — and there are two kinds:
   plugin (dashboard/api.py) starts every a2a bot's plugin, so each takes its
   hold without being opened.
 
+  The same route on a Hermes that runs its chats IN A GATEWAY (v0.23.0 and
+  some v0.22.x: Desktop's `hermes gateway ensure`). ONE record serves every
+  Hermes, and which path it takes is decided in each process, every launch,
+  by _chats_in_gateway() and never saved: the tags are not in order (v0.22.1
+  has it, v0.22.2 does not), so no version is read, and the same bot goes back
+  and forth between Hermes versions with nothing to do. There a turn binds
+  platform "local", no source and no app id; the chat id is the conversation's
+  own id, the very `session_key` a route saved before holds, and `gateway_key`
+  is what the gateway delivers by. A chat Hermes has not loaded refuses plugin
+  messages, and one from before the gateway has no key yet, so the plugin
+  opens it itself when a message needs it, exactly as `hermes sessions adopt`
+  does: session.resume, then a plain session.detach. So a working bot receives
+  with nobody at the app, nothing holds a connection, and no Hermes setting is
+  touched. No hold and no waking there: the gateway loads every served
+  profile's plugins when it starts.
+
   a MESSAGING CHAT of the bot. ctx.inject_message(text, origin=<chat>) asks
   the bot's gateway to run a turn in that chat; the reply goes back to it.
 
@@ -249,15 +265,81 @@ DESKTOP = "desktop"
 # source, so on a gateway it reaches by URL that chat is "tui". The injector
 # does not care which (tui_gateway/plugin_inject.py), so neither does this.
 CONVERSATION_SOURCES = ("desktop", "tui")
+# The platform a gateway binds for a local session's turn (Platform.LOCAL).
+LOCAL = "local"
+# Where a gateway keeps a local chat's receipt, in state.db's state_meta: a
+# JSON value whose `route` is the key the gateway delivers by
+# (hermes_state_local.py POLICY_PREFIX).
+CHAT_RECEIPT = "gateway.local_policy.v1:"
 # How often a route conversation that is closed in the app is looked at again.
 PEEK_S = 30.0
+
+
+def _surface():
+    """The client of the current turn as Hermes names it: `desktop`, `tui`,
+    `cli`, `acp`, or the bound platform when the turn has no session policy.
+    "" on a Hermes without it."""
+    try:
+        from hermes_cli.plugin_session import session_surface
+        return str(session_surface() or "")
+    except Exception:
+        return ""
+
+
+def _hermes_version():
+    """Reported, never branched on: the tags are not in order."""
+    try:
+        import hermes_cli
+        return str(getattr(hermes_cli, "__version__", "") or "") or None
+    except Exception:
+        return None
+
+
+_gateway_chats = []
+
+
+def _chats_in_gateway():
+    """Does this Hermes run its chats in a gateway? Decided here, in this
+    process, for this launch, and never saved: the same bot may next run on a
+    Hermes that does not. Desktop's `hermes gateway ensure` is the mark, because
+    the version numbers would not say (v0.22.1 has it, v0.22.2 does not). The
+    installer reads the same fact from `hermes gateway --help`."""
+    if not _gateway_chats:
+        try:
+            from hermes_cli.gateway_runtime_cli import cmd_gateway_ensure
+            _gateway_chats.append(callable(cmd_gateway_ensure))
+        except Exception:
+            _gateway_chats.append(False)
+    return _gateway_chats[0]
+
+
+def _gateway_here():
+    """The current turn's conversation in a gateway, or None. A gateway binds
+    platform "local", no source and no app id (gateway/run.py
+    _set_session_env). Its chat id is the conversation's own id, which
+    survives compression and which a chat from before the gateway keeps: the
+    `session_key` of the route on any Hermes. HERMES_SESSION_KEY is the route
+    key the gateway delivers by. `cli` and `acp` are local too, and are no
+    conversation. A turn whose client Hermes did not name may still be the
+    route's own, so it is returned for matching; may_open() keeps it from
+    starting a route."""
+    if _session("HERMES_SESSION_PLATFORM") != LOCAL:
+        return None
+    chat = _session("HERMES_SESSION_CHAT_ID")
+    key = _session("HERMES_SESSION_KEY")
+    surface = _surface()
+    named = surface in CONVERSATION_SOURCES
+    if not chat or not key or not (named or surface in ("", LOCAL)):
+        return None
+    return {"surface": DESKTOP, "session_key": chat, "ui_session_id": "",
+            "source": surface if named else LOCAL, "gateway_key": key}
 
 
 def _desktop_here():
     """The current turn's conversation, or None outside one."""
     source = _session("HERMES_SESSION_SOURCE")
     if source not in CONVERSATION_SOURCES:
-        return None
+        return _gateway_here()
     key = _session("HERMES_SESSION_KEY")
     if not key:
         return None
@@ -266,19 +348,73 @@ def _desktop_here():
             "source": source}
 
 
+def may_open(turn):
+    """May `turn` become the route? Not one whose client Hermes did not name:
+    that may be the classic CLI, which runs in the gateway too."""
+    return bool(turn) and turn.get("source") != LOCAL
+
+
 def is_desktop(route):
     return bool(route) and route.get("surface") == DESKTOP
 
 
 def same_conversation(turn, route):
     """Is `turn` (from _desktop_here) in the app conversation `route` names?
-    Either id matching is enough; the caller then records the other."""
+    Any id matching is enough; the caller then records the others."""
     if not turn or not is_desktop(route):
         return False
     if turn["session_key"] == route.get("session_key"):
         return True
     ui = turn.get("ui_session_id")
-    return bool(ui) and ui == route.get("ui_session_id")
+    if ui and ui == route.get("ui_session_id"):
+        return True
+    gateway_key = turn.get("gateway_key")
+    return bool(gateway_key) and gateway_key == route.get("gateway_key")
+
+
+def _open_chat(home, session_id):
+    """Load the chat `session_id` in this bot's gateway and leave it loaded:
+    what `hermes sessions adopt` does for each old chat. session.resume adopts
+    a chat from before the gateway and reopens a closed one, and a plain
+    session.detach is a client handing it back, which arms no close. Discovery
+    only: this never starts a gateway. Returns the id Hermes answers under."""
+    import asyncio
+    from hermes_cli.gateway_client import connect_gateway
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from hermes_constants import (reset_hermes_home_override,
+                                  set_hermes_home_override)
+
+    async def resume(endpoint):
+        async with connect_gateway(endpoint) as client:
+            snapshot = await client.rpc("session.resume", session_id=session_id,
+                                        omit_messages=True)
+            sid = snapshot.get("session_id") or session_id
+            await client.rpc("session.detach", session_id=sid,
+                             subscription_id=snapshot["subscription_id"])
+            return sid
+
+    token = set_hermes_home_override(str(home))
+    try:
+        found = discover_gateway_endpoint(Path(home).resolve())
+        if found.state != "ready":
+            raise RuntimeError(f"the gateway is {found.state}")
+        return asyncio.run(resume(found.endpoint))
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _chat_gateway_key(home, session_id):
+    """The key the gateway delivers chat `session_id` by, from its receipt in
+    the bot's state.db. Read only. "" when it has none."""
+    db = Path(home) / "state.db"
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True,
+                          timeout=2)
+    try:
+        row = con.execute("SELECT value FROM state_meta WHERE key = ?",
+                          (CHAT_RECEIPT + session_id,)).fetchone()
+    finally:
+        con.close()
+    return str(json.loads(row[0]).get("route") or "") if row else ""
 
 
 def _live_key(ui_session_id):
@@ -371,11 +507,13 @@ class _Hold:
 
 def _dashboard_server():
     """Hermes's session server where a dashboard's modules are loaded
-    (hermes_cli.web_server_app, and the session handlers installed), else
-    None. Read from sys.modules only, never imported. Not proof by itself: a
-    messaging gateway that mounts the dashboard has them too, and only the
-    desktop injector (_hold_wanted) says the app's conversations live here."""
-    if "hermes_cli.web_server_app" not in sys.modules:
+    (hermes_cli.web_server_app, or hermes_cli.web_server on a Hermes that had
+    not split it out, and the session handlers installed), else None. Read
+    from sys.modules only, never imported. Not proof by itself: a messaging
+    gateway that mounts the dashboard has them too, and only the desktop
+    injector (_hold_wanted) says the app's conversations live here."""
+    if ("hermes_cli.web_server_app" not in sys.modules
+            and "hermes_cli.web_server" not in sys.modules):
         return None
     srv = sys.modules.get("tui_gateway.server")
     methods = getattr(srv, "_methods", None)
@@ -1063,6 +1201,8 @@ class A2AHermes:
         # stream stays closed, so the broker keeps new messages undelivered,
         # and a peek every PEEK_S (or a turn there) looks again.
         self._closed_since = None
+        # Why the gateway last refused to open the route's chat, for the doctor.
+        self._open_error = ""
         # A turn of the route's app conversation ran in THIS process: then
         # this is the process that serves it, whatever its environment says.
         self._route_here = False
@@ -1138,7 +1278,8 @@ class A2AHermes:
                      f"({A2A_BAKED.get('agent')!r}) was installed for "
                      f"another profile and copied here with it; it is "
                      f"ignored")
-        self.log(f"loaded as {self.key} in profile {self.profile!r}; "
+        self.log(f"loaded as {self.key} in profile {self.profile!r} on "
+                 f"Hermes {_hermes_version() or '(version unknown)'}; "
                  + (f"a2a is on in {self._chat_label(self.route)}"
                     if self.enabled and self.route else
                     "a2a is off until its owner says 'enable a2a here'"))
@@ -1394,23 +1535,43 @@ class A2AHermes:
     def _host_ok(self):
         """Can THIS process deliver into the route? Exactly one process can:
         the gateway for a messaging chat, the process serving it for a
-        conversation — so no two ever hold one bot's stream."""
-        return (self._desktop_backend() if is_desktop(self.route)
-                else self._gateway())
+        conversation — which on a Hermes that runs its chats in a gateway is
+        that gateway — so no two ever hold one bot's stream."""
+        if is_desktop(self.route):
+            return self._desktop_backend() or self._gateway_delivers()
+        return self._gateway()
+
+    def _gateway_delivers(self):
+        """Does this gateway deliver the bot's conversations? On a Hermes
+        without `gateway ensure` a gateway is a messaging one, and must never
+        take a conversation it cannot reach."""
+        return (self._gateway() and not self._tui_injector()
+                and _chats_in_gateway())
+
+    def _path(self):
+        """How this process delivers conversations, for the doctor."""
+        if self._tui_injector():
+            return "backend"
+        return "gateway" if self._gateway_delivers() else None
 
     def _follow(self, turn):
         """Record the ids `turn` shows for the route conversation, when one
         of them moved (a compressed conversation's new key, a reconnected
-        app's new id)."""
+        app's new id, the key a gateway gave it)."""
         if not turn or not is_desktop(self.route):
             return
+        gateway_key = (turn.get("gateway_key")
+                       or self.route.get("gateway_key") or "")
         if (turn["session_key"] == self.route.get("session_key")
                 and (not turn["ui_session_id"] or turn["ui_session_id"]
-                     == self.route.get("ui_session_id"))):
+                     == self.route.get("ui_session_id"))
+                and gateway_key == (self.route.get("gateway_key") or "")):
             return
         route = dict(self.route, session_key=turn["session_key"],
                      ui_session_id=(turn["ui_session_id"]
                                     or self.route.get("ui_session_id") or ""))
+        if gateway_key:
+            route["gateway_key"] = gateway_key
         self.route = route
         try:
             self._set("route", route)
@@ -1667,6 +1828,8 @@ class A2AHermes:
         raw = a.get("enabled")
         on = raw is True or str(raw).lower() == "true"
         desk = _desktop_here()
+        if not may_open(desk):
+            desk = None
         here = None
         if desk is not None:
             # An app conversation: always the operator's own, so always
@@ -1742,6 +1905,11 @@ class A2AHermes:
         if not on:
             step = ("Tell the human a2a is off for this bot. Nothing is "
                     "delivered until they turn it on again.")
+        elif desk is not None and desk.get("gateway_key"):
+            step = ("Tell the human a2a is on for this bot in this "
+                    "conversation, connecting now — no restart. a2a messages "
+                    "arrive here whenever Hermes's gateway runs, open in the "
+                    "app or not.")
         elif desk is not None and _dashboard_server() is not None:
             step = ("Tell the human a2a is on for this bot in this "
                     "conversation of the Hermes app, connecting now — no "
@@ -1978,8 +2146,8 @@ class A2AHermes:
             return "a2a turned off for this bot; closing the stream"
         if not self._host_ok():
             return ("the Hermes app's backend went away; closing the stream"
-                    if is_desktop(self.route) else
-                    "the gateway went away; closing the stream")
+                    if is_desktop(self.route) and not _chats_in_gateway()
+                    else "the gateway went away; closing the stream")
         if self.key != stream_key:
             return "agent id changed; reconnecting"
         if self._reconnect.is_set():
@@ -2122,6 +2290,8 @@ class A2AHermes:
         a conversation open in the app, by its CURRENT key. A refusal may be
         a key Hermes rotated while compressing, so the conversation's live
         key is looked up once by its app id before calling it closed."""
+        if self._gateway_delivers():
+            return self._inject_in_gateway(text, route)
         key = route.get("session_key") or ""
         if self.ctx.inject_message(text, "user", session_key=key):
             return True
@@ -2134,6 +2304,43 @@ class A2AHermes:
         if self._closed_since is None:
             self._closed_since = time.time()
         return False
+
+    def _inject_in_gateway(self, text, route):
+        """Queue `text` on the route's chat in a gateway, by its gateway key.
+        Hermes takes it only for a LOADED chat, and a chat from before the
+        gateway has no key yet, so either way the chat is opened and it is
+        tried once more: a working bot receives with nobody at the app. What
+        Hermes refuses to open counts as closed, as a closed app conversation
+        does: nothing is lost, and the peek tries again."""
+        key = route.get("gateway_key") or ""
+        if key and self.ctx.inject_message(text, "user", session_key=key):
+            return True
+        key = self._open_in_gateway(route)
+        if key and self.ctx.inject_message(text, "user", session_key=key):
+            return True
+        if self._closed_since is None:
+            self._closed_since = time.time()
+        return False
+
+    def _open_in_gateway(self, route):
+        """Open the route's chat in the gateway and record its key: the key,
+        or "" with the reason kept for the doctor."""
+        try:
+            sid = _open_chat(self.home, route.get("session_key") or "")
+            key = _chat_gateway_key(self.home, sid)
+            if not key:
+                raise RuntimeError(f"Hermes has no key for chat {sid}")
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+            if why != self._open_error:
+                self.log(f"could not open {self._chat_label(route)}: {why}")
+            self._open_error = why
+            return ""
+        self._open_error = ""
+        self._follow({"session_key": sid, "ui_session_id": "",
+                      "gateway_key": key})
+        self.log(f"opened {self._chat_label(self.route)} in the gateway")
+        return key
 
     def _deliver(self, line, stream_key):
         """Hand one stream line to the gateway. False = refused, reconnect.
@@ -2430,7 +2637,8 @@ class A2AHermes:
         label = self._chat_label(self.route)
         if not on:
             c.append(_check("push_host", None, detail="skipped: a2a is off"))
-        elif block == "host" and is_desktop(self.route):
+        elif (block == "host" and is_desktop(self.route)
+                and not _chats_in_gateway()):
             c.append(_check("push_host", False, "user",
                             "this process is not the Hermes app's backend, "
                             "so nothing is delivered here; a2a messages "
@@ -2450,7 +2658,7 @@ class A2AHermes:
                             "Hermes app and open it again (or restart the "
                             "gateway however it is run)"))
         elif self._closed_since is not None:
-            why = self.hold["error"]
+            why = self.hold["error"] or self._open_error
             c.append(_check("push_host", False, "human",
                             "the a2a conversation is not open in the Hermes "
                             "app, so nothing can be delivered into it: ask "
@@ -2590,6 +2798,10 @@ class A2AHermes:
                 "last_error": self.state["error"] or None,
                 "gateway": self._gateway(),
                 "desktop_app": self._desktop_backend(),
+                # What this process runs on, reported only: nothing branches
+                # on the version. `path` is how it delivers conversations.
+                "hermes": {"version": _hermes_version(),
+                           "path": self._path()},
                 "conversation_open": (None if not is_desktop(self.route)
                                       else self._closed_since is None),
                 # The route conversation kept loaded in this dashboard, so
