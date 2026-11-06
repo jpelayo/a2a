@@ -235,8 +235,13 @@ back and forth, with nothing to do and nothing to enable again.
 
 | Hermes | Chats run in | Checked |
 |---|---|---|
-| v0.21.7, v0.22.0 | `hermes serve` | source read |
-| v0.23.0 | a gateway | source read |
+| v0.21.7, v0.22.0 | `hermes serve` | contract checks |
+| v0.22.2 | `hermes serve` | file list only |
+| v0.22.1, v0.22.3 to v0.22.7 | a gateway | file list only |
+| v0.23.0 | a gateway | contract checks |
+
+On v0.22.1 a bot not yet on a2a cannot turn it on in a chat, because that Hermes
+does not say which client a chat is. Bots already on a2a are unaffected.
 
 On a Hermes with the gateway:
 
