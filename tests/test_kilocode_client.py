@@ -20,6 +20,11 @@ thread, against a fake broker (stubbed fetch) and a fake Kilo client:
   busy       a message arriving while the session runs a turn is held — Kilo
              would supersede that turn — and delivered at the idle event.
   dispose    Kilo's dispose hook closes the stream and nothing reconnects.
+  terminal   after pty.created/updated (info {id: "pty_…", title, cwd}) the
+             message still goes to the ses_ session, never to the terminal.
+  refused    a prompt Kilo refuses — its SDK RESOLVES {error}, it does not
+             throw — is not acked, stays queued, and is retried by the
+             client's own timer; it lands once and is acked once.
   switch     enabled_opencode does not turn Kilo on.
   folders    Kilo's own (~/.config/kilo, $XDG_DATA_HOME/kilo); nothing is ever
              created under opencode.
@@ -106,7 +111,11 @@ globalThis.fetch = async (url, init = {}) => {
 }
 
 // --- fake Kilo client ---------------------------------------------------------
+// It refuses what Kilo refuses, the way Kilo's SDK does: a refused request
+// RESOLVES with {error} (no throwOnError), it does not throw.
 const prompts = []
+const refusals = []
+let refuse = job.refuse ? 1 : 0
 let status = job.busy ? { ses_x: { type: "busy" } } : {}
 const client = {
   app: { log: async () => {} },
@@ -114,7 +123,16 @@ const client = {
     list: async () => ({ data: [{ id: "ses_x", directory: project, time: { updated: 1 } }] }),
     status: async () => ({ data: status }),
     promptAsync: async (a) => {
-      prompts.push({ text: a?.body?.parts?.[0]?.text || "", noReply: !!a?.body?.noReply })
+      const id = a?.path?.id
+      const text = a?.body?.parts?.[0]?.text || ""
+      const no = (why) => {
+        refusals.push({ id, why })
+        return { error: { name: "BadRequest", data: { message: why } },
+                 response: { ok: false, status: 400 } }
+      }
+      if (!String(id).startsWith("ses")) return no("not a session id")
+      if (refuse && text.includes("hello from peer")) { refuse--; return no("refused once") }
+      prompts.push({ id, text, noReply: !!a?.body?.noReply })
       return {}
     },
   },
@@ -126,6 +144,15 @@ const hooks = await mod.default.server({ client, directory: project })
 await settle()
 const out = { name: job.name, hooks: Object.keys(hooks).sort() }
 
+if (job.terminal) {
+  // What Kilo sends when a terminal opens: an object with an id and a title,
+  // and no parent — it looks like a session (packages/schema/src/pty.ts).
+  const info = { id: "pty_1", title: "zsh", command: "zsh", args: [], cwd: project,
+                 status: "running", pid: 1 }
+  await hooks.event({ event: { type: "pty.created", properties: { info } } })
+  await hooks.event({ event: { type: "pty.updated", properties: { info } } })
+  await settle(300)
+}
 if (job.deliver) {
   streams.at(-1)?.push({ id: "m1", channel: "ops", sender: "peer", text: "hello from peer",
                          audience: [KEY], addressed: [] })
@@ -136,8 +163,14 @@ if (job.deliver) {
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ses_x" } } })
     await settle()
   }
+  if (job.refuse) {
+    out.acks_after_refusal = calls.filter((c) => c.path === "/ack")
+      .flatMap((c) => c.body?.ids || [])
+    await settle(6500)          // past RECONNECT_MS, with no event at all
+  }
 }
 out.prompts = prompts
+out.refusals = refusals
 out.acks = calls.filter((c) => c.path === "/ack").flatMap((c) => c.body?.ids || [])
 out.streams = streams.length
 if (job.tools) {
@@ -224,6 +257,10 @@ def main() -> int:
              "env": env_for("daemon", {"KILOCODE_FEATURE": "daemon"})},
             {"name": "opencode_key", "switch": {"enabled_opencode": True},
              "env": env_for("opencode_key", {"KILO_PROCESS_ROLE": "worker"})},
+            {"name": "terminal", "switch": on, "deliver": True, "terminal": True,
+             "env": env_for("terminal", {"KILO_PROCESS_ROLE": "worker"})},
+            {"name": "refused", "switch": on, "deliver": True, "refuse": True,
+             "env": env_for("refused", {"KILO_PROCESS_ROLE": "worker"})},
         ]
         for j in jobs:
             j["script"] = str(scenario)
@@ -306,7 +343,37 @@ def main() -> int:
               ok_key.get("streams") == 0 and ok_key.get("prompts") == [],
               json.dumps(ok_key)[:300])
 
-        homes = [base / n for n in ("tui", "busy", "daemon", "opencode_key", "main")]
+        # A terminal opened in Kilo sends pty.created/updated with info
+        # {id: "pty_…", title, cwd}: it looked like a session, became the
+        # injection target, and the next message went to it.
+        term = workers["terminal"]
+        check("terminal: after pty.created, the message still goes to the "
+              "ses_ session — a terminal id is not a session",
+              [p["id"] for p in term.get("prompts", [])
+               if "hello from peer" in p["text"]] == ["ses_x"],
+              json.dumps(term)[:600])
+        check("terminal: nothing is ever sent to pty_1",
+              not any(r["id"] == "pty_1" for r in term.get("refusals", [])),
+              json.dumps(term.get("refusals")))
+        check("terminal: and it is acked once, after it landed",
+              term.get("acks", []).count("m1") == 1, str(term.get("acks")))
+
+        # Kilo's SDK resolves a refused prompt with {error}: read as
+        # delivered, it was acked and lost.
+        ref = workers["refused"]
+        check("refused: a refused injection (resolves {error}) is NOT acked — "
+              "it was not shown", "m1" not in ref.get("acks_after_refusal", ["m1"]),
+              json.dumps(ref)[:600])
+        check("refused: it stays queued and the client retries it by itself, "
+              "with no event to prompt it — it lands once",
+              [p["id"] for p in ref.get("prompts", [])
+               if "hello from peer" in p["text"]] == ["ses_x"],
+              json.dumps(ref)[:600])
+        check("refused: and is acked exactly once, after it landed",
+              ref.get("acks", []).count("m1") == 1, str(ref.get("acks")))
+
+        homes = [base / n for n in ("tui", "busy", "daemon", "opencode_key",
+                                    "terminal", "refused", "main")]
         made = sorted(str(p.relative_to(base)) for h in homes for p in h.rglob("*")
                       if p.name == "opencode")
         check("nothing is ever created under opencode", not made, str(made))

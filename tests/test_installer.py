@@ -174,9 +174,9 @@ def snapshot(root: Path) -> dict:
             for p in root.rglob("*") if p.is_file()}
 
 
-def run_installer(installer: Path, home, bin_, cwd, answers):
+def run_installer(installer: Path, home, bin_, cwd, answers, extra_env=None):
     env = {"HOME": str(home), "PATH": f"{bin_}:/usr/bin:/bin",
-           "TERM": "dumb", "LANG": "C.UTF-8"}
+           "TERM": "dumb", "LANG": "C.UTF-8", **(extra_env or {})}
     r = subprocess.run([sys.executable, str(installer)],
                        input="\n".join(answers) + "\n", cwd=cwd, env=env,
                        capture_output=True, text=True, timeout=120)
@@ -257,6 +257,72 @@ def pure():
     shown = m.redact(f"GET /install/pi/{TOKEN} and /install/hermes/{TOKEN2}")
     check("redact hides EVERY token typed — one per harness is allowed",
           TOKEN not in shown and TOKEN2 not in shown, shown)
+
+    # --- OpenCode's one setting: where, and the JSONC edit ---------------------
+    # OpenCode 2 unloads an idle project, and a2a with it, after 60 minutes;
+    # experimental.location_idle_timeout = false is its own "never unload".
+    keep = {k: os.environ.pop(k, None)
+            for k in ("OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME")}
+    try:
+        plain_dir = m.opencode_config_dir()
+        os.environ["XDG_CONFIG_HOME"] = "/x/cfg"
+        xdg_dir = m.opencode_config_dir()
+        os.environ["OPENCODE_CONFIG_DIR"] = "/x/oc"
+        own_dir = m.opencode_config_dir()
+    finally:
+        for k, v in keep.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    check("setting: OpenCode's global config folder, by OpenCode's rule — "
+          "OPENCODE_CONFIG_DIR, else $XDG_CONFIG_HOME/opencode, else "
+          "~/.config/opencode",
+          plain_dir == home / ".config" / "opencode"
+          and xdg_dir == Path("/x/cfg/opencode") and own_dir == Path("/x/oc"),
+          f"{plain_dir} {xdg_dir} {own_dir}")
+    w, load = m._with_idle_setting, m._jsonc_load
+    on = {"location_idle_timeout": False}
+    check("setting: an empty file becomes a config holding only the setting",
+          json.loads(w("")) == {"experimental": on} and w("\n  \n") == w(""))
+    check("setting: {} gets it", load(w("{}")) == {"experimental": on})
+    check("setting: a one-line file gets it as its first member, the rest "
+          "kept as it was",
+          w('{"model": "x/y"}') == '{"experimental": { '
+          '"location_idle_timeout": false }, "model": "x/y"}',
+          w('{"model": "x/y"}'))
+    src = ('{\n  // a comment holding { and "quotes"\n'
+           '  "url": "http://h/{x}", /* and this one */\n'
+           '  "experimental": {\n    "subagent_depth": 2,\n  },\n}\n')
+    got = w(src)
+    check("setting: into an existing experimental object, as its first "
+          "member — comments, trailing commas and every other byte kept",
+          got == src.replace('"experimental": {', '"experimental": {\n'
+                             '    "location_idle_timeout": false,', 1), got)
+    check("setting: …and OpenCode would read the same config plus the setting",
+          load(got) == {"url": "http://h/{x}",
+                        "experimental": {**on, "subagent_depth": 2}})
+    crlf = w('{\r\n  "model": "x"\r\n}\r\n')
+    check("setting: a CRLF file stays CRLF",
+          crlf == '{\r\n  "experimental": { "location_idle_timeout": false },'
+                  '\r\n  "model": "x"\r\n}\r\n', repr(crlf))
+    check("setting: a byte-order mark stays where it was",
+          w('﻿{"a": 1}').startswith('﻿{"experimental"'))
+    check("setting: a repeated experimental key — the last one counts, so "
+          "it goes there",
+          load(w('{"experimental": {"a": true}, "experimental": {"b": true}}'))
+          == {"experimental": {**on, "b": True}})
+    check("setting: one already set, to any value, is left alone",
+          w('{"experimental": {"location_idle_timeout": "4 hours"}}') is None
+          and w('{"experimental": {"location_idle_timeout": false}}') is None)
+    refused = []
+    for bad in ('{"model": ', '[1]', '{"experimental": true}',
+                '{"a": 1} {"b": 2}', '{"a": "unterminated}', '{"a": 1 /* }'):
+        try:
+            w(bad)
+        except ValueError:
+            refused.append(bad)
+    check("setting: anything OpenCode could not read is refused, not edited",
+          len(refused) == 6, str(refused))
 
 
 def main() -> int:
@@ -357,6 +423,19 @@ def main() -> int:
         check("fresh: the next steps name what no installer can do",
               "plugin:a2a@skills-dir" in steps and "enable a2a here" in steps
               and "app-server --listen unix://" in steps, steps[:1500])
+        occ = home / ".config" / "opencode" / "opencode.jsonc"
+        check("fresh: OpenCode's global config gets its one setting, in a new "
+              "opencode.jsonc — the file OpenCode itself writes when there is "
+              "none",
+              occ.is_file() and json.loads(occ.read_text())
+              == {"experimental": {"location_idle_timeout": False}},
+              occ.read_text() if occ.is_file() else "absent")
+        check("fresh: the confirmation screen showed it, and why, before "
+              "anything was written",
+              out.find("Setting it will change") >= 0
+              and out.find("Setting it will change") < out.find("Installed")
+              and "experimental.location_idle_timeout = false" in out
+              and "60 idle minutes" in out, out[:2500])
         after = snapshot(root)
         outside = [p for p in after if p not in before
                    and not p.startswith("m1/home/") and p != "m1/commands.log"]
@@ -397,6 +476,12 @@ def main() -> int:
             "y",
         ])
         check("update: it finishes", code == 0, out[-1500:])
+        check("update: the OpenCode setting, already there, is left alone and "
+              "not shown again",
+              "Setting it will change" not in out and json.loads(
+                  occ.read_text()) == {"experimental":
+                                       {"location_idle_timeout": False}},
+              out[:2500])
         check("update: it shows the installed version and the new one",
               "installed 0.0.9" in out and f"installed {b.VERSION}" in out,
               out[:1500])
@@ -502,6 +587,9 @@ def main() -> int:
               "they are in your next steps" in out
               and "codex mcp add a2a" in out.split("Next steps", 1)[-1],
               out[-800:])
+        check("declined: with OpenCode not picked, its config is not touched",
+              not list((home / ".config" / "opencode").iterdir())
+              and "Setting it will change" not in out)
 
         # --- one token for most, another for Hermes ---------------------------
         m4 = root / "m4"
@@ -660,6 +748,76 @@ def main() -> int:
               and not any("gateway restart" in r for r in ran), steps[:1500])
         check("gateway: and it says a2a keeps receiving after the app quits",
               "keeps receiving" in steps, steps[:1500])
+
+        # --- OpenCode's setting in a config you already have -----------------
+        # In $XDG_CONFIG_HOME, as OpenCode looks; with comments, a trailing
+        # comma, another experimental key, a provider key and 0600.
+        m8 = root / "m8"
+        home, bin_, cwd, log = machine(m8)
+        xdg = {"XDG_CONFIG_HOME": str(m8 / "xdg")}
+        cfg = m8 / "xdg" / "opencode" / "opencode.json"
+        cfg.parent.mkdir(parents=True)
+        secret = "sk-SECRET-PROVIDER-KEY-123"
+        orig = ('{\n  // my provider\n  "provider": {"x": {"options": '
+                f'{{"apiKey": "{secret}"}}}}}},\n'
+                '  "experimental": {\n    "subagent_depth": 2,\n  },\n}\n')
+        cfg.write_text(orig)
+        cfg.chmod(0o600)
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"], xdg)
+        new = cfg.read_text()
+        check("setting: an existing config gets it where OpenCode looks "
+              "($XDG_CONFIG_HOME/opencode), with no second file",
+              code == 0 and new != orig
+              and not (home / ".config" / "opencode" / "opencode.jsonc")
+              .exists(), out[-1200:])
+        check("setting: added inside its experimental object, every other "
+              "byte kept — comments and trailing commas included",
+              new == orig.replace('"experimental": {', '"experimental": {\n'
+                                  '    "location_idle_timeout": false,', 1),
+              new.replace(secret, "<key>"))
+        check("setting: the file keeps its own permissions (0600 here)",
+              cfg.stat().st_mode & 0o777 == 0o600,
+              oct(cfg.stat().st_mode & 0o777))
+        check("setting: nothing of the file's content is ever printed — it "
+              "may hold provider keys",
+              secret not in out and "my provider" not in out
+              and "subagent_depth" not in out, "content printed")
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"], xdg)
+        check("setting: run again, it is there: untouched and not shown",
+              code == 0 and cfg.read_text() == new
+              and "Setting it will change" not in out, out[-1200:])
+
+        # A value you set yourself wins.
+        m9 = root / "m9"
+        home, bin_, cwd, log = machine(m9)
+        own = home / ".config" / "opencode" / "opencode.json"
+        mine = '{"experimental": {"location_idle_timeout": "4 hours"}}\n'
+        own.write_text(mine)
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"])
+        check("setting: one you set yourself, to any value, is left alone — "
+              "not edited, not shown, no second file",
+              code == 0 and own.read_text() == mine
+              and "Setting it will change" not in out
+              and not (home / ".config" / "opencode" / "opencode.jsonc")
+              .exists(), out[-1200:])
+
+        # A config OpenCode cannot read is not edited.
+        m10 = root / "m10"
+        home, bin_, cwd, log = machine(m10)
+        bad = home / ".config" / "opencode" / "opencode.jsonc"
+        bad.write_text('{"model": ')
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"])
+        steps = out.split("Next steps", 1)[-1]
+        check("setting: a config OpenCode cannot read is left as it was, the "
+              "install still finishes, and a next step says why",
+              code == 0 and bad.read_text() == '{"model": '
+              and "could not set experimental.location_idle_timeout = false "
+                  "in ~/.config/opencode/opencode.jsonc" in steps
+              and "Setting it will change" not in out, steps[:1500])
     finally:
         broker.close()
 

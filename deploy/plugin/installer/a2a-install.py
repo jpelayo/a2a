@@ -19,8 +19,9 @@ What it does, in order:
      them, or any of them its own (Hermes bots on another station's token);
   4. for Hermes, asks which bots (profiles), and an agent id for a profile
      whose name is no id (`default`);
-  5. downloads everything, shows every file it will write, and waits for
-     ENTER;
+  5. downloads everything, shows every file it will write — and, for
+     OpenCode, the one setting it changes in OpenCode's global config — and
+     waits for ENTER;
   6. writes the files — overwriting in place, deleting nothing;
   7. lists the harness commands still needed (`codex mcp add`, `hermes …
      plugins enable`, `dsh plugin --profile web add`, …) and asks before
@@ -683,6 +684,10 @@ class Target:
         self.token, self.me = token      # the token it is fetched with, its /me
         self.files = []          # [(absolute path, bytes, mode)]
         self.same = False        # every file already on disk, byte for byte
+        # OpenCode only: (path, bytes) of the one setting to write, or
+        # (path, None) when its file cannot be edited. Kept apart from
+        # `files`, so "already current" stays about the client.
+        self.setting = None
 
     def compare(self):
         """Is what was downloaded exactly what is installed? This, not the
@@ -829,6 +834,188 @@ def download(ui, targets):
                     f"a2a: the {t.label} download is not a usable archive "
                     f"({e}); nothing was written."))
         t.compare()
+        if t.key == "opencode":
+            t.setting = opencode_setting()
+
+
+# ---------------------------------------------------------------------------
+# OpenCode 2's one setting: keep a project loaded while OpenCode runs
+# ---------------------------------------------------------------------------
+# OpenCode 2 unloads a project after 60 minutes without session activity
+# (packages/core/src/location-activity.ts), and the a2a plugin with it: the
+# stream closes and nothing is received until a request for that project —
+# a prompt — loads it again. A plugin cannot keep its project loaded, and
+# viewing a session does not count. `experimental.location_idle_timeout:
+# false` is OpenCode's own "never unload" (packages/schema/src/config/
+# experimental.ts). It is written once, in OpenCode's global config, shown
+# first. OpenCode 1.x ignores keys it does not know, so the same file stays
+# valid there. The file may hold provider keys: only its path and this one
+# setting are ever shown.
+
+IDLE_KEY = "location_idle_timeout"
+IDLE_SHOWN = f"experimental.{IDLE_KEY} = false"
+
+
+def opencode_config_dir():
+    """OpenCode's global config folder, by OpenCode's rule: $OPENCODE_CONFIG_DIR
+    (packages/util/src/global.ts), else $XDG_CONFIG_HOME/opencode, else
+    ~/.config/opencode (packages/util/src/global-roots.ts)."""
+    explicit = os.environ.get("OPENCODE_CONFIG_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get("XDG_CONFIG_HOME") or str(HOME / ".config")
+    return Path(base) / "opencode"
+
+
+def _jsonc_tokens(text):
+    """The tokens of a JSONC text, [(start, end)], comments and whitespace
+    skipped. ValueError on an unterminated string or comment."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n﻿":
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError("unterminated comment")
+            i = j + 2
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise ValueError("unterminated string")
+            out.append((i, j + 1))
+            i = j + 1
+        elif c in "{}[]:,":
+            out.append((i, i + 1))
+            i += 1
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n{}[]:,\"/":
+                j += 1
+            if j == i:
+                raise ValueError("unexpected character")
+            out.append((i, j))
+            i = j
+    return out
+
+
+def _jsonc_load(text):
+    """A JSONC text parsed as OpenCode parses it — comments and trailing
+    commas allowed — by rebuilding strict JSON from its tokens. ValueError
+    when it is not valid."""
+    toks = _jsonc_tokens(text)
+    parts = []
+    for k, (s, e) in enumerate(toks):
+        if (text[s:e] == "," and k + 1 < len(toks)
+                and text[toks[k + 1][0]] in "}]"):
+            continue
+        parts.append(text[s:e])
+    if not parts:
+        raise ValueError("empty")
+    return json.loads(" ".join(parts))
+
+
+def _has_idle(cfg):
+    exp = cfg.get("experimental") if isinstance(cfg, dict) else None
+    return isinstance(exp, dict) and IDLE_KEY in exp
+
+
+def _with_idle_setting(text):
+    """`text` with experimental.location_idle_timeout = false added and every
+    other byte kept, or None when it already sets one. ValueError when it is
+    not a config OpenCode would load, or the edit does not hold."""
+    if not text.strip(" \t\r\n﻿"):
+        return ('{\n  "experimental": {\n    "%s": false\n  }\n}\n'
+                % IDLE_KEY)
+    before = _jsonc_load(text)
+    if not isinstance(before, dict):
+        raise ValueError("not an object")
+    if _has_idle(before):
+        return None
+    exp = before.get("experimental")
+    if exp is not None and not isinstance(exp, dict):
+        raise ValueError("experimental is not an object")
+    toks = _jsonc_tokens(text)
+    if text[toks[0][0]] != "{":
+        raise ValueError("not an object")
+    # The object to add to: the LAST top-level "experimental" object (a
+    # repeated key keeps its last value), else the file's own object.
+    at, depth = 0, 0
+    for k, (s, e) in enumerate(toks):
+        tok = text[s:e]
+        if (depth == 1 and tok.startswith('"') and k + 2 < len(toks)
+                and text[toks[k + 1][0]] == ":"
+                and text[toks[k + 2][0]] == "{"
+                and json.loads(tok) == "experimental"):
+            at = k + 2
+        if tok in "{[":
+            depth += 1
+        elif tok in "}]":
+            depth -= 1
+    member = (f'"{IDLE_KEY}": false' if at else
+              f'"experimental": {{ "{IDLE_KEY}": false }}')
+    open_end = toks[at][1]
+    nxt = toks[at + 1][0]
+    nl = "\r\n" if "\r\n" in text else "\n"
+    if text[nxt] == "}":                      # an empty object
+        insert = member
+    else:
+        line = text.rfind("\n", 0, nxt) + 1
+        indent = text[line:nxt]
+        if line > open_end and not indent.strip(" \t"):
+            insert = nl + indent + member + ","
+        else:
+            insert = member + ", "
+    out = text[:open_end] + insert + text[open_end:]
+    after = _jsonc_load(out)
+    want = dict(before)
+    want["experimental"] = {IDLE_KEY: False, **(exp or {})}
+    if after != want or after["experimental"][IDLE_KEY] is not False:
+        raise ValueError("the edit did not hold")
+    return out
+
+
+def opencode_setting():
+    """What the setting needs: (path, bytes) to write; (path, None) when its
+    file cannot be edited safely (a next step says so); None when there is
+    nothing to do — either global file sets it already, to any value: yours
+    wins.
+
+    The file is the one OpenCode's own Config.update writes
+    (packages/core/src/config.ts): the last of opencode.json / opencode.jsonc
+    that exists, else a new opencode.jsonc."""
+    d = opencode_config_dir()
+    present = [d / n for n in ("opencode.json", "opencode.jsonc")
+               if (d / n).is_file()]
+    for p in present:
+        try:
+            # Bytes, decoded: read_text() would turn CRLF into LF and the
+            # write would then change every line ending in the file.
+            if _has_idle(_jsonc_load(p.read_bytes().decode("utf-8"))):
+                return None
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+    path = present[-1] if present else d / "opencode.jsonc"
+    try:
+        new = _with_idle_setting(path.read_bytes().decode("utf-8")
+                                 if path.is_file() else "")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return path, None
+    return None if new is None else (path, new.encode("utf-8"))
+
+
+def _mode_of(path, default=0o644):
+    """Keep a file's own permissions: a config holding keys may be 0600."""
+    try:
+        return path.stat().st_mode & 0o777
+    except OSError:
+        return default
 
 
 _gateway_chats = []
@@ -1037,11 +1224,20 @@ def summary(targets, cmds):
         lines.append("")
     lines.append("Will be installed")
     lines += _table([[t.label, _change(t), _where(t)] for t in targets])
-    if cmds:
-        lines += ["", "Setup it will ask to run afterwards"]
-        lines += _table([[who, what] for who, what, _ in cmds])
-    lines += ["", "Nothing outside these folders is touched, and nothing is "
-                  "deleted."]
+    sets = [t for t in targets if t.setting and t.setting[1] is not None]
+    if sets:
+        # Short lines: the curses screen cuts each one at the terminal width.
+        lines += ["", "Setting it will change"]
+        for t in sets:
+            lines += [f"  {t.label}: {IDLE_SHOWN}",
+                      f"    in {tilde(t.setting[0])}"]
+        lines += ["  OpenCode 2 unloads a project after 60 idle minutes, and",
+                  "  a2a with it, until you type there again. This keeps it",
+                  "  loaded while OpenCode runs."]
+    lines += ["", ("Nothing outside these folders and that file is touched, "
+                   "and nothing is deleted." if sets else
+                   "Nothing outside these folders is touched, and nothing "
+                   "is deleted.")]
     return lines
 
 
@@ -1139,6 +1335,17 @@ def next_steps(targets, pending, hermes_touched):
                           + (" and the desktop app (OpenCode 2 reloads the "
                              "plugin by itself)" if key == "opencode"
                              else "") + "."])
+    for t in targets:
+        if t.key == "opencode" and t.setting and t.setting[1] is None:
+            # The file is never shown: it may hold provider keys.
+            steps.append([f"OpenCode: a2a could not set {IDLE_SHOWN} in "
+                          f"{tilde(t.setting[0])}: it is not a config "
+                          "OpenCode can read, or could not be written, so "
+                          "a2a left it as it was.",
+                          "Until it is set, OpenCode 2 unloads a2a with a "
+                          "project after 60 idle minutes, and messages wait "
+                          "until you type there. Once the file is fixed, run "
+                          "the installer again."])
     in_gateway = "hermes" in keys and hermes_runs_chats_in_gateway()
     if hermes_touched and in_gateway:
         # Its gateway outlives the app, so quitting would reload nothing.
@@ -1249,6 +1456,20 @@ def main():
             rows.append([f"{G.cross} {t.label}", "could not write",
                          str(e.strerror or e)])
             broken.append(t)
+    wrote_setting = False
+    for t in targets:
+        if t in broken or not t.setting or t.setting[1] is None:
+            continue
+        path, data = t.setting
+        try:
+            write_file(path, data, _mode_of(path))
+            rows.append([f"{G.check} {t.label} setting", IDLE_SHOWN,
+                         tilde(path)])
+            wrote_setting = True
+        except OSError as e:
+            rows.append([f"{G.cross} {t.label} setting", "could not write",
+                         str(e.strerror or e)])
+            t.setting = (path, None)
     say("", f"a2a {VERSION} {G.dash} {URL}", "", "Installed", *_table(rows))
     targets = [t for t in targets if t not in broken]
     cmds = [c for c in cmds if c[0] in {t.label for t in targets}]
@@ -1284,6 +1505,8 @@ def main():
         say("", "Next steps")
         for i, lines in enumerate(steps, 1):
             say(f"  {i}. {lines[0]}", *[f"     {l}" for l in lines[1:]])
+    elif wrote_setting:
+        say("", "Nothing else to do.")
     else:
         say("", "Nothing else to do: everything you picked was already "
                 "current.")

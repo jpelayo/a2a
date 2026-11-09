@@ -13,7 +13,9 @@ each thing the plugin relies on from both ends: that OpenCode still provides
 it, and that the plugin still uses it.
 
 Written against anomalyco/opencode `dev` on 2026-10-22 (V2, @opencode/plugin
-2.1.3) for the V2 half, and tags v1.19.4 / v1.18.28 for the V1 half.
+2.1.3) for the V2 half, and tags v1.19.4 / v1.18.28 for the V1 half. The
+idle-unload pins (idle, idle_v1) were added on 2026-11-09 and also hold the
+installer to OpenCode's config rules.
 
 SKIPs (exit 2) when OPENCODE_SRC does not point at a V2 checkout: nothing has
 been checked, and saying so is the only honest outcome.
@@ -25,6 +27,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CLIENT = HERE.parent / "deploy" / "plugin" / "opencode" / "a2a-opencode.js"
+INSTALLER = HERE.parent / "deploy" / "plugin" / "installer" / "a2a-install.py"
 
 fails: list[str] = []
 
@@ -158,6 +161,75 @@ def v2(src: Path, plugin: str) -> None:
           "packages/ai/src/schema/messages.ts changed, or the plugin did")
 
 
+def idle(src: Path, installer: str) -> None:
+    """Added 2026-11-09 against `dev`. OpenCode 2 unloads a project after 60
+    minutes without session activity, and the plugin with it: the stream
+    closes and nothing is received until a request for that project (a
+    prompt) loads it again. The plugin cannot keep its project loaded, so the
+    installer writes OpenCode's own "never unload" into its global config."""
+    activity = read(src, "packages/core/src/location-activity.ts")
+    schema = read(src, "packages/schema/src/config/experimental.ts")
+    supervisor = read(src, "packages/core/src/plugin/supervisor.ts")
+    config = read(src, "packages/core/src/config.ts")
+    discovery = read(src, "packages/core/src/config/discovery.ts")
+    watch = read(src, "packages/core/src/config/watch.ts")
+    roots = read(src, "packages/util/src/global-roots.ts")
+    glob = read(src, "packages/util/src/global.ts")
+    check("plugins are per project — the plugin supervisor is a location "
+          "node, so a project unloaded unloads the plugin",
+          'makeLocationNode({ name: "plugin-supervisor"' in supervisor,
+          "packages/core/src/plugin/supervisor.ts changed")
+    check("an idle project is unloaded after 60 minutes unless "
+          "experimental.location_idle_timeout says otherwise; false = never",
+          '"60 minutes"' in activity
+          and "experimental?.location_idle_timeout" in activity
+          and "timeout !== false" in activity
+          and "locations.invalidate(" in activity,
+          "packages/core/src/location-activity.ts changed")
+    check("the setting is a duration or false — and the installer writes "
+          "false under that name",
+          re.search(r"location_idle_timeout:\s*Schema\.Union\(\[\s*Schema\."
+                    r"DurationFromString,\s*Schema\.Literal\(false\)\s*\]\)",
+                    schema) is not None
+          and 'IDLE_KEY = "location_idle_timeout"' in installer
+          and '": false' in installer,
+          "packages/schema/src/config/experimental.ts changed, or the "
+          "installer did")
+    check("the global config folder is OPENCODE_CONFIG_DIR, else "
+          "$XDG_CONFIG_HOME/opencode, else ~/.config/opencode — read the "
+          "same way by the installer",
+          "process.env.XDG_CONFIG_HOME ||" in roots
+          and 'path.join(home, ".config")' in roots
+          and 'const app = "opencode"' in glob
+          and "process.env.OPENCODE_CONFIG_DIR ?? Path.config" in glob
+          and '"OPENCODE_CONFIG_DIR"' in installer
+          and '"XDG_CONFIG_HOME"' in installer,
+          "packages/util/src/global*.ts changed, or the installer did")
+    check("OpenCode's own write picks the last of opencode.json / "
+          "opencode.jsonc, else a new opencode.jsonc — the file the "
+          "installer edits",
+          'names = ["opencode.json", "opencode.jsonc"]' in discovery
+          and '.at(-1) ?? path.join(directory, "opencode.jsonc")' in config
+          and '("opencode.json", "opencode.jsonc")' in installer
+          and 'd / "opencode.jsonc"' in installer,
+          "packages/core/src/config*.ts changed, or the installer did")
+    check("a config may hold comments and trailing commas — what the "
+          "installer's edit keeps",
+          '"jsonc-parser"' in config and "allowTrailingComma: true" in config,
+          "packages/core/src/config.ts changed")
+    check("the global folder is watched, so the setting applies with no "
+          "restart", "...(sources.global ? [sources.global] : [])" in watch,
+          "packages/core/src/config/watch.ts changed")
+
+
+def idle_v1(src: Path) -> None:
+    parse = read(src, "packages/opencode/src/config/parse.ts")
+    check("V1 ignores a config key it does not know — the installer's "
+          "setting leaves a V1 config valid",
+          'onExcessProperty: "ignore"' in parse,
+          "packages/opencode/src/config/parse.ts changed")
+
+
 def v1(src: Path, plugin: str) -> None:
     index = read(src, "packages/opencode/src/plugin/index.ts")
     shared = read(src, "packages/opencode/src/plugin/shared.ts")
@@ -191,10 +263,12 @@ def main() -> int:
               "(packages/core/src/plugin/module.ts not found)")
         return 2
     v2(src, plugin)
+    idle(src, INSTALLER.read_text())
 
     old = Path(os.environ.get("OPENCODE_V1_SRC") or "")
     if str(old) and (old / "packages/opencode/src/plugin/index.ts").is_file():
         v1(old, plugin)
+        idle_v1(old)
     else:
         print("(V1 half skipped: set OPENCODE_V1_SRC to a v1.x checkout)")
 

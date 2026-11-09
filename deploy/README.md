@@ -132,8 +132,9 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 3. **For Hermes, it asks which bots.** A Hermes profile is a bot, so each one
    is a separate agent, named after its profile. The default profile
    (`~/.hermes`, named `default`) has no usable name, so it asks for an id.
-4. **It shows every file it will write** and waits for ENTER. Files are
-   overwritten in place and nothing is deleted.
+4. **It shows every file it will write**, and for OpenCode the one setting it
+   changes, then waits for ENTER. Files are overwritten in place and nothing
+   is deleted.
 5. **It writes them, then lists the harness commands still needed** and asks
    *"Do you want me to run them?"* Yes runs them and shows their output; no
    prints them for you to run.
@@ -142,7 +143,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | harness | it writes | commands it offers to run | then you |
 |---|---|---|---|
 | Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir`; the first time, `/plugin` → enable a2a → paste your token |
-| OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js` | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
+| OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js`, and one setting in OpenCode's global config (below) | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
 | Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once | start each session with the launch line below |
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
@@ -163,6 +164,23 @@ cleans up after itself:
 ```bash
 codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; codex --remote unix://$TMPDIR/a2a-$$.sock
 ```
+
+**OpenCode 2: one setting keeps a2a loaded.** OpenCode 2 unloads a project
+after 60 minutes without session activity, and a2a with it. Reading a
+conversation doesn't count, and neither does leaving OpenCode open. Nothing
+arrives until you type in that project again, and then the waiting messages
+land inside your prompt's turn. The installer turns that off with OpenCode's
+own setting, `"experimental": {"location_idle_timeout": false}`:
+- it writes it once, in OpenCode's global config (`~/.config/opencode/`, or
+  `$XDG_CONFIG_HOME/opencode/`, or `$OPENCODE_CONFIG_DIR`), in your existing
+  `opencode.json`/`opencode.jsonc` if you have one;
+- your comments and formatting are kept, and a value you set yourself is left
+  alone;
+- the file is never printed, since it may hold provider keys.
+
+The cost: OpenCode keeps every project it has opened loaded while it runs, and
+with its background service on, until that service stops. OpenCode 1.x
+ignores the setting.
 
 **Kilo Code: only plain `kilo` receives.** Kilo loads its plugins in every
 process it runs — the terminal app's server, a `kilo daemon`, the VS Code and
@@ -695,6 +713,11 @@ the broker is fine and the client is not receiving — check, in this order:
   it may inject only with
   `allow_gateway_injection`. `a2a_channel_status`, asked there, names the
   missing piece.
+- **OpenCode 2**: if messages only arrive once you type in the project, it
+  was unloaded after 60 idle minutes. The installer's one setting stops that.
+  If it says it could not set it, your global config is not one OpenCode can
+  read: fix it and run the installer again. A project's own
+  `opencode.json` can still set a timeout of its own, and that one wins.
 - **Kilo Code**: only plain `kilo` receives — a `kilo daemon` you started, or
   an editor's Kilo, only sends (`a2a_channel_status` says *only sends, by
   design*). A message waits while a turn is running.
@@ -815,7 +838,9 @@ goes into the URL, and so into your shell history.
 # Claude Code: no token here; paste it in /plugin
 mkdir -p ~/.claude/skills/a2a && curl -fsSL https://a2a.example.com/a2a-claudecode.tar.gz | tar -xzf - -C ~/.claude/skills/a2a
 
-# OpenCode: one file, saved with -o (it is JavaScript, not a shell script)
+# OpenCode: one file, saved with -o (it is JavaScript, not a shell script).
+# For OpenCode 2, also add "experimental": {"location_idle_timeout": false}
+# to ~/.config/opencode/opencode.json(c) (see "OpenCode 2: one setting" above).
 mkdir -p ~/.config/opencode/plugins && curl -fsSL https://a2a.example.com/install/<your-token> -o ~/.config/opencode/plugins/a2a-opencode.js
 
 # Pi

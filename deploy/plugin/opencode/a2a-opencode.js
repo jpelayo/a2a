@@ -108,11 +108,13 @@ const BRIEF_GIVE_UP_MS = 30_000
 // THIS PROCESS — not this plugin instance. The channel check runs when the CLI
 // starts, and the plugin lives in the CLI's process: OpenCode 1's own, or
 // OpenCode 2's per-launch server once its background service is disabled
-// (`opencode service set disabled true`). OpenCode 2 also recycles a
-// project's plugin instance inside one process after an hour without session
-// activity, and reloads it when its file changes; neither is a start. Both
-// facts are per process — the pid, and when the process started — so they
-// hold whichever way the host loads this module.
+// (`opencode service set disabled true`). OpenCode 2 also unloads a project,
+// and this instance with it, after 60 minutes without session activity
+// (location-activity.ts; the installer sets experimental.location_idle_timeout
+// false so it does not), loads it again on the next request for that project,
+// and reloads it when its file changes; none of these is a start. Both facts
+// are per process — the pid, and when the process started — so they hold
+// whichever way the host loads this module.
 const PROC = { pid: process.pid, started: Date.now() - process.uptime() * 1000 }
 const sameProcess = (p) => p?.pid === PROC.pid &&
   Math.abs((Number(p?.started) || 0) - PROC.started) < 2000
@@ -615,6 +617,9 @@ async function core(host) {
   let setupHint = ""
   let injecting = false
   const queue = []
+  // A refused injection is retried after retryMs (see retryLater()).
+  let retryMs = RECONNECT_MS
+  let retrying = false
   // Message ids already handed to the session, so a replay on
   // reconnect does not deliver them a second time.
   const seen = new Set()
@@ -648,7 +653,14 @@ async function core(host) {
 
   /** Record what a session object says about itself. */
   function learn(s) {
-    if (typeof s?.id !== "string") return
+    // A session id starts "ses" — V2's SessionID schema refuses anything else
+    // (packages/schema/src/session-id.ts), and V1 mints them with that prefix
+    // (packages/core/src/id/id.ts). Other objects look like sessions: V2's
+    // shell.created carries info {id: "sh_…", cwd, time}, V1's
+    // pty.created/updated info {id: "pty_…", title, cwd}. Learned as roots,
+    // a shell id became the injection target the moment the agent ran a
+    // command, and the next message was refused and stranded.
+    if (typeof s?.id !== "string" || !s.id.startsWith("ses")) return
     // Something beyond the id has to be present, or this is not a session
     // object and its silence about parentID means nothing.
     if (s.time === undefined && s.directory === undefined &&
@@ -929,24 +941,50 @@ async function core(host) {
 
     const target = sessionID
     injecting = true
+    let failed = false
     try {
       // Issued before the messages so it lands first, awaited only as far as
       // the server accepting it. What must never happen again is the queue
       // waiting on a model to finish thinking.
       await brief(target)
       while (queue.length) {
-        const item = queue.shift()
+        // Taken off the queue only once the session has it. A message shifted
+        // first and then refused was gone from the queue while its id stayed
+        // in `seen`, so the broker's replay was skipped as "already injected"
+        // and nothing showed it until the plugin reloaded.
+        const item = queue[0]
         await say(item.text, {}, target)
+        queue.shift()
+        retryMs = RECONNECT_MS
         log("info", `injected ${item.id || "(status)"} into ${target}`)
         // Received means received: the session has taken it.
         if (item.id) toAck.add(item.id)
       }
     } catch (e) {
-      log("error", `inject failed: ${e}`)
+      failed = true
+      log("error", `inject failed: ${e} — kept, ${queue.length} message(s) ` +
+                   `waiting`)
+      // The target may be what was refused: ask the server again next time.
+      if (sessionID === target) sessionID = null
     } finally {
       injecting = false
     }
     await flushAcks()
+    if (failed) retryLater()
+  }
+
+  // One pending retry of a refused injection, backing off from RECONNECT_MS
+  // to 5 minutes; a success resets it. A wake event or a new message may
+  // drain sooner. sleep() ends early on stop(), and drain() then does nothing.
+  function retryLater() {
+    if (retrying || stopped) return
+    retrying = true
+    const wait = retryMs
+    retryMs = Math.min(retryMs * 2, 300_000)
+    void sleep(wait).then(() => {
+      retrying = false
+      return drain()
+    })
   }
 
   /** Confirm everything the session has taken, in one call.
@@ -1924,10 +1962,20 @@ async function server({ client, directory }) {
       const res = await client.session.list({})
       return Array.isArray(res) ? res : res?.data || []
     },
-    prompt: (id, text, { noReply }) => client.session.promptAsync({
-      path: { id },
-      body: { ...(noReply ? { noReply: true } : {}), parts: [{ type: "text", text }] },
-    }),
+    // V1's SDK client is made without throwOnError (packages/sdk/js/src/
+    // client.ts), so a refused request RESOLVES with {error}. Read as
+    // delivered, a refusal was acked and the message lost; thrown, it stays
+    // queued for a retry.
+    prompt: async (id, text, { noReply }) => {
+      const res = await client.session.promptAsync({
+        path: { id },
+        body: { ...(noReply ? { noReply: true } : {}), parts: [{ type: "text", text }] },
+      })
+      if (res?.error !== undefined && res?.error !== null) {
+        throw new Error(`prompt refused: ${JSON.stringify(res.error).slice(0, 200)}`)
+      }
+      return res
+    },
   })
   if (!a2a) return {}
   return {

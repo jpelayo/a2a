@@ -619,6 +619,9 @@ async function core(host) {
   let setupHint = ""
   let injecting = false
   const queue = []
+  // A refused injection is retried after retryMs (see retryLater()).
+  let retryMs = RECONNECT_MS
+  let retrying = false
   // Message ids already handed to the session, so a replay on
   // reconnect does not deliver them a second time.
   const seen = new Set()
@@ -652,7 +655,13 @@ async function core(host) {
 
   /** Record what a session object says about itself. */
   function learn(s) {
-    if (typeof s?.id !== "string") return
+    // A session id starts "ses" — Kilo mints them with that prefix
+    // (packages/core/src/id/id.ts), and a terminal is "pty". A terminal looks
+    // like a session: pty.created/updated carry info {id: "pty_…", title, cwd}
+    // (packages/schema/src/pty.ts). Learned as a root, its id became the
+    // injection target when a terminal opened, and the next message was sent
+    // to it and refused.
+    if (typeof s?.id !== "string" || !s.id.startsWith("ses")) return
     // Something beyond the id has to be present, or this is not a session
     // object and its silence about parentID means nothing.
     if (s.time === undefined && s.directory === undefined &&
@@ -964,30 +973,55 @@ async function core(host) {
 
     const target = sessionID
     injecting = true
+    let failed = false
     try {
       // Issued before the messages so it lands first, awaited only as far as
       // the server accepting it. What must never happen again is the queue
       // waiting on a model to finish thinking.
       await brief(target)
       while (queue.length) {
-        const item = queue.shift()
+        // Taken off the queue only once the session has it. A message shifted
+        // first and then refused was gone from the queue while its id stayed
+        // in `seen`, so the broker's replay was skipped as "already injected"
+        // and nothing showed it until the plugin reloaded.
+        const item = queue[0]
         if (await say(item.text, {}, target) === false) {
-          // Busy: back to the front, untouched and unacked. The idle event
+          // Busy: left at the front, untouched and unacked. The idle event
           // at the end of the turn drains it.
-          queue.unshift(item)
           log("info", `holding ${queue.length} message(s) for ${target}`)
           break
         }
+        queue.shift()
+        retryMs = RECONNECT_MS
         log("info", `injected ${item.id || "(status)"} into ${target}`)
         // Received means received: the session has taken it.
         if (item.id) toAck.add(item.id)
       }
     } catch (e) {
-      log("error", `inject failed: ${e}`)
+      failed = true
+      log("error", `inject failed: ${e} — kept, ${queue.length} message(s) ` +
+                   `waiting`)
+      // The target may be what was refused: ask the server again next time.
+      if (sessionID === target) sessionID = null
     } finally {
       injecting = false
     }
     await flushAcks()
+    if (failed) retryLater()
+  }
+
+  // One pending retry of a refused injection, backing off from RECONNECT_MS
+  // to 5 minutes; a success resets it. A wake event or a new message may
+  // drain sooner. sleep() ends early on stop(), and drain() then does nothing.
+  function retryLater() {
+    if (retrying || stopped) return
+    retrying = true
+    const wait = retryMs
+    retryMs = Math.min(retryMs * 2, 300_000)
+    void sleep(wait).then(() => {
+      retrying = false
+      return drain()
+    })
   }
 
   /** Confirm everything the session has taken, in one call.
@@ -2049,10 +2083,20 @@ async function server({ client, directory }) {
       const res = await client.session.list({})
       return Array.isArray(res) ? res : res?.data || []
     },
-    prompt: (id, text, { noReply }) => client.session.promptAsync({
-      path: { id },
-      body: { ...(noReply ? { noReply: true } : {}), parts: [{ type: "text", text }] },
-    }),
+    // Kilo's SDK client is made without throwOnError (createKiloClient,
+    // packages/sdk/js/src/client.ts), so a refused request RESOLVES with
+    // {error}. Read as delivered, a refusal was acked and the message lost;
+    // thrown, it stays queued for a retry.
+    prompt: async (id, text, { noReply }) => {
+      const res = await client.session.promptAsync({
+        path: { id },
+        body: { ...(noReply ? { noReply: true } : {}), parts: [{ type: "text", text }] },
+      })
+      if (res?.error !== undefined && res?.error !== null) {
+        throw new Error(`prompt refused: ${JSON.stringify(res.error).slice(0, 200)}`)
+      }
+      return res
+    },
     ...(await kiloHost(client)),
   })
   if (!a2a) return {}
