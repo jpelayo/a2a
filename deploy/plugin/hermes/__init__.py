@@ -184,6 +184,12 @@ T_UNSEEN = float(os.environ.get("A2A_HERMES_UNSEEN") or 480)
 ACK_RETRY_MIN_S = 2.0
 ACK_RETRY_MAX_S = 60.0
 LOG_MAX = 512 * 1024
+# A stream the broker ends this soon after it opened is a flap: another
+# process of this bot is taking it. Consecutive flaps back off up to the max.
+FLAP_S = 10.0
+FLAP_BASE_S = 1.0
+FLAP_MAX_S = 60.0
+FLAP_SAY = 3
 
 # Profile names that name no bot. Hermes calls its unnamed profile "default",
 # and a HERMES_HOME outside ~/.hermes/profiles "custom": every such install
@@ -503,6 +509,124 @@ class _Hold:
 
     def close(self):
         self._closed = True
+
+
+# --- one stream per bot ---------------------------------------------------------
+# A bot's conversation can look deliverable from two Hermes processes at once:
+# `hermes serve` (the hold puts the chat in its session table) and, on a Hermes
+# with `gateway ensure`, its gateway, by that capability alone. Both streamed;
+# the broker keeps one stream per agent and the newest wins, so they evicted
+# each other every second (a real bot, 2026-11-20). The serve lock decides: a
+# process with the TUI injector that serves the chat holds it; the gateway only
+# looks, so a dashboard that starts later still wins. The OS drops it when its
+# holder exits. flock, not lockf: two holders in ONE process must conflict too.
+try:
+    import fcntl as _fcntl
+except ImportError:          # Windows
+    _fcntl = None
+try:
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None
+# On Windows the locked byte sits past what the holder writes, so others can
+# still read who holds it.
+_WIN_LOCK_AT = 1 << 20
+
+
+def _try_lock(fh):
+    """Non-blocking exclusive lock on `fh`: True if taken (and where the OS
+    has neither primitive, so it behaves as before)."""
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        elif _msvcrt is not None:
+            fh.seek(_WIN_LOCK_AT)
+            _msvcrt.locking(fh.fileno(), _msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(fh):
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            fh.seek(_WIN_LOCK_AT)
+            _msvcrt.locking(fh.fileno(), _msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+class _ServeLock:
+    """Which process delivers this bot's conversation (see above). The file,
+    in the plugin's own folder, names the holder ({pid, role, since}) for the
+    logs and the doctor."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._fh = None
+        self._mu = threading.Lock()
+
+    @property
+    def held(self):
+        return self._fh is not None
+
+    def _open(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return open(self.path, "a+", encoding="utf-8")
+
+    def take(self, info):
+        """Hold it (idempotent); False while another process does. A file
+        that cannot be opened counts as held, as before the lock existed."""
+        with self._mu:
+            if self._fh is not None:
+                return True
+            try:
+                fh = self._open()
+            except OSError:
+                return True
+            if not _try_lock(fh):
+                fh.close()
+                return False
+            try:
+                fh.seek(0)
+                fh.truncate()
+                fh.write(json.dumps(info))
+                fh.flush()
+            except OSError:
+                pass
+            self._fh = fh
+            return True
+
+    def release(self):
+        with self._mu:
+            fh, self._fh = self._fh, None
+        if fh is not None:
+            _unlock(fh)
+            fh.close()
+
+    def holder(self):
+        """None unless ANOTHER process holds it; then its info ({} if the
+        file says nothing). Finding out takes the lock for an instant."""
+        with self._mu:
+            if self._fh is not None:
+                return None
+            try:
+                fh = self._open()
+            except OSError:
+                return None
+            try:
+                if _try_lock(fh):
+                    _unlock(fh)
+                    return None
+            finally:
+                fh.close()
+        try:
+            info = json.loads(self.path.read_text(encoding="utf-8") or "{}")
+        except (OSError, ValueError):
+            info = {}
+        return info if isinstance(info, dict) else {}
 
 
 def _dashboard_server():
@@ -1160,6 +1284,11 @@ class A2AHermes:
         self.data_dir = self._data_dir()
         self.log_file = ((self.data_dir / "a2a.log") if self.data_dir
                          else self.home / "logs" / "a2a.log")
+        # One stream per bot (_ServeLock). No plugin folder, no lock: a
+        # Hermes without ctx.state behaves as before.
+        self._serve = (_ServeLock(self.data_dir / "serve.lock")
+                       if self.data_dir else None)
+        self._flaps = 0
         self._log_lock = threading.Lock()
         # Derived on first use (client_key), never at register(): loading the
         # plugin must not write anything.
@@ -1430,9 +1559,21 @@ class A2AHermes:
             run(self._store.set, "home", self.home_id)
             self._stamp = self.home_id
 
+    def _role(self):
+        """What this process is, for the logs and the serve lock: several
+        processes of one bot write the same a2a.log."""
+        try:
+            if self._tui_injector():
+                return ("dashboard" if _dashboard_server() is not None
+                        else "tui")
+            return "gateway" if self._gateway() else "other"
+        except Exception:
+            return "other"
+
     def log(self, msg):
+        key = getattr(self, "key", "") or "?"
         line = (f"{time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime())} "
-                f"[{self.key or '?'}] {msg}\n")
+                f"[{key} pid={os.getpid()} {self._role()}] {msg}\n")
         _logger.info("a2a: %s", msg)
         try:
             with self._log_lock:
@@ -1536,10 +1677,49 @@ class A2AHermes:
         """Can THIS process deliver into the route? Exactly one process can:
         the gateway for a messaging chat, the process serving it for a
         conversation — which on a Hermes that runs its chats in a gateway is
-        that gateway — so no two ever hold one bot's stream."""
+        that gateway — so no two ever hold one bot's stream.
+
+        Two can look able, though: `hermes serve` with the chat in its table,
+        and a gateway on a Hermes with `gateway ensure`, which knows only that
+        chats MAY run in a gateway. The serve lock settles it: the process
+        serving the chat holds it, and a gateway takes the stream only while
+        nobody does (_ServeLock)."""
         if is_desktop(self.route):
-            return self._desktop_backend() or self._gateway_delivers()
+            if self._tui_injector():
+                return self._desktop_backend() and self._serve_take()
+            return self._gateway_delivers() and self._serve_holder() is None
         return self._gateway()
+
+    def _serve_take(self):
+        """Be THE process that delivers this bot's conversation; True where
+        there is no lock (no plugin folder)."""
+        if self._serve is None:
+            return True
+        return self._serve.take({"pid": os.getpid(), "role": self._role(),
+                                 "since": iso_utc(time.time())})
+
+    def _serve_holder(self):
+        """{pid, role, since} of ANOTHER process delivering this bot's
+        conversation, else None."""
+        return None if self._serve is None else self._serve.holder()
+
+    def _serve_release(self):
+        if self._serve is not None and self._serve.held:
+            self._serve.release()
+            self.log("no longer the process that delivers this bot's "
+                     "conversation")
+
+    def _yielded(self):
+        """Why this process leaves a conversation's stream to another, or ''."""
+        if not is_desktop(self.route):
+            return ""
+        h = self._serve_holder()
+        if h is None:
+            return ""
+        who = (f"a Hermes {h.get('role') or 'process'} (pid {h.get('pid')})"
+               if h.get("pid") else "another Hermes process of this bot")
+        return (f"{who} delivers this bot's conversation; leaving the "
+                f"stream to it")
 
     def _gateway_delivers(self):
         """Does this gateway deliver the bot's conversations? On a Hermes
@@ -2096,7 +2276,10 @@ class A2AHermes:
         if not (self._gateway() or self._tui_injector()):
             return
         label = self._chat_label(self.route)
-        if block == "injection":
+        yielded = self._yielded() if block == "host" else ""
+        if yielded:
+            self.log(f"not streaming here: {yielded}")
+        elif block == "injection":
             self.log("not streaming here: the gateway may not start turns for "
                      "this plugin (plugins.entries.a2a.allow_gateway_injection)")
         elif is_desktop(self.route) and not self._tui_injector():
@@ -2117,6 +2300,7 @@ class A2AHermes:
         while not self._stop.is_set():
             block = self.blocker()
             if block:
+                self._serve_release()
                 if block != held:
                     held = block
                     self._say_held(block)
@@ -2145,6 +2329,9 @@ class A2AHermes:
         if not self.enabled or not self.route:
             return "a2a turned off for this bot; closing the stream"
         if not self._host_ok():
+            yielded = self._yielded()
+            if yielded:
+                return yielded
             return ("the Hermes app's backend went away; closing the stream"
                     if is_desktop(self.route) and not _chats_in_gateway()
                     else "the gateway went away; closing the stream")
@@ -2223,6 +2410,7 @@ class A2AHermes:
                     self.state["error"] = ""
                 self.log(f"stream open as {stream_key}")
                 self._reconnect.clear()
+                opened = time.time()
                 for raw in resp:
                     self.state["last_line"] = time.time()
                     # Checked BEFORE delivering: a line read after the bot
@@ -2253,6 +2441,8 @@ class A2AHermes:
                                  "reached a turn; reopening the stream so the "
                                  "broker sends it again")
                         return 0
+                # The broker ended it.
+                return self._flapped(time.time() - opened)
         except TimeoutError:
             # A silent stream is a dead stream: reconnect at once.
             self.log("stream idle past the read timeout; reconnecting")
@@ -2273,6 +2463,25 @@ class A2AHermes:
         finally:
             self._resp = None
         return 1
+
+    def _flapped(self, lasted):
+        """The wait after the broker ended a stream. One it ends within
+        FLAP_S of opening is a flap — the broker serves one stream per agent,
+        newest wins — so consecutive flaps back off instead of taking the
+        stream back every second, and the log says why once."""
+        if lasted >= FLAP_S:
+            self._flaps = 0
+            return 1
+        self._flaps += 1
+        if self._flaps == FLAP_SAY:
+            h = self._serve_holder()
+            who = (f" (this bot's serve lock names pid {h.get('pid')}, "
+                   f"{h.get('role')})" if h and h.get("pid") else "")
+            self.log("the broker keeps closing this stream seconds after it "
+                     "opens: another process of THIS bot is taking it — only "
+                     "a Hermes process running this profile has its client "
+                     f"secret{who}; backing off")
+        return min(FLAP_MAX_S, FLAP_BASE_S * 2.0 ** self._flaps)
 
     def _inject(self, text):
         route = self.route or {}
@@ -2504,6 +2713,7 @@ class A2AHermes:
         self._stop.set()
         self._wake.set()
         self._ack_wake.set()
+        self._serve_release()
         resp = self._resp
         if resp is not None:
             try:
@@ -2635,8 +2845,15 @@ class A2AHermes:
             else:
                 c.append(_check("registered", True))
         label = self._chat_label(self.route)
+        yielded = self._yielded() if on and block == "host" else ""
         if not on:
             c.append(_check("push_host", None, detail="skipped: a2a is off"))
+        elif yielded:
+            c.append(_check("push_host", False, "auto",
+                            f"nothing to do: {yielded} — {label} is "
+                            "delivered there, and this process takes over by "
+                            "itself if that one stops",
+                            detail=yielded))
         elif (block == "host" and is_desktop(self.route)
                 and not _chats_in_gateway()):
             c.append(_check("push_host", False, "user",
@@ -2761,12 +2978,17 @@ class A2AHermes:
                 and not self.state["connected"]):
             # This process should hold the stream and does not, while the
             # broker serves one for this agent: another process has it.
+            h = self._serve_holder()
+            who = (f" — pid {h.get('pid')}, {h.get('role')}, per this bot's "
+                   f"serve lock" if h and h.get("pid") else "")
             stream.update(_check(
                 "stream", False, "user",
-                "another process holds this agent's stream (the broker "
-                "serves one, and it is not this one): close the other Hermes "
-                "process running this bot, or leave it as the one that "
-                "receives"))
+                "another Hermes process running THIS bot holds its stream"
+                f"{who} (the broker serves one per agent, and only a process "
+                "with this bot's client secret can hold it — never another "
+                "harness or agent, so do not stop other programs). Leave it "
+                "as the one that receives; if messages do not arrive, quit "
+                "the Hermes app and open it again"))
         step = _next_step(checks)
 
         return json.dumps({
@@ -2798,6 +3020,13 @@ class A2AHermes:
                 "last_error": self.state["error"] or None,
                 "gateway": self._gateway(),
                 "desktop_app": self._desktop_backend(),
+                # Which process delivers this bot's conversation (_ServeLock),
+                # and how often the broker ended a just-opened stream.
+                "serve_lock": {
+                    "held_here": bool(self._serve and self._serve.held),
+                    "holder": self._serve_holder(),
+                },
+                "stream_flaps": self._flaps,
                 # What this process runs on, reported only: nothing branches
                 # on the version. `path` is how it delivers conversations.
                 "hermes": {"version": _hermes_version(),

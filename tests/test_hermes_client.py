@@ -726,6 +726,7 @@ def main() -> int:
     desktop()
     gateway_chats()
     hold()
+    serve_and_gateway()
     tui_route()
     cloned()
     own_state()
@@ -2238,6 +2239,155 @@ def _no_dashboard():
     for name in ("tui_gateway.transport", "hermes_cli.web_server_app"):
         sys.modules.pop(name, None)
     _no_tui_gateway()
+
+
+def serve_and_gateway() -> None:
+    """`hermes serve` AND the gateway of a Hermes with `gateway ensure`, both
+    running one bot (a real machine, 2026-11-20: the app's supervisor starts
+    the gateway, the app talks to `hermes serve`). Both used to take the
+    stream — serve because the hold puts the chat in its table, the gateway on
+    the capability alone — and the broker's newest-wins evicted them in turn
+    every second. The serve lock makes the process serving the chat the one."""
+    hermes_constants.set_hermes_home_override = lambda path: path
+    hermes_constants.reset_hermes_home_override = lambda token: None
+    gateway_hermes(True)
+    try:
+        _serve_lock()
+        _two_dashboards()
+        _flaps()
+    finally:
+        gateway_hermes(False)
+        _no_dashboard()
+
+
+SERVED = {"surface": "desktop", "session_key": GW_ID, "ui_session_id": "a1b2",
+          "source": "desktop"}
+
+
+def _gateway_proc(fb, home):
+    mod = load(fb.url)
+    mod.PEEK_S = 0.3
+    ctx = Ctx("bot", gateway=True, tui=False,
+              state={"enabled": True, "route": dict(SERVED)})
+    gw = FakeGateway(ctx, home)
+    sys.modules["hermes_cli.gateway_client"].connect_gateway = gw.connect
+    sys.modules["hermes_cli.gateway_runtime"].discover_gateway_endpoint = (
+        gw.discover)
+    start(mod, ctx, home)
+    return ctx, gw
+
+
+def _dashboard_proc(fb, home, srv):
+    mod = load(fb.url)
+    mod.PEEK_S = 0.3
+    ctx = Ctx("bot", gateway=False, tui=True,
+              state={"enabled": True, "route": dict(SERVED)})
+    ctx.live_keys = _TableKeys(srv)
+    start(mod, ctx, home)
+    return ctx
+
+
+def _serve_lock() -> None:
+    fb = FakeBroker()
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    # The gateway first, as on that machine (it started 8 s earlier).
+    gctx, gw = _gateway_proc(fb, home)
+    g = ctx_inst(gctx)
+    check("serve lock: alone, the gateway delivers the bot's conversation "
+          "(a Hermes whose chats run in the gateway is unchanged)",
+          until(lambda: g.state["connected"]), str(g.state))
+    srv = dashboard(home)
+    dctx = _dashboard_proc(fb, home, srv)
+    d = ctx_inst(dctx)
+    check("serve lock: the dashboard serving the chat takes the stream",
+          until(lambda: d.state["connected"] and d._serve.held),
+          f"{d.state} held={d._serve.held}")
+    check("serve lock: and the gateway leaves it, never both",
+          until(lambda: not g.state["connected"])
+          and g.blocker() == "host", f"{g.state} {g.blocker()}")
+    time.sleep(0.5)
+    check("serve lock: it stays that way (no flapping)",
+          d.state["connected"] and not g.state["connected"],
+          f"{d.state} / {g.state}")
+    log = g.log_file.read_text()
+    check("serve lock: the gateway's log names the process it leaves it to",
+          any("gateway]" in ln and "leaving the stream to it" in ln
+              and f"(pid {os.getpid()})" in ln and "dashboard" in ln
+              for ln in log.splitlines()), log[-600:])
+    check("serve lock: each log line names its process (pid and role)",
+          f"pid={os.getpid()} dashboard]" in log
+          and f"pid={os.getpid()} gateway]" in log, log[-300:])
+    fb.live.put(msg("sg1"))
+    check("serve lock: a message is delivered once, by the dashboard, and "
+          "the gateway opens no chat for it",
+          until(lambda: "sg1" in dctx.ids_injected())
+          and "sg1" not in gctx.ids_injected() and not gw.rpcs(),
+          f"{dctx.injected[-1:]} / {gctx.injected} / {gw.rpcs()}")
+    st = json.loads(g.status({}))
+    host = next(c for c in st["checks"] if c["check"] == "push_host")
+    check("serve lock: the gateway's doctor says another process delivers, "
+          "and that nothing is to be done",
+          host["ok"] is False and host["do"].startswith("nothing to do")
+          and st["push"]["serve_lock"]["holder"]["role"] == "dashboard",
+          f"{host} {st['push']['serve_lock']}")
+    st = json.loads(d.status({}))
+    check("serve lock: the dashboard's doctor reports it holds it",
+          st["push"]["serve_lock"] == {"held_here": True, "holder": None}
+          and next(c for c in st["checks"]
+                   if c["check"] == "push_host")["ok"] is True,
+          str(st["push"]["serve_lock"]))
+    stop(dctx)
+    check("serve lock: the dashboard gone, the gateway takes over by itself",
+          until(lambda: g.state["connected"]), str(g.state))
+    stop(gctx)
+    settle()
+    fb.close()
+    _no_dashboard()
+
+
+def _two_dashboards() -> None:
+    fb = FakeBroker()
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    srv = dashboard(home)
+    actx = _dashboard_proc(fb, home, srv)
+    a = ctx_inst(actx)
+    until(lambda: a.state["connected"])
+    bctx = _dashboard_proc(fb, home, srv)
+    b = ctx_inst(bctx)
+    time.sleep(0.6)
+    check("two dashboards of one bot: only the first streams",
+          a.state["connected"] and not b.state["connected"]
+          and b.blocker() == "host", f"{a.state} / {b.state}")
+    stop(actx)
+    check("two dashboards: the second takes over when the first stops",
+          until(lambda: b.state["connected"]), str(b.state))
+    stop(bctx)
+    settle()
+    fb.close()
+    _no_dashboard()
+
+
+def _flaps() -> None:
+    fb = FakeBroker()
+    home = tempfile.mkdtemp(prefix="a2a-hermes-home-")
+    srv = dashboard(home)
+    ctx = _dashboard_proc(fb, home, srv)
+    inst = ctx_inst(ctx)
+    inst._flapped.__globals__["FLAP_BASE_S"] = 0.05
+    until(lambda: inst.state["connected"])
+    fb.stop.set()          # every stream now ends the moment it opens
+    check("flaps: a broker that keeps ending the stream gets a growing "
+          "backoff, not a reconnect every second",
+          until(lambda: inst._flaps >= 4, secs=8), str(inst._flaps))
+    said = inst.log_file.read_text().count("keeps closing this stream")
+    check("flaps: and the log says why exactly once", said == 1, str(said))
+    st = json.loads(inst.status({}))
+    check("flaps: the doctor counts them",
+          st["push"]["stream_flaps"] >= 4, str(st["push"]["stream_flaps"]))
+    stop(ctx)
+    settle()
+    fb.close()
+    _no_dashboard()
 
 
 def hold() -> None:
