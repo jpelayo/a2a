@@ -38,6 +38,7 @@ KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
 DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
 BROKER = HERE.parent / "deploy" / "a2a_mcp" / "a2a-mcp.py"
 
@@ -216,6 +217,14 @@ def main() -> int:
           hx.ENVELOPE_ID.findall(h_named) == ["m1"],
           str(hx.ENVELOPE_ID.findall(h_named)))
 
+    # --- Antigravity: its own copy, the same string ---------------------------
+    spec = importlib.util.spec_from_file_location("a2a_agy", AGY)
+    ax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ax)
+    check("antigravity renders byte-identically to codex, both shapes",
+          ax.envelope(MSG) == named and ax.envelope(ROOM) == room,
+          f"{ax.envelope(MSG)!r} vs {named!r}")
+
     # --- a DM over a station link: the sender is "name@station" --------------
     # The broker signs a DM that crossed a link as "alice@A", and the reply is
     # send_dm(to=<that sender>) — so every client must hand the string over
@@ -230,6 +239,7 @@ def main() -> int:
     cl = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cl)
     rendered = {"codex": cl.envelope(LINKED), "hermes": hx.envelope(LINKED),
+                "antigravity": ax.envelope(LINKED),
                 "opencode": node_envelopes(OPENCODE, (LINKED,))[0],
                 "kilocode": node_envelopes(KILOCODE, (LINKED,))[0],
                 "dsh": node_envelopes(DSH, (LINKED,))[0],
@@ -254,7 +264,8 @@ def main() -> int:
     spec = importlib.util.spec_from_file_location("a2a_codex_r", CODEX)
     cx = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cx)
-    trimmed = {"codex": cx._confirm(raw_json), "hermes": hx._confirm(raw_json)}
+    trimmed = {"codex": cx._confirm(raw_json), "hermes": hx._confirm(raw_json),
+               "antigravity": ax._confirm(raw_json)}
 
     spec = importlib.util.spec_from_file_location("a2a_broker_r", BROKER)
     br = importlib.util.module_from_spec(spec)
@@ -292,7 +303,8 @@ def main() -> int:
     # us straight back where this started.
     for label, path in (("claude", CLAUDE), ("opencode", OPENCODE),
                         ("kilocode", KILOCODE), ("dsh", DSH),
-                        ("pi", PI), ("codex", CODEX), ("hermes", HERMES)):
+                        ("pi", PI), ("codex", CODEX), ("hermes", HERMES),
+                        ("antigravity", AGY)):
         src = path.read_text()
         check(f"{label}: no delivered field is called 'to' any more",
               'm.to' not in src and 'm["to"]' not in src

@@ -1,0 +1,11 @@
+{
+  "a2a-turn-end": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 -B -I ./a2a-stop.py",
+        "timeout": 10
+      }
+    ]
+  }
+}

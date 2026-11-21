@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "a2a": {
+      "command": "python3",
+      "args": ["-B", "-I", "${PLUGIN_ROOT}/a2a-antigravity.py"]
+    }
+  }
+}

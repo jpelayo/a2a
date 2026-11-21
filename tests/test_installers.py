@@ -324,6 +324,48 @@ def main() -> int:
         check("the shared-file route /install/kilo is gone", old[0] == 404,
               str(old[0]))
 
+        # --- Antigravity: an agy plugin folder with its own client ------------
+        code, body, ctype = get(f"{base}/install/antigravity/{token}")
+        check("antigravity: served", code == 200, f"HTTP {code}")
+        check("antigravity: is application/gzip", "gzip" in ctype, ctype)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as t:
+                amembers = {m.name: t.extractfile(m).read().decode()
+                            for m in t.getmembers() if m.isfile()}
+        except Exception as e:
+            amembers = {}
+            check("antigravity: extracts as a gzipped tar", False, repr(e))
+        check("antigravity: exactly the plugin — manifest, MCP config, hooks, "
+              "rules, the server and the Stop hook",
+              sorted(amembers) == ["a2a-antigravity.py", "a2a-stop.py",
+                                   "hooks.json", "mcp_config.json",
+                                   "plugin.json", "rules/AGENTS.md"],
+              str(sorted(amembers)))
+        adir = ROOT / "deploy" / "plugin" / "antigravity"
+        asrc = (adir / "a2a-antigravity.py").read_text()
+        served = amembers.get("a2a-antigravity.py", "")
+        check("antigravity: the server is its own client with the credentials "
+              "baked into its seam — nothing else changed",
+              "A2A_BAKED = {}" not in served and token in served
+              and served.replace(served.split("A2A_BAKED = ", 1)[-1]
+                                 .split("\n", 1)[0], "{}", 1) == asrc,
+              served[:120])
+        check("antigravity: the docstring still opens the file (the seam is "
+              "replaced, never prepended)", served.startswith("#!/usr/bin/env"))
+        check("antigravity: and the hook carries no credential",
+              amembers.get("a2a-stop.py") == (adir / "a2a-stop.py").read_text()
+              and token not in amembers.get("a2a-stop.py", ""))
+        try:
+            apkg = json.loads(amembers.get("plugin.json", "{}"))
+        except ValueError:
+            apkg = {}
+        check("antigravity: plugin.json names the plugin a2a, version stamped",
+              apkg.get("name") == "a2a"
+              and apkg.get("version") == health.get("version"), str(apkg))
+        bad_ag = get(f"{base}/install/antigravity/a2a_st_wrong")
+        check("a bad token 404s on the antigravity route", bad_ag[0] == 404,
+              str(bad_ag[0]))
+
         # --- the installer: public, and carrying no secret -------------------
         # Reached with NO bearer: it is what a user runs before they have
         # typed a token anywhere, so the auth middleware must let it through.

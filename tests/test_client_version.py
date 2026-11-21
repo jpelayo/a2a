@@ -179,6 +179,8 @@ def main() -> int:
                   "\n    check_version()"),
         "hermes": (PLUGIN / "hermes" / "__init__.py", "self.log(",
                    "_version_checked", "self._check_version()"),
+        "antigravity": (PLUGIN / "antigravity" / "a2a-antigravity.py", "log(",
+                        "_version_checked", "\n    check_version()"),
     }
     for name, (path, free_path, once, called) in clients.items():
         src = path.read_text()

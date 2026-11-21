@@ -144,9 +144,9 @@ def main() -> int:
         except ValueError as e:
             why = str(e)
         check(f"refused: {label}", word in why, why)
-    # Every client the broker serves can report — the two newest included —
-    # and a send-only process reports receives=false.
-    for harness in ("kilocode", "dsh"):
+    # Every client the broker serves can report — the newest included — and
+    # a send-only process reports receives=false.
+    for harness in ("kilocode", "dsh", "antigravity"):
         try:
             CS.validate(dict(GOOD, harness=harness, route="project",
                              receives=False))

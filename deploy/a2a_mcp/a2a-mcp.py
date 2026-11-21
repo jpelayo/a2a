@@ -212,7 +212,12 @@ KILOCODE_JS = PLUGIN_SRC / "kilocode" / "a2a-kilocode.js"
 # package.json, cordis.patch.yml, the index.js entry and dsh's own client,
 # a2a-dsh.js, which carries the baked credentials.
 DSH_DIR = PLUGIN_SRC / "dsh"
-# The installer: GET /install, public. One interactive program for all seven
+# Antigravity (the agy CLI): GET /install/antigravity/<token>. An Antigravity
+# plugin folder — plugin.json, mcp_config.json, hooks.json, rules/, the MCP
+# server a2a-antigravity.py (credentials baked into its seam) and its Stop
+# hook a2a-stop.py.
+ANTIGRAVITY_DIR = PLUGIN_SRC / "antigravity"
+# The installer: GET /install, public. One interactive program for all eight
 # clients, served with the broker's url and version baked and NO token — the
 # token is typed into it, so it never sits in a URL or a shell history.
 INSTALLER_PY = PLUGIN_SRC / "installer" / "a2a-install.py"
@@ -2871,7 +2876,7 @@ class ClientStateRegistry:
     of it rides on a message, a stream line or /me. Sync, like the others."""
 
     HARNESSES = ("claude", "codex", "opencode", "pi", "hermes", "kilocode",
-                 "dsh")
+                 "dsh", "antigravity")
     ROUTES = ("project", "app", "tui", "chat")
     SETTINGS = ("own", "copied")
     KEYS = ("harness", "version", "switch", "route", "receives", "settings",
@@ -6662,6 +6667,57 @@ def build_app() -> Starlette:
             },
         )
 
+    async def antigravity_install(request: Request):
+        """The Antigravity (agy CLI) client: an Antigravity plugin folder,
+        tar.gz — plugin.json (its version stamped), mcp_config.json,
+        hooks.json, rules/, the MCP server a2a-antigravity.py with the
+        credentials baked into its `A2A_BAKED = {}` seam (as Codex's: the
+        file opens with a module docstring), and the Stop hook a2a-stop.py.
+        The installer unpacks it straight into ~/.gemini/config/plugins/a2a,
+        agy's global plugin folder, and runs no agy command.
+        Unknown, revoked and not-installed all answer the same 404."""
+        missing = JSONResponse(
+            {"error": "no installer available"}, status_code=404
+        )
+        token = request.path_params["token"]
+        client = ANTIGRAVITY_DIR / "a2a-antigravity.py"
+        manifest_file = ANTIGRAVITY_DIR / "plugin.json"
+        if not client.is_file() or not manifest_file.is_file() \
+                or not await _db(lambda: TOKENS.resolve(token)):
+            return missing
+        base = PUBLIC_URL or f"{request.url.scheme}://{request.url.netloc}"
+        baked = json.dumps({
+            "url": base,
+            "token": token,
+            "station": request.query_params.get("station") or "",
+            "agent": request.query_params.get("agent") or "",
+            "version": VERSION,
+        })
+        src = _bake_seam(client.read_bytes(), baked)
+        if src is None:
+            return JSONResponse(
+                {"error": "installer source is missing its A2A_BAKED seam"},
+                status_code=500,
+            )
+        manifest = json.loads(manifest_file.read_text())
+        manifest["version"] = VERSION
+        body = await _db(lambda: _archive_dir(
+            ANTIGRAVITY_DIR, "tar.gz",
+            rewrite={
+                "plugin.json":
+                    (json.dumps(manifest, indent=2) + "\n").encode(),
+                "a2a-antigravity.py": src,
+            },
+        ))
+        return Response(
+            body, media_type="application/gzip",
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="a2a-antigravity.tar.gz"',
+                "Cache-Control": "no-store, must-revalidate",
+            },
+        )
+
     async def stream_route(request: Request) -> StreamingResponse:
         """Stream the caller's messages: pending first, then live.
 
@@ -7697,6 +7753,8 @@ def build_app() -> Starlette:
     routes.append(Route("/install/kilocode/{token}", kilocode_install,
                         methods=["GET"]))
     routes.append(Route("/install/dsh/{token}", dsh_install, methods=["GET"]))
+    routes.append(Route("/install/antigravity/{token}", antigravity_install,
+                        methods=["GET"]))
     routes.append(Route("/install/{token}", opencode_install, methods=["GET"]))
     routes.append(Route("/stream", stream_route, methods=["GET"]))
 

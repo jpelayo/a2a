@@ -53,6 +53,7 @@ PLUGIN = HERE.parent / "deploy" / "plugin"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
 
 fails: list[str] = []
 
@@ -542,6 +543,64 @@ def run_codex(contents, follow=()) -> dict:
     }
 
 
+def run_agy(contents, follow=()) -> dict:
+    """The real Antigravity client as agy runs it: cwd = the PLUGIN folder,
+    PWD = the project, PLUGIN_DATA and TMPDIR of its own (kept out of the
+    real ~/.gemini), spoken to over MCP stdio."""
+    fb = FakeBroker()
+    proj = _project(contents)
+    side = proj.parent / (proj.name + "-agy")
+    tmp = side / "tmp"
+    tmp.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("A2A_", "PLUGIN_"))}
+    env.update(A2A_URL=fb.url, A2A_TOKEN="t", PWD=str(proj),
+               PLUGIN_ROOT=str(AGY.parent), TMPDIR=str(tmp),
+               PLUGIN_DATA=str(side / "antigravity-cli" / "plugin_data"
+                               / "a2a"))
+    proc = subprocess.Popen([sys.executable, "-B", "-I", str(AGY)],
+                            cwd=str(AGY.parent), env=env, text=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+
+    def say(obj):
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+
+    say({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    say({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    say({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    time.sleep(1.5)
+    before = list(fb.calls)
+    boxes = list((tmp / "a2a-agy").glob("*/live"))
+    for i, (name, args) in enumerate(follow):
+        say({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call",
+             "params": {"name": name, "arguments": args}})
+        time.sleep(1.5)
+    after = fb.calls[len(before):]
+    live_after = list((tmp / "a2a-agy").glob("*/live"))
+    proc.stdin.close()
+    out, err = proc.communicate(timeout=30)
+    fb.close()
+    replies = {r.get("id"): r.get("result") or {}
+               for r in (json.loads(l) for l in out.splitlines() if l.strip())}
+    try:
+        file = json.loads((proj / ".a2a.json").read_text())
+    except Exception:
+        file = None
+    return {
+        "before": before, "after": after, "stderr": err,
+        "clients": [c for p, c in fb.clients],
+        "instructions": (replies.get(1) or {}).get("instructions"),
+        "tools": [t["name"] for t in (replies.get(2) or {}).get("tools", [])],
+        "results": [((replies.get(10 + i) or {}).get("content")
+                     or [{}])[0].get("text") or "null"
+                    for i in range(len(follow))],
+        "file": file, "mailbox": bool(boxes), "mailbox_after": bool(live_after),
+        "pycache": any(p.name == "__pycache__" for p in AGY.parent.rglob("*")),
+    }
+
+
 def codex_off_stops_the_stream() -> dict:
     """Drive the real pump in-process: on, deliver; OFF, and a line arriving
     after that must be neither injected nor acked; on again, and the broker's
@@ -838,6 +897,50 @@ def main() -> int:
     check("codex: on again, the same message arrives — held, not lost",
           st["reconnected"] and st["m2_in_after"] and st["m2_acked_after"],
           str(st))
+
+    # --- Antigravity: the real client, as agy runs it -------------------------
+    for label, contents in (("no .a2a.json at all", None),
+                            ('{"enabled_antigravity": "true"} — a STRING',
+                             {"enabled_antigravity": "true"}),
+                            ("ONLY the other clients' keys",
+                             {"enabled_codex": True, "enabled_opencode": True}),
+                            ('{"enabled": true} — the bare key',
+                             {"enabled": True})):
+        got = run_agy(contents)
+        check(f"antigravity: {label} → NOTHING reaches the broker, and no "
+              f"mailbox for the hook to act on",
+              got["before"] == [] and not got["mailbox"],
+              f'{got["before"]} {got["mailbox"]}')
+        check(f"antigravity: {label} → no brief, but every tool is listed",
+              not got["instructions"] and "enable_a2a_here" in got["tools"]
+              and "a2a_inbox" in got["tools"], str(got["tools"]))
+    off = run_agy(None, follow=[("a2a_channel_status", {})])
+    step = (json.loads(off["results"][0]) or {}).get("next_step") or ""
+    check("antigravity: asked what is wrong in a project that is off, it says "
+          "THAT first and leaves the decision to the user",
+          "a2a is off" in step and "enable_a2a_here" in step, step)
+    on = run_agy({"enabled_antigravity": True},
+                 follow=[("enable_a2a_here", {"enabled": False})])
+    check('antigravity: {"enabled_antigravity": true} connects, streams and '
+          "opens the mailbox, briefed",
+          "/me" in on["before"] and "/stream" in on["before"] and on["mailbox"]
+          and "ADDRESSING IS AN ARGUMENT" in (on["instructions"] or ""),
+          f'{on["before"]} {on["mailbox"]}')
+    check("antigravity: every request naming its agent carries ONE client key",
+          on["clients"] and len(set(on["clients"])) == 1
+          and on["clients"][0].startswith("a2a_ck_"), str(on["clients"]))
+    check("antigravity: turning it OFF takes the mailbox away, so the waiter "
+          "and the hook stop", not on["mailbox_after"], str(on["results"]))
+    sw = run_agy({"catchup": 42, "enabled_pi": True},
+                 follow=[("enable_a2a_here", {"enabled": True})])
+    check("antigravity: the switch MERGES and connects this session with no "
+          "restart",
+          sw["file"] == {"catchup": 42, "enabled_pi": True,
+                         "enabled_antigravity": True}
+          and sw["before"] == [] and "/stream" in sw["after"]
+          and sw["mailbox_after"], f'{sw["file"]} {sw["after"]}')
+    check("antigravity: and nothing was written into the plugin folder",
+          not sw["pycache"])
 
     # --- Pi: source, because typebox is not installed here --------------------
     pi = PI.read_text()

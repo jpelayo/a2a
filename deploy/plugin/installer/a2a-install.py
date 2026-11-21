@@ -86,7 +86,11 @@ HARNESSES = (
     ("hermes", "Hermes (bots)", True, ".hermes", "hermes"),
     ("kilocode", "Kilo Code", True, ".config/kilo", "kilo"),
     ("dsh", "DeepSeek Harness", True, ".dsh", "dsh"),
+    ("antigravity", "Antigravity CLI", True, ".gemini/antigravity-cli", "agy"),
 )
+# What an agy permission allow rule for a2a's tools looks like: plugin a2a,
+# server a2a. MCP tools ask before every call until it is added.
+AGY_ALLOW = "mcp(a2a_a2a/*)"
 NAMES = {h[0]: h[1] for h in HARNESSES}
 
 
@@ -103,6 +107,10 @@ def install_dir(key, profile_home=None):
         # A dsh package, added to a profile by dsh's own command. Outside
         # every profile root, where dsh watches for changes.
         "dsh": DSH_HOME / "a2a" / "plugin",
+        # An Antigravity plugin folder, where agy keeps installed plugins
+        # (its documented global install place; both the CLI and the app
+        # load it from here).
+        "antigravity": HOME / ".gemini" / "config" / "plugins" / "a2a",
     }.get(key) or (profile_home / "plugins" / "a2a")
 
 
@@ -133,7 +141,8 @@ def client_file(key, profile_home=None):
     d = install_dir(key, profile_home)
     return {"opencode": d / "a2a-opencode.js", "pi": d / "index.ts",
             "codex": d / "a2a-codex.py", "hermes": d / "__init__.py",
-            "kilocode": d / "a2a-kilocode.js", "dsh": d / "a2a-dsh.js"}.get(key)
+            "kilocode": d / "a2a-kilocode.js", "dsh": d / "a2a-dsh.js",
+            "antigravity": d / "a2a-antigravity.py"}.get(key)
 
 
 def installed_version(key, profile_home=None):
@@ -330,7 +339,8 @@ def fetch(key, token, agent="", profile=""):
     path = {"claude": "/a2a-claudecode.tar.gz", "opencode": f"/install/{q}",
             "pi": f"/install/pi/{q}", "codex": f"/install/codex/{q}",
             "hermes": f"/install/hermes/{q}", "kilocode": f"/install/kilocode/{q}",
-            "dsh": f"/install/dsh/{q}"}[key]
+            "dsh": f"/install/dsh/{q}",
+            "antigravity": f"/install/antigravity/{q}"}[key]
     query = {}
     if key != "claude" and agent:
         query["agent"] = agent
@@ -394,8 +404,8 @@ def tilde(p):
 # ---------------------------------------------------------------------------
 
 class G:
-    check, cross, dot, arrow, dash, bullet, updown = (
-        "x", "!", "*", "->", "-", "-", "up/down")
+    check, cross, dot, arrow, dash, bullet, updown, warn = (
+        "x", "!", "*", "->", "-", "-", "up/down", "!")
 
     @classmethod
     def setup(cls):
@@ -405,8 +415,8 @@ class G:
             pass
         if "utf" in (locale.getpreferredencoding(False) or "").lower():
             (cls.check, cls.cross, cls.dot, cls.arrow, cls.dash, cls.bullet,
-             cls.updown) = ("✓", "✗", "•", "→", "—",
-                            "·", "↑↓")
+             cls.updown, cls.warn) = ("✓", "✗", "•", "→", "—",
+                                      "·", "↑↓", "⚠")
 
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1128,84 @@ def _hermes_state_on(home):
     return None
 
 
+# Claude Code's managed settings: they win over the user's, so a2a switched
+# off there is off whatever the user's file says.
+CLAUDE_MANAGED = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+)
+
+
+def _a2a_entry(mapping):
+    """(key, value) of the a2a plugin in a Claude Code settings map, keyed
+    "a2a@<marketplace>"; (None, None) if absent."""
+    if isinstance(mapping, dict):
+        for k, v in mapping.items():
+            if k == "a2a" or str(k).startswith("a2a@"):
+                return k, v
+    return None, None
+
+
+def claude_state():
+    """Why Claude Code's installed a2a cannot work, or None: "off" (switched
+    off in /plugin), "off_no_token" (off, and the plugin's hook cleared its
+    token, as it does on every switch-off) or "no_token".
+
+    Read only. The installer never writes Claude Code's settings — the switch
+    and the token are /plugin's — and of the token it looks only at whether
+    the key exists: its value is never read into anything, shown or kept.
+    A project's own settings may differ; this checks what applies everywhere.
+    """
+    if not install_dir("claude").is_dir():
+        return None
+
+    def load(path):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    user = load(HOME / ".claude" / "settings.json")
+    enabled = None
+    for settings in [load(p) for p in CLAUDE_MANAGED] + [user]:
+        key, value = _a2a_entry(settings.get("enabledPlugins"))
+        if key is not None:
+            enabled = value
+            break
+    _, cfg = _a2a_entry(user.get("pluginConfigs"))
+    opts = cfg.get("options") if isinstance(cfg, dict) else None
+    has_token = isinstance(cfg, dict) and (
+        "token" in cfg or (isinstance(opts, dict) and "token" in opts))
+    if enabled is False:
+        return "off" if has_token else "off_no_token"
+    return None if has_token else "no_token"
+
+
+def claude_advice(state, first):
+    """The lines that tell what to do about claude_state(), or []."""
+    a = G.arrow
+    if state in ("off", "off_no_token"):
+        gone = state == "off_no_token"
+        return [("Claude Code: a2a is switched OFF"
+                 + (", and its token is gone (the plugin clears it when it is "
+                    "switched off)" if gone else "") + "."),
+                f"In Claude Code: /plugin {a} a2a {a} Enable"
+                + (f" {a} paste your token" if gone else "")
+                + ". Then start your sessions with:",
+                f"   {CLAUDE_LAUNCH}"]
+    if state == "no_token" and first:
+        return ["Claude Code: start it with",
+                f"   {CLAUDE_LAUNCH}",
+                f"then type /plugin {a} enable a2a {a} paste your token."]
+    if state == "no_token":
+        return ["Claude Code: a2a has no token.",
+                f"In Claude Code: /plugin {a} a2a {a} Disable, then Enable "
+                f"{a} paste your token. Then start your sessions with:",
+                f"   {CLAUDE_LAUNCH}"]
+    return []
+
+
 def setup_needed(targets):
     """The harness commands still needed: [(whose, what it does, argv)].
 
@@ -1201,11 +1289,15 @@ def _table(rows, indent="  "):
             + "  " + r[-1] for r in rows]
 
 
-def summary(targets, cmds):
+def summary(targets, cmds, needs=()):
     """The confirmation screen: what will be written, and what will be asked.
     One line per token — whose it is, which harnesses get it, its stations —
-    and never the token itself."""
+    and never the token itself. `needs` (lines), if any, goes first: a
+    client that is installed but cannot work, such as Claude Code's a2a
+    switched off."""
     lines = []
+    if needs:
+        lines += [f"{G.warn} Needs you", *[f"  {l}" for l in needs], ""]
     groups = {}
     for t in targets:
         if t.token:
@@ -1257,30 +1349,38 @@ def run_setup(say, cmds, use_tty):
             ok, why = False, f"{argv[0]} is not on PATH"
         except subprocess.TimeoutExpired:
             ok, why = False, "it did not finish"
-        if ok:
-            say(f"  {G.check} {who}: {what}")
-        else:
+        if not ok:
             say(f"  {G.cross} {who}: {what} {G.dash} did not work"
-                + (f" ({why})" if why else "") + "; it is in your next steps")
+                + (f" ({why})" if why else ""))
             failed.append((who, what, argv))
+    if not failed:
+        say(f"  {G.check} done")
     return failed
 
 
-def next_steps(targets, pending, hermes_touched):
-    """What is left for the person, in the order to do it: [[line, ...]]."""
+def next_steps(targets, pending, hermes_touched, failed=(), claude=None):
+    """What is left for the person: (needs, todo), each [[line, ...]].
+
+    `needs` is only what keeps a2a from working until the person acts: a
+    command not run or that failed, a setting not written, Claude Code's a2a
+    switched off or without its token. `todo` is the ordinary rest — the
+    restarts, the launch lines, "enable a2a here" — and the first-install
+    notes. Nothing else: an installer that prints everything gets nothing
+    read, and Claude Code switched off went unseen exactly that way."""
     first = {t.key for t in targets if t.before is None}
     # Byte-identical to what was installed: there is nothing to restart, and
     # saying so would only cost a restart.
     changed = {t.key for t in targets if not t.same}
     keys = {t.key for t in targets}
-    steps = []
+    needs, steps = [], []
     for who, what, argv in pending:
-        steps.append([f"{who}: {what}. Run:", f"   {command_text(argv)}"])
-    if "claude" in first:
-        steps.append([f"Claude Code: start it with",
-                      f"   {CLAUDE_LAUNCH}",
-                      f"then type /plugin {G.arrow} enable a2a {G.arrow} "
-                      "paste your token."])
+        needs.append([f"{who}: {what}"
+                      + (f" {G.dash} did not work" if (who, what, argv)
+                         in failed else "") + ". Run:",
+                      f"   {command_text(argv)}"])
+    advice = claude_advice(claude, "claude" in first)
+    if advice:
+        needs.append(advice)
     elif "claude" in changed:
         steps.append(["Claude Code: restart your sessions "
                       "(/reload-plugins does not pick up a new copy)."])
@@ -1292,14 +1392,25 @@ def next_steps(targets, pending, hermes_touched):
                       "Desktop app if you use it."])
     dsh_pending = [argv for _, _, argv in pending if argv[:2] == ["dsh", "plugin"]]
     if dsh_pending and shutil.which("pnpm") is None:
-        steps.append(["DeepSeek Harness: `dsh plugin` needs pnpm on your PATH "
+        needs.append(["DeepSeek Harness: `dsh plugin` needs pnpm on your PATH "
                       "(npm install -g pnpm), then run the command above."])
     if any("desktop" in argv for argv in dsh_pending):
         steps.append(["DeepSeek Harness Desktop: only the app's own dsh may "
                       "change its profile. In the app, use \"Manage dsh "
                       "Command…\" to install it, quit the app, run the "
                       "desktop command above, and open the app again."])
-    off = [NAMES[k] for k in ("opencode", "pi", "codex", "kilocode", "dsh")
+    if "antigravity" in changed:
+        # agy starts a plugin's MCP server once, at boot.
+        steps.append(["Antigravity: quit agy and start it again, so it loads "
+                      "a2a (and the Antigravity app, if it is open)."])
+    if "antigravity" in first:
+        steps.append(["Antigravity: a2a's tools ask before every call until "
+                      "you allow them, once: in agy type /permissions, pick "
+                      f"Global, then the allow list, press A and add {AGY_ALLOW}",
+                      "a2a receives in the agy CLI; the Antigravity app only "
+                      "sends."])
+    off = [NAMES[k] for k in ("opencode", "pi", "codex", "kilocode", "dsh",
+                              "antigravity")
            if k in first]
     if off:
         names = (", ".join(off[:-1]) + " and " + off[-1] if len(off) > 1
@@ -1338,7 +1449,7 @@ def next_steps(targets, pending, hermes_touched):
     for t in targets:
         if t.key == "opencode" and t.setting and t.setting[1] is None:
             # The file is never shown: it may hold provider keys.
-            steps.append([f"OpenCode: a2a could not set {IDLE_SHOWN} in "
+            needs.append([f"OpenCode: a2a could not set {IDLE_SHOWN} in "
                           f"{tilde(t.setting[0])}: it is not a config "
                           "OpenCode can read, or could not be written, so "
                           "a2a left it as it was.",
@@ -1359,22 +1470,59 @@ def next_steps(targets, pending, hermes_touched):
                       "loads a2a.",
                       "(If you run the Hermes gateway yourself instead, "
                       "restart it.)"])
-    for t in targets:
-        if t.key == "hermes" and not _hermes_config(t.dest.parent.parent)[2]:
-            steps.append([f"{t.label}: in the Hermes app, open the "
-                          "conversation with this bot that should carry a2a "
-                          "and say \"enable a2a here\" (a messaging chat with "
-                          "the bot works too).",
-                          "a2a messages go into it while Hermes's gateway "
-                          "runs, whether or not the app shows it."
-                          if in_gateway else
-                          "Keep that conversation open: a2a messages go into "
-                          "it while it is open, and wait on the broker while "
-                          "it is closed."])
+    off_bots = [t for t in targets if t.key == "hermes"
+                and not _hermes_config(t.dest.parent.parent)[2]]
+    if off_bots:
+        # One step for every bot still off, not one each: the same words
+        # repeated per bot were most of what nobody read.
+        if len(off_bots) == 1:
+            who, which = off_bots[0].label, "with this bot"
+        else:
+            names = [f"'{t.profile}'" for t in off_bots]
+            who = ("Hermes bots " + ", ".join(names[:-1]) + " and "
+                   + names[-1])
+            which = "with each of them"
+        steps.append([f"{who}: in the Hermes app, open the conversation "
+                      f"{which} that should carry a2a and say \"enable a2a "
+                      "here\" (a messaging chat with the bot works too).",
+                      "a2a messages go into it while Hermes's gateway "
+                      "runs, whether or not the app shows it."
+                      if in_gateway else
+                      "Keep that conversation open: a2a messages go into "
+                      "it while it is open, and wait on the broker while "
+                      "it is closed."])
     if first:
         steps.append(["Your operator approves each new agent when it asks to "
                       "be registered."])
-    return steps
+    return needs, steps
+
+
+def installed_line(targets, broken, wrote_setting):
+    """What was installed, in one line: new, updated, already current. The
+    per-file table is on the confirmation screen; after it, the paths are
+    noise."""
+    groups = {"new": [], "updated": [], "already current": []}
+    for t in targets:
+        if t in broken:
+            continue
+        status = ("new" if t.before is None else
+                  "already current" if t.same else "updated")
+        groups[status].append(t)
+    parts = []
+    for status, ts in groups.items():
+        if not ts:
+            continue
+        names = [t.label for t in ts if t.key != "hermes"]
+        bots = [t for t in ts if t.key == "hermes"]
+        if len(bots) == 1:
+            names.append(bots[0].label)
+        elif bots:
+            names.append(f"{len(bots)} Hermes bots")
+        parts.append(f"{status}: {', '.join(names)}")
+    if wrote_setting:
+        parts.append(f"OpenCode setting {IDLE_SHOWN}")
+    return (f"{G.check} Installed {VERSION} {G.dash} "
+            + f" {G.bullet} ".join(parts)) if parts else ""
 
 
 def choose_ui():
@@ -1420,7 +1568,7 @@ def main():
                 ui.close()
                 print("a2a: no supported harness was found here (Claude Code, "
                       "OpenCode, Pi, Codex, Hermes, Kilo Code, DeepSeek "
-                      "Harness).")
+                      "Harness, Antigravity CLI).")
                 return 1
             picked = ui.checklist("Install or update a2a for which "
                                   "harnesses?", rows)
@@ -1437,7 +1585,11 @@ def main():
             targets = plan(selected, bots, tokens)
             download(ui, targets)
             cmds = setup_needed(targets)
-            if not ui.confirm("Ready to install", summary(targets, cmds)):
+            # Said before anything is written too: Claude Code switched off
+            # is the one thing no reinstall can fix, and it was missed.
+            early = claude_advice(claude_state(), False)
+            if not ui.confirm("Ready to install",
+                              summary(targets, cmds, early)):
                 raise Cancelled()
         finally:
             ui.close()
@@ -1446,16 +1598,14 @@ def main():
         return 1
 
     say = plain.say
-    rows, broken = [], []
+    broken, unwritten = [], []
     for t in targets:
         try:
             for path, data, mode in t.files:
                 write_file(path, data, mode)
-            rows.append([f"{G.check} {t.label}", _change(t), _where(t)])
         except OSError as e:
-            rows.append([f"{G.cross} {t.label}", "could not write",
-                         str(e.strerror or e)])
             broken.append(t)
+            unwritten.append(f"{t.label}: {e.strerror or e}")
     wrote_setting = False
     for t in targets:
         if t in broken or not t.setting or t.setting[1] is None:
@@ -1463,24 +1613,21 @@ def main():
         path, data = t.setting
         try:
             write_file(path, data, _mode_of(path))
-            rows.append([f"{G.check} {t.label} setting", IDLE_SHOWN,
-                         tilde(path)])
             wrote_setting = True
-        except OSError as e:
-            rows.append([f"{G.cross} {t.label} setting", "could not write",
-                         str(e.strerror or e)])
-            t.setting = (path, None)
-    say("", f"a2a {VERSION} {G.dash} {URL}", "", "Installed", *_table(rows))
+        except OSError:
+            t.setting = (path, None)        # its next step says why
+    say("", f"a2a {VERSION} {G.dash} {URL}")
+    line = installed_line(targets, broken, wrote_setting)
+    if line:
+        say(line)
     targets = [t for t in targets if t not in broken]
     cmds = [c for c in cmds if c[0] in {t.label for t in targets}]
 
-    pending = []
+    pending, failed = [], []
     if cmds:
         say("", "Setup still needed")
-        width = max(len(who) for who, _, _ in cmds)
         for who, what, argv in cmds:
-            say(f"  {who.ljust(width)}  {what}",
-                f"  {' ' * width}  {G.dash} {command_text(argv)}")
+            say(f"  {who} {G.dash} {what}:  {command_text(argv)}")
         ask = ("Run this command now?" if len(cmds) == 1
                else f"Run these {len(cmds)} commands now?")
         try:
@@ -1488,29 +1635,30 @@ def main():
         except Cancelled:
             run = False
         if run:
-            pending = run_setup(say, cmds, tty)
+            failed = run_setup(say, cmds, tty)
+            pending = list(failed)
         else:
-            say("  Not run; they are in your next steps.")
+            say("  Not run; they are under Needs you.")
             pending = list(cmds)
     hermes_touched = any(t.key == "hermes" and not t.same
                          for t in targets) or any(
         argv[0] == "hermes" for _, _, argv in cmds)
 
-    steps = next_steps(targets, pending, hermes_touched)
+    needs, todo = next_steps(targets, pending, hermes_touched, failed,
+                             claude_state())
     if broken:
-        steps.insert(0, ["Run the installer again for what could not be "
-                         "written: " + ", ".join(t.label for t in broken)
-                         + "."])
-    if steps:
-        say("", "Next steps")
-        for i, lines in enumerate(steps, 1):
-            say(f"  {i}. {lines[0]}", *[f"     {l}" for l in lines[1:]])
-    elif wrote_setting:
-        say("", "Nothing else to do.")
-    else:
-        say("", "Nothing else to do: everything you picked was already "
-                "current.")
-    say("", "To update later, run the same command again.")
+        needs.insert(0, ["Could not write " + "; ".join(unwritten)
+                         + ". Run the installer again."])
+    for title, steps in ((f"{G.warn} Needs you", needs), ("To do", todo)):
+        if steps:
+            say("", title)
+            for lines in steps:
+                say(f"  {G.dot} {lines[0]}", *[f"    {l}" for l in lines[1:]])
+    n = len(needs)
+    say("", f"{G.warn} {n} thing{'s' if n != 1 else ''} need{'' if n != 1 else 's'} "
+            "you (above)." if n else
+            f"{G.check} Done {G.dash} only the To do above is left." if todo
+            else f"{G.check} Done {G.dash} nothing to do.")
     return 1 if broken else 0
 
 

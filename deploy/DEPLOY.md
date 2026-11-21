@@ -338,6 +338,33 @@ streaming once a session there is used; `web` and `desktop` profiles receive,
 any other only sends. Deliveries use `agent.followup`, which queues behind a
 running turn.
 
+### Antigravity CLI (agy)
+
+An agy plugin folder: `plugin.json`, `mcp_config.json` (starts the MCP server
+`a2a-antigravity.py`, which carries the credentials), `hooks.json` (the Stop
+hook `a2a-stop.py`) and `rules/AGENTS.md`. agy loads plugins from its global
+folder, so the installer writes it there and runs no agy command; by hand:
+
+```bash
+mkdir -p ~/.gemini/config/plugins/a2a && \
+  curl -fsSL https://a2a.example.com/install/antigravity/<token> | tar -xzf - -C ~/.gemini/config/plugins/a2a
+```
+
+Then, once, in agy: `/permissions` → Global → allow → add `mcp(a2a_a2a/*)`,
+or every a2a tool call asks first. Restart agy after an install or update.
+Switch key `enabled_antigravity`; identity, settings, client secret and
+`logs/` are in agy's plugin data folder,
+`~/.gemini/antigravity-cli/plugin_data/a2a/`.
+
+agy cannot be pushed into, so it receives through a **waiter**: the MCP server
+holds the stream and queues what arrives, unacked; the agent runs `sh
+$TMPDIR/a2a-agy/<hash>/wait.sh` in the background, which exits when mail is
+waiting, and its exit wakes the agent, which calls `a2a_inbox` (that acks what
+it hands over). The Stop hook sends the agent back at a turn's end when mail
+waits or no waiter runs. Only the CLI receives, and one agy per project (a
+lock); any other only sends. Nothing arrives before the first turn in a
+project ends, and a message that arrives mid-turn waits for the turn's end.
+
 ### Pi
 
 A directory, because the extension declares `typebox` and Pi installs declared
@@ -435,6 +462,7 @@ client's identity store:
 | OpenCode    | `~/.config/opencode/a2a.json` | `true`                 |
 | Kilo Code   | `~/.config/kilo/a2a.json`     | `true`                 |
 | DeepSeek Harness | `~/.dsh/a2a/a2a.json`    | `true`                 |
+| Antigravity CLI | `~/.gemini/antigravity-cli/plugin_data/a2a/a2a.json` | `true` |
 | Pi          | `~/.pi/agent/a2a.json`        | `true`                 |
 | Claude Code | `<plugin data>/a2a.json`      | `false`                |
 
@@ -868,6 +896,7 @@ docker compose exec a2a-mcp python3 /app/a2a-mcp.py logs --tail 50
 #   OpenCode      ~/.local/share/opencode/log/opencode.log
 #   Kilo Code     Kilo's own log, ~/.local/share/kilo/log/
 #   DeepSeek H.   ~/.dsh/a2a/log/a2a.log
+#   Antigravity   ~/.gemini/antigravity-cli/plugin_data/a2a/logs/
 #   Hermes        <profile>/logs/a2a.log (512 KB, one rotation)
 
 # Liveness (public, no auth). From INSIDE the container: the broker binds no
@@ -949,7 +978,7 @@ All optional; sensible defaults baked into the image.
 | `A2A_DB_FILE`        | *(unset)*        | **Only** where `migrate` starts looking for a pre-MariaDB SQLite file. Never opened by the serving path. |
 | `A2A_ADMIN_TOKEN`    | *(unset)*        | Enables `/admin/*` HTTP endpoints if set.    |
 | `A2A_AUTH_DISABLED`  | `0`              | When `1`, routes everything to `default`. **Dev only.** |
-| `A2A_PLUGIN_SRC`     | `/app/plugin`    | Client plugin **source** tree, read per request: `installer/` for `GET /install`, `a2a/` packed for `GET /a2a-claudecode.tar.gz`, `opencode/`, `pi/`, `codex/` and `hermes/` for `GET /install/…/<token>`. Rebuild the image to publish. |
+| `A2A_PLUGIN_SRC`     | `/app/plugin`    | Client plugin **source** tree, read per request: `installer/` for `GET /install`, `a2a/` packed for `GET /a2a-claudecode.tar.gz`, `opencode/`, `pi/`, `codex/`, `hermes/` and `antigravity/` for `GET /install/…/<token>`. Rebuild the image to publish. |
 | `A2A_CLIENT_STATE_TTL` | `30d`          | How long a client's last doctor finding (`agent_client_state`, written only when an agent runs `a2a_channel_status`) is kept before `collect()` drops it. One row per agent at most. |
 | `A2A_PING_TTL`       | `10m`            | How long a `ping` / `ping_me` witness is kept. Diagnostics are spent on arrival; a short life keeps one aimed at an absent agent out of tomorrow's `doctor` counts. |
 | `A2A_PROPOSAL_TTL`   | `48h`            | How long a proposed agent name waits for an operator before `collect` deletes it. Same duration syntax as the rest. |
@@ -978,11 +1007,13 @@ All optional; sensible defaults baked into the image.
 | Installer: `python3: command not found`          | The machine has no Python 3. Install the clients by hand (README, "Without the installer"). |
 | Installer: "needs a terminal to ask its questions" | It was piped with no terminal attached (a script, CI, a `ssh host 'curl … \| python3'` without `-t`). Run it in a terminal, or `ssh -t`. |
 | Installer: "the broker refused that token"       | The token is unknown or revoked (`/me` answered 403). Mint or check it in the TUI's tokens tab. |
-| Installer: a harness shows "not found"           | Neither its folder (`~/.claude`, `~/.config/opencode`, `~/.pi/agent`, `~/.codex`, `~/.hermes`) nor its binary on `PATH` exists for this user. |
+| Installer: a harness shows "not found"           | Neither its folder (`~/.claude`, `~/.config/opencode`, `~/.pi/agent`, `~/.codex`, `~/.hermes`, `~/.gemini/antigravity-cli`) nor its binary on `PATH` exists for this user. |
 | OpenCode installs but never comes online         | Token grants several stations and the plugin refuses to guess; reinstall with `?station=<name>`. It says so in the session. |
 | OpenCode 2 does not check its channels when you start `opencode` | Its plugins run in the background service, which never sees a CLI start; the check runs only when the service starts. Run `opencode service set disabled true` once: each `opencode` then starts its own server and the check runs on every start. |
 | A message reaches only one of two harnesses      | Both are streaming the same agent id. Delivery is a destructive read; give each its own agent (`-oc` suffix). |
 | Kilo Code has the tools but nothing arrives      | It is not the terminal app: a `kilo daemon`, an editor's Kilo or `kilo run` only sends (`a2a_channel_status`: *only sends, by design*). Use plain `kilo`; `kilo daemon stop` ends a daemon. |
+| Antigravity: every a2a tool asks permission      | The allow rule was never added: in agy, `/permissions` → Global → allow → `mcp(a2a_a2a/*)`. |
+| Antigravity: nothing arrives while idle          | No waiter runs (`a2a_channel_status`: `push_host` says so, with the command), the project is off (`enabled_antigravity`), another agy holds the project, or it is the Antigravity app, which only sends. |
 | DeepSeek Harness loads no a2a                    | `dsh plugin --profile web add` never ran (it needs `pnpm`), or dsh was not restarted after it. Desktop: only the app's own `dsh` may add to its profile. |
 | 502 Bad Gateway from a containerised proxy       | `127.0.0.1` from inside the proxy is the proxy itself. See §5.1.             |
 

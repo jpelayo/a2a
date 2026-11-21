@@ -38,6 +38,9 @@ TOKEN = "a2a_st_TESTsecretTOKENvalue123"
 # A second user's token, in another station: what a harness given its own
 # token (Hermes bots on `bots`, say) is installed with.
 TOKEN2 = "a2a_st_TESTsecondTOKENforBOTS456"
+# Planted in Claude Code's settings, where /plugin keeps its token: it must
+# never appear in anything the installer prints.
+CC_TOKEN = "a2a_st_CLAUDEsentinelNEVERprinted789"
 
 fails: list[str] = []
 
@@ -447,6 +450,23 @@ def main() -> int:
               and not any(p == "/me" and h.get("X-A2A-Agent")
                           for p, h in broker.seen), str(broker.seen[:4]))
 
+        check("fresh: Hermes bots still off share ONE 'enable a2a here' step",
+              "Hermes bots 'default' and 'bot1': in the Hermes app" in steps
+              and steps.count("enable a2a here") == 2, steps[:1500])
+        check("fresh: the last line is the verdict, counting what needs you",
+              out.rstrip().splitlines()[-1].startswith("⚠ 2 things need you"),
+              out[-300:])
+
+        # Claude Code set up the way /plugin leaves it: on, with its token.
+        # The installer reads that the key EXISTS; the value is never read
+        # into anything, printed or written.
+        cc_settings = home / ".claude" / "settings.json"
+        cc_settings.write_text(json.dumps({
+            "enabledPlugins": {"a2a@skills-dir": True},
+            "pluginConfigs": {"a2a@skills-dir": {"options": {
+                "token": CC_TOKEN}}}}, indent=2))
+        cc_seeded = cc_settings.read_bytes()
+
         # --- running it again: an update -----------------------------------
         (pi / "node_modules").mkdir(exist_ok=True)
         (pi / "node_modules" / "keep.txt").write_text("installed by pi")
@@ -518,8 +538,13 @@ def main() -> int:
         check("current: picking an up-to-date Claude Code asks for no token",
               code == 0 and "Paste or type the token" not in out, out[-1200:])
         check("current: and ends with nothing to do — no restart line",
-              "Nothing else to do" in out and "restart" not in out,
+              out.rstrip().splitlines()[-1] == "✓ Done — nothing to do."
+              and "restart" not in out and "Needs you" not in out,
               out[-1200:])
+        check("claude: on, with its token — no warning, Claude Code's settings "
+              "byte-identical, and the token never printed",
+              cc_settings.read_bytes() == cc_seeded and CC_TOKEN not in out,
+              out[-600:])
         check("update: files it did not ship are left alone (Pi's "
               "node_modules)", (pi / "node_modules" / "keep.txt").is_file())
         check("update: the default bot keeps the id it already had",
@@ -583,14 +608,61 @@ def main() -> int:
         check("declined: the install still finishes", code == 0, out[-800:])
         check("declined: no command ran", not log.exists(),
               log.read_text() if log.exists() else "")
-        check("declined: and they are in the next steps, to run by hand",
-              "they are in your next steps" in out
-              and "codex mcp add a2a" in out.split("Next steps", 1)[-1],
+        check("declined: and they are under Needs you, to run by hand",
+              "they are under Needs you" in out
+              and "codex mcp add a2a" in out.split("Needs you", 1)[-1],
               out[-800:])
         check("declined: with OpenCode not picked, its config is not touched",
               not list((home / ".config" / "opencode").iterdir())
               and "Setting it will change" not in out)
 
+        # --- Claude Code's a2a switched off ----------------------------------
+        # What a real machine had for days: /plugin switched a2a off, its
+        # hook cleared the token, and reinstalling said nothing about it.
+        m11 = root / "m11"
+        home, bin_, cwd, log = machine(m11)
+        code, out = run_installer(installer, home, bin_, cwd, ["1", "y"])
+        cc_settings = home / ".claude" / "settings.json"
+        cc_settings.write_text(json.dumps(
+            {"enabledPlugins": {"a2a@skills-dir": False}}))
+        cc_seeded = cc_settings.read_bytes()
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"])     # OpenCode only
+        confirm = out.split("Install? [Y/n]", 1)[0]
+        after = out.split("Install? [Y/n]", 1)[-1]
+        check("claude off: said on the confirmation screen, before anything "
+              "is written — with Claude Code not even picked",
+              "switched OFF" in confirm and "Needs you" in confirm,
+              confirm[-900:])
+        check("claude off: and first under Needs you, with the way back: "
+              "/plugin → a2a → Enable → paste your token, then the launch line",
+              after.find("Needs you") < after.find("switched OFF")
+              and "its token is gone" in after
+              and "/plugin → a2a → Enable → paste your token" in after
+              and "plugin:a2a@skills-dir" in after, after[-900:])
+        check("claude off: the verdict counts it",
+              out.rstrip().splitlines()[-1] == "⚠ 1 thing needs you (above).",
+              out[-300:])
+        check("claude off: Claude Code's settings are left exactly as they "
+              "were", cc_settings.read_bytes() == cc_seeded)
+        cc_settings.write_text(json.dumps({
+            "enabledPlugins": {"a2a@skills-dir": False},
+            "pluginConfigs": {"a2a@skills-dir": {"token": CC_TOKEN}}}))
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"])
+        after = out.split("Install? [Y/n]", 1)[-1]
+        check("claude off, token kept: just Enable — no token to paste, and "
+              "the token is never printed",
+              "switched OFF." in after and "token is gone" not in after
+              and "Enable. Then start" in after and CC_TOKEN not in out,
+              after[-700:])
+        cc_settings.write_text(json.dumps(
+            {"enabledPlugins": {"a2a@skills-dir": True}}))
+        code, out = run_installer(installer, home, bin_, cwd,
+                                  ["2", TOKEN, "y"])
+        check("claude on but no token: told how to give it one",
+              "a2a has no token" in out and "paste your token" in out,
+              out[-700:])
         # --- one token for most, another for Hermes ---------------------------
         m4 = root / "m4"
         home, bin_, cwd, log = machine(m4)
@@ -722,6 +794,47 @@ def main() -> int:
               "receives, and where the privacy settings are",
               "restart dsh web" in out and "plain `kilo`" in out
               and "telemetry" in out and "README" in out, out[-1800:])
+
+        # --- Antigravity: the plugin folder, written where agy keeps it --------
+        m8 = root / "m8"
+        home, bin_, cwd = m8 / "home", m8 / "bin", m8 / "cwd"
+        for d in (home / ".gemini" / "antigravity-cli", bin_, cwd):
+            d.mkdir(parents=True, exist_ok=True)
+        log = m8 / "commands.log"
+        p = bin_ / "agy"
+        p.write_text(f'#!/bin/sh\necho "agy $*" >> "{log}"\n')
+        p.chmod(0o755)
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all",          # the one harness found: Antigravity
+            TOKEN,
+            "y",            # install
+        ])
+        check("antigravity: the installer finishes", code == 0, out[-1500:])
+        pdir = home / ".gemini" / "config" / "plugins" / "a2a"
+        names = sorted(str(q.relative_to(pdir)) for q in pdir.rglob("*")
+                       if q.is_file()) if pdir.is_dir() else []
+        check("antigravity: the plugin lands in ~/.gemini/config/plugins/a2a, "
+              "where agy keeps installed plugins",
+              names == ["a2a-antigravity.py", "a2a-stop.py", "hooks.json",
+                        "mcp_config.json", "plugin.json", "rules/AGENTS.md"],
+              str(names))
+        srv = (pdir / "a2a-antigravity.py").read_text() if names else ""
+        check("antigravity: with the token baked into the server's seam",
+              f'"token": "{TOKEN}"' in srv and "A2A_BAKED = {}" not in srv,
+              srv[:120])
+        check("antigravity: and no agy command was run — the folder is the "
+              "install", not log.is_file(), log.read_text() if log.is_file()
+              else "")
+        check("antigravity: the next steps say to restart agy, the one allow "
+              "rule to add, and that the app only sends",
+              "quit agy" in out and "mcp(a2a_a2a/*)" in out
+              and "/permissions" in out and "only sends" in out
+              and "enable a2a here" in out, out[-1800:])
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "all", TOKEN, "y"])
+        check("antigravity: run again, it is already current and asks for no "
+              "restart", code == 0 and "already current" in out
+              and "quit agy" not in out, out[-1200:])
 
         # --- a Hermes that runs its chats in a gateway ------------------------
         m7 = root / "m7"

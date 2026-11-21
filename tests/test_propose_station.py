@@ -45,6 +45,7 @@ HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "deploy" / "plugin"
 CHANNEL = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
 PI = PLUGIN / "pi" / "index.ts"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
@@ -302,16 +303,31 @@ def run_codex(fb, tmp) -> dict:
     return {"schema": props, "results": texts, "project": proj}
 
 
+def run_agy(fb, tmp) -> dict:
+    """As agy runs it: cwd = the plugin folder, PWD = the project."""
+    proj = tmp / "agy-proj"
+    proj.mkdir()
+    (proj / ".a2a.json").write_text(json.dumps(PROJECT))
+    (tmp / "t").mkdir()
+    env = dict(base_env(fb, tmp), PWD=str(proj), PLUGIN_ROOT=str(AGY.parent),
+               PLUGIN_DATA=str(tmp / "antigravity-cli" / "plugin_data" / "a2a"),
+               TMPDIR=str(tmp / "t"))
+    props, texts = mcp([sys.executable, "-B", "-I", str(AGY)], env, AGY.parent)
+    return {"schema": props, "results": texts, "project": proj}
+
+
 # The clients with a project switch, and the key each writes.
 SWITCH = {"Codex": "enabled_codex", "Pi": "enabled_pi",
           "OpenCode": "enabled_opencode", "Kilo Code": "enabled_kilocode",
-          "DeepSeek Harness": "enabled_dsh"}
+          "DeepSeek Harness": "enabled_dsh",
+          "Antigravity": "enabled_antigravity"}
 # What a pump that started asks first. Codex opens /stream only with the
 # launch line's socket — a session that cannot render must not take the
 # inbox (test_codex_client) — so there it is the pump's /me; and an OFF
 # Codex asks the broker nothing at all (test_project_gate).
 STARTED = {"Codex": "/me", "Pi": "/stream", "OpenCode": "/stream",
-           "Kilo Code": "/stream", "DeepSeek Harness": "/stream"}
+           "Kilo Code": "/stream", "DeepSeek Harness": "/stream",
+           "Antigravity": "/stream"}
 
 
 def run(label, fn, refuse=False):
@@ -330,10 +346,10 @@ def run(label, fn, refuse=False):
 # The folder each driver above runs the client in, and the harness suffix.
 FOLDER = {"Claude Code": "cc", "Codex": "codex-proj", "Pi": "pi",
           "OpenCode": "opencode", "Kilo Code": "kilocode",
-          "DeepSeek Harness": "dsh"}
+          "DeepSeek Harness": "dsh", "Antigravity": "agy-proj"}
 SUFFIX = {"Claude Code": "claude", "Codex": "codex", "Pi": "pi",
           "OpenCode": "opencode", "Kilo Code": "kilo",
-          "DeepSeek Harness": "dsh"}
+          "DeepSeek Harness": "dsh", "Antigravity": "antigravity"}
 
 
 def asked(fb) -> list[tuple[str, str]]:
@@ -411,7 +427,8 @@ def main() -> int:
                       ("Pi", run_pi), ("OpenCode", run_opencode),
                       ("Kilo Code", run_own_js("kilocode", KILOCODE,
                                                KILOCODE_HARNESS)),
-                      ("DeepSeek Harness", run_own_js("dsh", DSH, DSH_HARNESS))):
+                      ("DeepSeek Harness", run_own_js("dsh", DSH, DSH_HARNESS)),
+                      ("Antigravity", run_agy)):
         out, fb = run(label, fn)
         sent = [b for p, b in fb.bodies if p == "/me/proposals"]
         if "error" in out:

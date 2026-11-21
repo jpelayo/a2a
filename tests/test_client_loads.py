@@ -23,6 +23,7 @@ So this asserts the one property those cannot: the whole artifact loads. Pure
 python3 plus node; no database, no harness installed.
 """
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -41,6 +42,8 @@ PI = PLUGIN / "pi" / "index.ts"
 CLAUDE = PLUGIN / "a2a" / "server" / "a2a-channel.py"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
+AGY_HOOK = PLUGIN / "antigravity" / "a2a-stop.py"
 
 fails: list[str] = []
 
@@ -201,6 +204,27 @@ def main() -> int:
     # Hermes imports a directory plugin's __init__.py and calls register();
     # Hermes itself is imported lazily inside it, so this needs no Hermes.
     python_client(HERMES, "hermes", ("register", "A2AHermes", "TOOLS"))
+    # Antigravity: the MCP server and the Stop hook, and the three JSON files
+    # agy reads to find them — a typo there loads a plugin with neither.
+    python_client(AGY, "antigravity", ("handle", "pump", "BRIEF", "TOOLS"))
+    python_client(AGY_HOOK, "antigravity hook", ("decide", "main"))
+    try:
+        manifest = json.loads((AGY.parent / "plugin.json").read_text())
+        mcp = json.loads((AGY.parent / "mcp_config.json").read_text())
+        hooks = json.loads((AGY.parent / "hooks.json").read_text())
+        server = mcp["mcpServers"]["a2a"]
+        stop = [h for g in hooks.values() for h in g.get("Stop") or []]
+        ok = (manifest.get("name") == "a2a"
+              and server["args"][-1] == "${PLUGIN_ROOT}/" + AGY.name
+              and len(stop) == 1
+              and stop[0]["command"].endswith("./" + AGY_HOOK.name)
+              and (AGY.parent / "rules" / "AGENTS.md").is_file())
+        detail = f"{manifest} {server} {stop}"
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}: {e}"
+    check("antigravity: plugin.json names the plugin a2a, mcp_config.json "
+          "starts the server, hooks.json runs the Stop hook, rules/AGENTS.md "
+          "is there", ok, detail)
 
     print()
     for f in fails:

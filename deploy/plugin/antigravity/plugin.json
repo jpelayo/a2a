@@ -1,0 +1,6 @@
+{
+  "name": "a2a",
+  "displayName": "a2a",
+  "version": "0.0.0",
+  "description": "a2a: talk to other agents through an a2a broker. Receives in the agy CLI through a background waiter; the app only sends."
+}

@@ -38,6 +38,7 @@ PI = PLUGIN / "pi" / "index.ts"
 OPENCODE = PLUGIN / "opencode" / "a2a-opencode.js"
 KILOCODE = PLUGIN / "kilocode" / "a2a-kilocode.js"
 DSH = PLUGIN / "dsh" / "a2a-dsh.js"
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
 
 fails: list[str] = []
 
@@ -155,6 +156,35 @@ def main() -> int:
     check("codex: the same secret and scope give the same key as Claude's",
           codex.client_key() == identity.client_key(os.getcwd(), str(store)),
           "the formulas drifted")
+
+    # Antigravity: secret under PLUGIN_DATA, scope from PWD (agy starts the
+    # server with cwd = the plugin folder and PWD = the project).
+    agy_data = tmp / "agy-data"
+    agy_data.mkdir()
+    (agy_data / "a2a-client.secret").write_text(secret_hex)
+    agy_proj = tmp / "agy-proj"
+    agy_proj.mkdir()
+    os.environ.update(PLUGIN_DATA=str(agy_data), PWD=str(agy_proj))
+    agy = load(AGY, "key_agy")
+    check("antigravity: the same secret and scope give the same key as "
+          "Claude's — the scope is the project (PWD), not the plugin folder",
+          agy.client_key() == identity.client_key(str(agy_proj), str(store)),
+          "the formulas drifted")
+    race = tmp / "agy-race"
+    out = concurrently([[sys.executable, "-B", "-c",
+                         "import importlib.util;"
+                         f"s=importlib.util.spec_from_file_location('a',{str(AGY)!r});"
+                         "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+                         "print(m.client_key())"]] * 6,
+                       env=clean_env(A2A_URL="http://127.0.0.1:1", A2A_TOKEN="t",
+                                     PLUGIN_DATA=str(race), PWD=str(agy_proj)))
+    check("antigravity: 6 processes racing on an empty folder derive ONE key",
+          len(set(out)) == 1 and out[0].startswith("a2a_ck_"), str(out))
+    ok, files = secret_state(race, "a2a-client.secret")
+    check("antigravity: exactly one secret, mode 0600, no temp file left "
+          "behind", ok, files)
+    for k in ("PLUGIN_DATA", "PWD"):
+        os.environ.pop(k, None)
 
     # Pi: its derivation, lifted verbatim — Pi itself cannot be imported here.
     src = PI.read_text()

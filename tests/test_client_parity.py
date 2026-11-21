@@ -40,6 +40,12 @@ DSH = PLUGIN / "dsh" / "a2a-dsh.js"
 PI = PLUGIN / "pi" / "index.ts"
 CODEX = PLUGIN / "codex" / "a2a-codex.py"
 HERMES = PLUGIN / "hermes" / "__init__.py"
+# Antigravity: its OWN client (a copy of Codex's, never an import).
+AGY = PLUGIN / "antigravity" / "a2a-antigravity.py"
+# Tools one harness needs because of how it receives, with the reason.
+# a2a_inbox: agy cannot be pushed into, so the model takes what the waiter
+# woke it for through this tool (see the client's docstring).
+HARNESS_ONLY = {"antigravity": {"a2a_inbox"}}
 
 # Tools that legitimately exist on only one surface, with the reason.
 ONLY_BROKER = {
@@ -143,6 +149,21 @@ def status_shapes() -> dict:
         else {"channels": []})
     out["codex"] = _json.loads(cx._status({}))
 
+    # Antigravity: its data, temp and project folders all under a temp dir.
+    agy_tmp = Path(tempfile.mkdtemp(prefix="a2a-parity-agy-"))
+    for sub in ("antigravity-cli/plugin_data/a2a", "t", "proj"):
+        (agy_tmp / sub).mkdir(parents=True)
+    os.environ.update(PLUGIN_DATA=str(agy_tmp / "antigravity-cli"
+                                      / "plugin_data" / "a2a"),
+                      TMPDIR=str(agy_tmp / "t"), PWD=str(agy_tmp / "proj"))
+    spec = importlib.util.spec_from_file_location("parity_agy", AGY)
+    ax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ax)
+    ax.api = cx.api
+    out["antigravity"] = _json.loads(ax._status({}))
+    for k in ("PLUGIN_DATA", "PWD"):
+        os.environ.pop(k, None)
+
     # Hermes: the real plugin, register()ed against the smallest context it
     # accepts. Its home (and so its log) goes to a temp dir, never ~/.hermes.
     os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="a2a-parity-hermes-")
@@ -240,6 +261,7 @@ FIX_DECLARED = {
     "kilocode": (KILOCODE, 'args: { fix: { type: ["boolean", "null"] } }'),
     "dsh": (DSH, 'args: { fix: { type: ["boolean", "null"] } }'),
     "pi": (PI, "fix: Type.Optional(Type.Boolean("),
+    "antigravity": (AGY, '{"fix": {"type": "boolean"}}, [], _status'),
 }
 # Where each client declares propose_me's optional `name` — the name to ask
 # for (test_propose_station and test_hermes_client run it).
@@ -258,6 +280,8 @@ NAME_DECLARED = {
     "dsh": (DSH, "args: { name: optStr, note: optStr, station: optStr }"),
     "pi": (PI, "async execute(_id, a: { name?: string; note?: string; "
                "station?: string })"),
+    "antigravity": (AGY, '{"name": OPT_STR, "note": OPT_STR, '
+                         '"station": OPT_STR}, [], _propose_me'),
 }
 
 
@@ -312,6 +336,13 @@ def main() -> int:
     check("and dsh's own client exposes exactly OpenCode's vocabulary",
           dx == oc, f"only in dsh: {sorted(dx - oc)}; "
                     f"missing: {sorted(oc - dx)}")
+    ax = codex_tools(AGY)
+    check("and Antigravity's own client exposes exactly Codex's vocabulary, "
+          "plus only the tool its waiter needs (a2a_inbox)",
+          ax - HARNESS_ONLY["antigravity"] == cx
+          and HARNESS_ONLY["antigravity"] <= ax,
+          f"only in antigravity: {sorted(ax - cx)}; "
+          f"missing: {sorted(cx - ax)}")
 
     # --- and neither may drift from the broker without a stated reason -----
     missing = (broker - oc) - ONLY_BROKER
@@ -326,7 +357,8 @@ def main() -> int:
                       "delete_channel"):
         check(f"no client offers {forbidden}",
               forbidden not in oc and forbidden not in pi
-              and forbidden not in cx and forbidden not in hx)
+              and forbidden not in cx and forbidden not in hx
+              and forbidden not in ax)
 
     # --- and they must hit the same REST paths for the same capability -----
     def paths(src: str) -> set[str]:
@@ -353,8 +385,9 @@ def main() -> int:
           "unchecked", not broken, str(broken))
     shapes = {k: v for k, v in shapes.items() if "__error__" not in v}
     send_only = shapes.pop("kilocode-send-only", None)
-    check("all seven clients were checked", sorted(shapes) == sorted(
-        ["claude", "codex", "hermes", "opencode", "pi", "kilocode", "dsh"]),
+    check("all eight clients were checked", sorted(shapes) == sorted(
+        ["claude", "codex", "hermes", "opencode", "pi", "kilocode", "dsh",
+         "antigravity"]),
         str(sorted(shapes)))
     # A Kilo daemon or editor server only sends, like Pi's helper session:
     # by design, so push_host holds and the stream is not applicable.
@@ -426,7 +459,8 @@ def main() -> int:
                         ("opencode", PLUGIN / "opencode" / "a2a-opencode.js"),
                         ("kilocode", KILOCODE), ("dsh", DSH),
                         ("pi", PLUGIN / "pi" / "index.ts"),
-                        ("codex", CODEX), ("hermes", HERMES)):
+                        ("codex", CODEX), ("hermes", HERMES),
+                        ("antigravity", AGY)):
         body = path.read_text()
         check(f"{label}: its brief does not tell the agent to wait",
               "stop and wait" not in body, "'stop and wait' is back")
