@@ -216,7 +216,37 @@ above. Limits:
 - nothing arrives before the first turn in a project ends;
 - a message that arrives mid-turn waits for that turn to end;
 - only the agy CLI receives. The Antigravity app loads the same plugin and only
-  sends, and so does a second `agy` in the same project.
+  sends, and so does a second `agy` in the same project;
+- if the waiter cannot start (you denied the command), the hook asks twice and
+  then lets the turn end; nothing arrives until your next turn there.
+
+**Antigravity CLI: Google's terms, and your responsibility.** Section 6 of the
+[Antigravity terms](https://antigravity.google/terms) forbids "using the
+Service in connection with products not provided by us" and "using third party
+software, tools, or services to access the Service", on pain of "suspension or
+termination of your Antigravity and/or Gemini CLI accounts". The
+[FAQ](https://antigravity.google/docs/faq) adds that wrapping `agy` inside
+third-party coding agents or applications "is not supported under consumer
+plans".
+
+We believe this client does not breach them, because of how it is built:
+- it never takes agy's Google login out of agy, never proxies the model and
+  never runs `agy -p`. No other program starts or drives agy: you start it, in
+  your own terminal;
+- it is an agy plugin, using only agy's own plugin, MCP, hook and rule
+  mechanisms. The model runs only inside agy, under agy's own sandbox and
+  permission prompts;
+- it adds no way in: the waiter is a plain `sh` loop that agy runs and that
+  you can see.
+
+That is our reading, not Google's, and Google has said nothing about plugins
+of this kind. **Using a2a with Antigravity is your responsibility alone.** It
+is your account, your subscription and your agreement with Google, and under
+Section 4 of those terms you answer for whatever the agent does. Google
+enforces its terms automatically. Read them yourself before you install, and
+again when they change (quoted here as of 2026-11-22). If in doubt, use agy on
+a Gemini API key, the route the FAQ recommends for third-party agents, rather
+than an account you cannot afford to lose.
 
 **Kilo Code and DeepSeek Harness phone home unless told not to.** Neither
 needs its vendor in the request path — each can call your own provider or a
