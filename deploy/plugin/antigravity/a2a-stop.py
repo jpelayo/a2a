@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""a2a — Antigravity Stop hook: at a turn's end, send the agent back when an
-a2a message is waiting or nothing would wake it for the next one.
+"""a2a — Antigravity hooks: at a turn's end (Stop), send the agent back when
+an a2a message is waiting or nothing would wake it for the next one; at a new
+conversation's first prompt (SessionStart, see decide_start), ask it to start
+the waiter in that same turn, only where .a2a.json turns a2a on.
 
 agy runs this (hooks.json) every time a conversation's loop ends, with the
 event as JSON on stdin and cwd = the plugin folder. Answering
 {"decision": "continue", "reason": …} re-enters the loop with `reason` as a
 system message; anything else lets it stop. Measured on agy 1.5.14: it fires
-after woken turns too, and `fullyIdle` is false while a background command
-runs.
+after woken turns too. It does not trust `fullyIdle` to say whether the
+waiter runs: a real run said true while it did.
 
 It reads ONLY local files — the mailbox the a2a MCP server writes in
-$TMPDIR/a2a-agy/<project hash>/ — and never the network, the token or the
+<PLUGIN_DATA>/boxes/<project hash>/ — and never the network, the token or the
 inbox. It is silent (allows the stop) unless every one of these holds:
   - this is the CLI (the app only sends);
   - a live a2a receiver owns that project's mailbox (`live`, its pid alive);
@@ -35,7 +37,6 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 
 BEAT_FRESH_S = 10.0
@@ -93,32 +94,93 @@ def _write_json(path, data):
         pass
 
 
-def decide(event, env=None, now=None):
-    """The answer for one Stop event: {} (stop) or a continue."""
-    env = os.environ if env is None else env
-    now = time.time() if now is None else now
+def _receiver(event, env):
+    """(box, live, workspace) of the live a2a receiver for this event's
+    workspace, or (None, None, None): the app, or no receiver here."""
     data_dir = env.get("PLUGIN_DATA") or ""
     if data_dir and "antigravity-cli" not in data_dir.split(os.sep):
-        return {}                                   # the app: send-only
-    base = os.path.join(env.get("TMPDIR") or tempfile.gettempdir(), "a2a-agy")
-    box = live = None
+        return None, None, None                     # the app: send-only
+    # MUST match a2a-antigravity.py's MAILBOX and wait.sh's search.
+    base = os.path.join(
+        data_dir or os.path.join(os.path.expanduser("~"), ".gemini",
+                                 "antigravity-cli", "plugin_data", "a2a"),
+        "boxes")
     for ws in event.get("workspacePaths") or []:
         if not isinstance(ws, str) or not ws:
             continue
         d = os.path.join(base, project_hash(ws))
         info = _read_json(os.path.join(d, "live"))
         if info and _alive(info.get("pid")):
-            box, live = d, info
-            break
+            return d, info, ws
+    return None, None, None
+
+
+def _waiter(box):
+    """(beat age or None, a waiter pid alive)."""
+    def pid_in(name):
+        try:
+            with open(os.path.join(box, name)) as f:
+                p = f.read().strip()
+        except OSError:
+            return False
+        return bool(p) and _alive(p)
+    # A waiter runs while its beat is fresh AND its pid lives: a2a_inbox's
+    # waiter_running() rule. The pid covers one killed outright (fresh beat,
+    # dead pid). `starting` holds the pid of one still in its agentapi check,
+    # which ends the turn that started it right away. NOT agy's fullyIdle: it
+    # said true with the waiter running outside the sandbox (a real run, agy
+    # 1.5.14), and the hook sent the agent back twice for a waiter that was
+    # there.
+    return (_age(os.path.join(box, "beat")),
+            pid_in("waiter") or pid_in("starting"))
+
+
+def decide_start(event, env=None):
+    """SessionStart: agy fires it once, as the first prompt of a NEW
+    conversation is sent (measured: not at launch, not on `agy -c`). When
+    this project is on and no waiter runs, it asks the agent, in that same
+    turn, to call a2a_inbox and do what it says — which starts the waiter —
+    so the Stop hook need not send it back for one afterwards. A system
+    message, not a user message: a user message took the place of the
+    person's prompt as `lastUserInput` (the probe)."""
+    env = os.environ if env is None else env
+    box, _live, ws = _receiver(event, env)
+    if not box:
+        return {}
+    try:
+        with open(os.path.join(ws, ".a2a.json")) as f:
+            on = json.load(f).get("enabled_antigravity") is True
+    except (OSError, ValueError, AttributeError):
+        on = False
+    if not on:
+        return {}
+    beat, alive = _waiter(box)
+    if beat is not None and beat <= BEAT_FRESH_S and alive:
+        return {}                                   # already armed
+    return {"injectSteps": [{"systemMessage": {"systemMessage": (
+        "a2a is on in this project, and nothing will wake you when an a2a "
+        "message arrives until its waiter runs. Before you answer, call the "
+        "a2a_inbox tool once and do exactly what its last line says (it may "
+        "name the a2a waiter to start in the BACKGROUND, or say not to). "
+        "Then answer the person's message as usual.")}}]}
+
+
+def decide(event, env=None, now=None):
+    """The answer for one Stop event: {} (stop) or a continue."""
+    env = os.environ if env is None else env
+    now = time.time() if now is None else now
+    box, live, _ws = _receiver(event, env)
     if not box:
         return {}                                   # no receiver: not ours
     conv = event.get("conversationId") or ""
     route = live.get("route") or ""
-    beat = _age(os.path.join(box, "beat"))
-    # fullyIdle: agy says no background command runs at all, so no waiter
-    # can, whatever `beat` says (measured: false while one runs).
-    no_waiter = beat is None or beat > BEAT_FRESH_S \
-        or event.get("fullyIdle") is True
+    beat, alive = _waiter(box)
+    no_waiter = beat is None or beat > BEAT_FRESH_S or not alive
+    # What it saw, kept in guard.json for the doctor's push.hook: what agy
+    # reports and what the files say, side by side.
+    saw = {"fully_idle": event.get("fullyIdle"),
+           "beat_s": None if beat is None else round(beat, 1),
+           "waiter_alive": alive}
     if route and conv and conv != route \
             and not (no_waiter and event.get("fullyIdle") is True):
         return {}                                   # another conversation
@@ -142,7 +204,8 @@ def decide(event, env=None, now=None):
             "says not to — and end your turn.")
     else:
         _write_json(os.path.join(box, "guard.json"),
-                    {"conv": conv, "n": 0, "last": "stop", "at": now})
+                    {"conv": conv, "n": 0, "last": "stop", "at": now,
+                     "saw": saw})
         return {}
 
     guard = _read_json(os.path.join(box, "guard.json"))
@@ -155,11 +218,11 @@ def decide(event, env=None, now=None):
         n = 0                       # something happened since the last nudge
     if n >= MAX_NUDGES:
         _write_json(os.path.join(box, "guard.json"),
-                    dict(guard, last=why, gave_up=True, at=now))
+                    dict(guard, last=why, gave_up=True, at=now, saw=saw))
         return {}
     _write_json(os.path.join(box, "guard.json"),
                 {"conv": conv, "n": n + 1, "last": why, "gave_up": False,
-                 "at": now})
+                 "at": now, "saw": saw})
     return {"decision": "continue", "reason": reason}
 
 
@@ -167,7 +230,10 @@ def main():
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}
-        out = decide(event if isinstance(event, dict) else {})
+        event = event if isinstance(event, dict) else {}
+        out = (decide_start(event)
+               if event.get("hookEventName") == "SessionStart"
+               else decide(event))
     except Exception:
         out = {}
     sys.stdout.write(json.dumps(out))

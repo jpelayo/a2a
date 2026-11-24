@@ -336,10 +336,11 @@ def main() -> int:
             amembers = {}
             check("antigravity: extracts as a gzipped tar", False, repr(e))
         check("antigravity: exactly the plugin — manifest, MCP config, hooks, "
-              "rules, the server and the Stop hook",
+              "rules, the server, the Stop hook and the waiter",
               sorted(amembers) == ["a2a-antigravity.py", "a2a-stop.py",
                                    "hooks.json", "mcp_config.json",
-                                   "plugin.json", "rules/AGENTS.md"],
+                                   "plugin.json", "rules/AGENTS.md",
+                                   "wait.sh"],
               str(sorted(amembers)))
         adir = ROOT / "deploy" / "plugin" / "antigravity"
         asrc = (adir / "a2a-antigravity.py").read_text()

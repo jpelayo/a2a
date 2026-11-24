@@ -4,17 +4,20 @@
     python3 tests/test_antigravity_client.py
 
 Runs the REAL MCP server as agy does (cwd = the plugin folder, PWD = the
-project, PLUGIN_DATA and TMPDIR of its own) against a fake broker, the REAL
-waiter script it writes, and the REAL Stop hook:
+project, PLUGIN_DATA of its own) against a fake broker, the REAL waiter
+(the plugin's wait.sh) with a fake `agentapi` on PATH, and the REAL Stop hook:
 
   the queue    what the stream delivers is kept UNACKED until a2a_inbox hands
-               it to the model; the `mail` file counts it;
-  the waiter   `sh <mailbox>/wait.sh` beats while nothing is waiting, exits on
-               mail (which is what wakes agy), and exits when the receiver is
-               gone;
+               it to the model; `mail` counts it and `bell` goes up;
+  the waiter   finds its mailbox by the conversation agy gives it, keeps
+               running, rings `agentapi send-message` once per new batch
+               (never on a drain), and exits when it cannot reach agentapi
+               (the sandbox), when a ring fails, when the receiver is gone,
+               when the route moves, or when a newer waiter takes over. It
+               never prints or stores agy's CSRF token;
   a2a_inbox    returns the envelopes and the brief, acks exactly those ids,
                clears `mail`, follows the ROOT conversation from _meta, and
-               ends with the waiter line;
+               ends with the waiter command — or, while one runs, says so;
   the hook     silent where a2a is not receiving, for another conversation,
                and after two nudges that changed nothing; otherwise sends the
                agent back for mail or a missing waiter;
@@ -40,6 +43,8 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent.parent / "deploy" / "plugin" / "antigravity"
 CLIENT = PLUGIN / "a2a-antigravity.py"
 HOOK = PLUGIN / "a2a-stop.py"
+WAITER = PLUGIN / "wait.sh"
+SECRET = "CSRF-SECRET-do-not-leak-4242"
 
 fails: list[str] = []
 
@@ -160,12 +165,12 @@ def hook_mod():
 class Client:
     """The real MCP server as a process, spoken to over stdio."""
 
-    def __init__(self, broker, project, data, tmpdir, home):
+    def __init__(self, broker, project, data, home):
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("A2A_", "PLUGIN_"))}
+               if not k.startswith(("A2A_", "PLUGIN_", "ANTIGRAVITY_"))}
         env.update(A2A_URL=broker.url, A2A_TOKEN="a2a_st_test",
                    PLUGIN_DATA=str(data), PLUGIN_ROOT=str(PLUGIN),
-                   PWD=str(project), TMPDIR=str(tmpdir), HOME=str(home),
+                   PWD=str(project), HOME=str(home),
                    PYTHONDONTWRITEBYTECODE="1")
         self.proc = subprocess.Popen(
             [sys.executable, "-B", "-I", str(CLIENT)], cwd=str(PLUGIN), env=env,
@@ -207,6 +212,61 @@ class Client:
         return self.proc.returncode
 
 
+class Agentapi:
+    """A fake agy `agentapi` on PATH: records its arguments (never the
+    token), fails like the sandbox while `fail` exists, and otherwise prints
+    a reply carrying the token, so a waiter that let its output through would
+    leak it."""
+
+    def __init__(self, root):
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.calls = root / "agentapi-calls"
+        self.fail = root / "agentapi-fail"
+        self.slow = root / "agentapi-slow"
+        exe = self.bin / "agentapi"
+        exe.write_text(
+            "#!/bin/sh\n"
+            f'echo "$*" >> "{self.calls}"\n'
+            f'if [ -f "{self.slow}" ]; then sleep 3; fi\n'
+            f'if [ -f "{self.fail}" ]; then\n'
+            '  echo "dial tcp [::1]:1: connect: operation not permitted"\n'
+            "  exit 1\n"
+            "fi\n"
+            'echo "{\\"token\\": \\"$ANTIGRAVITY_CSRF_TOKEN\\"}"\n')
+        exe.chmod(0o755)
+
+    def rings(self):
+        try:
+            lines = self.calls.read_text().splitlines()
+        except OSError:
+            return []
+        return [x for x in lines if x.startswith("send-message")]
+
+
+def start_waiter(api, home, conv="c-root", drop=()):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ANTIGRAVITY_", "PLUGIN_"))}
+    env.update(PATH=f"{api.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+               HOME=str(home), ANTIGRAVITY_CONVERSATION_ID=conv,
+               ANTIGRAVITY_CSRF_TOKEN=SECRET,
+               ANTIGRAVITY_LS_ADDRESS="[::1]:1",
+               ANTIGRAVITY_APP_DATA_DIR=str(home / ".gemini"
+                                            / "antigravity-cli"))
+    for k in drop:
+        env.pop(k, None)
+    return subprocess.Popen(["sh", str(WAITER)], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+
+
+def finish(w, timeout=12):
+    try:
+        return w.communicate(timeout=timeout)[0]
+    except subprocess.TimeoutExpired:
+        return "(still running)"
+
+
 def run_hook(event, env):
     r = subprocess.run([sys.executable, "-B", "-I", "./a2a-stop.py"],
                        cwd=str(PLUGIN), input=json.dumps(event),
@@ -223,27 +283,30 @@ def main() -> int:
     broker = Broker()
     clients = []
     waiters = []
+    outputs = []
     try:
         home = root / "home"
         home.mkdir()
-        tmpdir = root / "tmp"
-        tmpdir.mkdir()
         data = root / "home" / ".gemini" / "antigravity-cli" / "plugin_data" / "a2a"
         proj = root / "agy-proj"
         proj.mkdir()
         (proj / ".a2a.json").write_text('{"enabled_antigravity": true}')
         hk = hook_mod()
-        box = tmpdir / "a2a-agy" / hk.project_hash(str(proj))
-        hook_env = {"TMPDIR": str(tmpdir), "PLUGIN_DATA": str(data)}
+        box = data / "boxes" / hk.project_hash(str(proj))
+        hook_env = {"PLUGIN_DATA": str(data)}
+        api = Agentapi(root)
+        line = f"sh {WAITER}"
 
         broker.peek = [msg("m-old", "from before")]
-        c = Client(broker, proj, data, tmpdir, home)
+        c = Client(broker, proj, data, home)
         clients.append(c)
         init = c.rpc("initialize", {"protocolVersion": "2025-06-18"})["result"]
         check("initialize carries the brief in an enabled project, with the "
               "waiter explained",
               "HOW MESSAGES REACH YOU HERE" in (init.get("instructions") or "")
-              and "wait.sh" in init["instructions"], str(init)[:200])
+              and "wait.sh" in init["instructions"]
+              and "BypassSandbox: true" in init["instructions"],
+              str(init)[:200])
         tools = [t["name"] for t in c.rpc("tools/list")["result"]["tools"]]
         check("a2a_inbox is listed with the shared vocabulary",
               "a2a_inbox" in tools and "post_to_channel" in tools
@@ -254,63 +317,112 @@ def main() -> int:
                        == c.proc.pid), str(list(box.glob("*")) if box.exists()
                                           else "no mailbox"))
         check("and the mailbox is where the hook will look for it — the hook's "
-              "hash of the project, the server's TMPDIR",
-              (box / "wait.sh").is_file())
+              "hash of the project, under PLUGIN_DATA/boxes",
+              (box / "bell").is_file() and (box / "route").is_file()
+              and not (box / "wait.sh").exists())
         check("the peek's old message is queued, unacked: `mail` counts it",
               wait_for(lambda: (box / "mail").read_text().startswith("1 new")),
               (box / "mail").read_text() if (box / "mail").exists() else "-")
         check("nothing was acked before the model saw it", broker.acked == [],
               str(broker.acked))
 
-        # --- the waiter, beating, then woken by mail ---------------------------
-        # Clear mail first so the waiter has nothing to exit on: hand over the
-        # peeked message through a2a_inbox.
+        # --- a2a_inbox, then the waiter -----------------------------------------
         out = c.call("a2a_inbox", conv="c-root")
         check("a2a_inbox hands over the queued message as an envelope, brief "
-              "first, and ends with the exact waiter command",
+              "first, and ends with the exact waiter command, outside the "
+              "sandbox",
               'id="m-old"' in out and out.startswith('You are a2a agent')
-              and f"sh {box / 'wait.sh'}" in out, out[-300:])
+              and line in out and "BypassSandbox: true" in out, out[-300:])
         check("and acks exactly what it handed over",
               wait_for(lambda: broker.acked == ["m-old"]), str(broker.acked))
         check("and clears `mail`", (box / "mail").read_text() == "")
-        check("and follows the conversation it was called from",
-              json.loads((box / "live").read_text())["route"] == "c-root")
+        check("and follows the conversation it was called from, in `live` "
+              "and in `route`",
+              json.loads((box / "live").read_text())["route"] == "c-root"
+              and (box / "route").read_text() == "c-root")
 
-        w = subprocess.Popen(["sh", str(box / "wait.sh")],
-                             stdout=subprocess.PIPE, text=True)
+        # --- SessionStart: the first prompt of a new conversation ----------
+        start_ev = {"hookEventName": "SessionStart", "conversationId": "c-new",
+                    "workspacePaths": [str(proj)]}
+        code, out = run_hook(start_ev, hook_env)
+        steps = out.get("injectSteps") or [{}]
+        text = ((steps[0].get("systemMessage") or {}).get("systemMessage")
+                or "")
+        check("SessionStart in an enabled project with no waiter asks for "
+              "a2a_inbox in that same turn, as a SYSTEM message (a user "
+              "message replaced the person's prompt)",
+              code == 0 and "a2a_inbox" in text and "userMessage" not in
+              json.dumps(out) and "wait.sh" not in text, str(out))
+        app_env = dict(hook_env, PLUGIN_DATA=str(root / "antigravity" /
+                                                 "plugin_data" / "a2a"))
+        check("and says nothing in the Antigravity app",
+              run_hook(start_ev, app_env)[1] == {})
+        cfg = proj / ".a2a.json"
+        saved = cfg.read_text()
+        cfg.write_text(json.dumps(dict(json.loads(saved),
+                                       enabled_antigravity=False)))
+        code, out = run_hook(start_ev, hook_env)
+        cfg.write_text(saved)
+        check("nor where .a2a.json does not turn a2a on", out == {}, str(out))
+
+        api.slow.write_text("")            # agentapi's check takes 3 s
+        w = start_waiter(api, home)
         waiters.append(w)
-        check("the waiter beats while nothing is waiting",
+        early = wait_for(lambda: (box / "beat").exists(), 1.5)
+        code, out = run_hook({"conversationId": "c-root",
+                              "workspacePaths": [str(proj)]}, hook_env)
+        check("the waiter beats BEFORE its agentapi check, so the turn that "
+              "started it ends with no nudge (a real run was sent back)",
+              early and not (box / "waiter").exists() and out == {},
+              f"early={early} out={out}")
+        api.slow.unlink()
+        check("the waiter finds its mailbox by its conversation and beats",
               wait_for(lambda: hk._age(str(box / "beat")) is not None
                        and hk._age(str(box / "beat")) < 5, 8))
-        check("and keeps running", w.poll() is None)
+        check("and keeps running, its pid in `waiter` once the check passes",
+              wait_for(lambda: (box / "waiter").exists()
+                       and (box / "waiter").read_text().strip() == str(w.pid),
+                       8) and w.poll() is None)
+        out = c.call("a2a_inbox", conv="c-root")
+        check("a2a_inbox while it runs says so and names no command",
+              "already running" in out and "wait.sh" not in out, out[-300:])
+
         code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(proj)]}, hook_env)
         check("the hook lets a turn end while the waiter runs and nothing "
               "waits", code == 0 and out == {}, str(out))
+        check("and SessionStart asks for nothing while the waiter runs",
+              run_hook(start_ev, hook_env)[1] == {})
         code, out = run_hook({"conversationId": "c-root", "fullyIdle": True,
                               "workspacePaths": [str(proj)]}, hook_env)
-        check("but when agy says no background command runs (fullyIdle), "
-              "no waiter can, whatever the beat says",
-              out.get("decision") == "continue"
-              and "waiter is not running" in out.get("reason", ""), str(out))
-        check("and the hook's reason names no command: a2a_inbox says what "
-              "to start, or that this agy does not receive",
-              "wait.sh" not in out.get("reason", ""), str(out))
+        saw = json.loads((box / "guard.json").read_text()).get("saw") or {}
+        check("agy's fullyIdle does not override a running waiter (a real "
+              "run said true while it ran, and was sent back twice)",
+              out == {}, str(out))
+        check("and the hook records what it saw for the doctor: agy's "
+              "fullyIdle beside the beat and the waiter's pid",
+              saw.get("fully_idle") is True and saw.get("waiter_alive") is True
+              and isinstance(saw.get("beat_s"), float), str(saw))
         link = root / "link-proj"
         link.symlink_to(proj)
-        code, out = run_hook({"conversationId": "c-root", "fullyIdle": True,
+        (box / "guard.json").unlink()
+        code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(link)]}, hook_env)
         check("the hook finds the mailbox through a symlinked project path",
-              out.get("decision") == "continue", str(out))
+              out == {} and (box / "guard.json").is_file(), str(out))
 
+        # --- a message rings, and the waiter keeps running ----------------------
         broker.push(msg("m-1", "are you there?"))
-        try:
-            got = w.communicate(timeout=15)[0]
-        except subprocess.TimeoutExpired:
-            got = "(still running)"
-        check("a message arriving makes the waiter EXIT — that is what wakes "
-              "agy — saying to call a2a_inbox",
-              w.returncode == 0 and "Call a2a_inbox" in got, got)
+        check("a message arriving rings the conversation with agentapi "
+              "send-message, naming a2a_inbox",
+              wait_for(lambda: len(api.rings()) == 1, 10)
+              and api.rings()[0].startswith("send-message --title a2a c-root")
+              and "1 new a2a message" in api.rings()[0]
+              and "Call a2a_inbox" in api.rings()[0], str(api.rings()))
+        time.sleep(4)
+        check("once: the waiter does not ring the same batch again, and keeps "
+              "running", len(api.rings()) == 1 and w.poll() is None,
+              str(api.rings()))
         check("and the message is still unacked", "m-1" not in broker.acked)
 
         code, out = run_hook({"conversationId": "c-root",
@@ -329,8 +441,7 @@ def main() -> int:
               str(out))
         code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(proj)]},
-                             {"TMPDIR": str(tmpdir),
-                              "PLUGIN_DATA": str(home / ".gemini" / "antigravity"
+                             {"PLUGIN_DATA": str(home / ".gemini" / "antigravity"
                                                  / "plugin_data" / "a2a")})
         check("and in the Antigravity app", out == {}, str(out))
         code, out = run_hook({"conversationId": "c-root",
@@ -342,11 +453,6 @@ def main() -> int:
               out.get("decision") == "continue" and out3 == {}
               and json.loads((box / "guard.json").read_text())["gave_up"],
               f"{out} {out3}")
-        code, out = run_hook({"conversationId": "c-new", "fullyIdle": True,
-                              "workspacePaths": [str(proj)]}, hook_env)
-        check("another conversation IS nudged when no waiter runs and agy is "
-              "fully idle (a /clear or a new chat in the same agy)",
-              out.get("decision") == "continue", str(out))
         for bad in ("", "not json", "[1,2]"):
             r = subprocess.run([sys.executable, "-B", "-I", "./a2a-stop.py"],
                                cwd=str(PLUGIN), input=bad, capture_output=True,
@@ -361,13 +467,33 @@ def main() -> int:
               and json.loads((box / "live").read_text())["route"] == "c-root",
               out[:200])
         check("and that ack went out", wait_for(lambda: "m-1" in broker.acked))
+        time.sleep(4)
+        check("a drained queue rings nothing", len(api.rings()) == 1,
+              str(api.rings()))
+
+        # --- a waiter killed outright --------------------------------------------
+        w.kill()
+        w.wait()
+        out = c.call("a2a_inbox", conv="c-root")
+        check("a waiter killed outright leaves a fresh beat, but its pid is "
+              "dead: a2a_inbox names the command again",
+              line in out and "already running" not in out, out[-300:])
+        code, out = run_hook({"conversationId": "c-new", "fullyIdle": True,
+                              "workspacePaths": [str(proj)]}, hook_env)
+        check("another conversation IS nudged when no waiter runs and agy is "
+              "fully idle (a /clear or a new chat in the same agy)",
+              out.get("decision") == "continue", str(out))
         code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(proj)]}, hook_env)
-        check("after progress the hook nudges again: no waiter is running now",
-              out.get("decision") == "continue"
+        check("the hook nudges when no waiter is running: the killed one's "
+              "beat is still fresh, its pid is dead",
+              (box / "beat").exists() and out.get("decision") == "continue"
               and "waiter is not running" in out.get("reason", ""), str(out))
+        check("and the hook's reason names no command: a2a_inbox says what "
+              "to start, or that this agy does not receive",
+              "wait.sh" not in out.get("reason", ""), str(out))
         # A waiter that never starts (the command denied, or run in the
-        # foreground): a2a_inbox calls alone must not reset the guard.
+        # sandbox): a2a_inbox calls alone must not reset the guard.
         c.call("a2a_inbox", conv="c-root")
         code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(proj)]}, hook_env)
@@ -376,8 +502,7 @@ def main() -> int:
                                "workspacePaths": [str(proj)]}, hook_env)
         check("an a2a_inbox call with no waiter started is not progress: it "
               "still gives up after two nudges",
-              out.get("decision") == "continue" and out3 == {},
-              f"{out} {out3}")
+              out3 == {}, f"{out} {out3}")
 
         broker.push(msg("m-1", "replayed"))
         broker.push(msg("m-2", "new"))
@@ -394,24 +519,85 @@ def main() -> int:
                       "version"], str(ids))
         ph = next(x for x in st["checks"] if x["check"] == "push_host")
         check("doctor: no waiter running is the agent's to fix, with the "
-              "command", ph["ok"] is False and ph["who"] == "you"
-              and "wait.sh" in ph["do"], str(ph))
+              "command and the bypass", ph["ok"] is False and ph["who"] == "you"
+              and "wait.sh" in ph["do"] and "BypassSandbox: true" in ph["do"],
+              str(ph))
         check("doctor: push names the queue, route and waiter",
               st["push"]["queued"] == 1 and st["push"]["route"] == "c-root"
-              and st["push"]["host"] == "cli", str(st["push"]))
+              and st["push"]["host"] == "cli"
+              and st["push"]["waiter"]["running"] is False, str(st["push"]))
         report = [b for m, p, b in broker.requests if p == "/me/state"]
         check("doctor: it reports harness antigravity with the allowed keys",
               report and report[-1]["harness"] == "antigravity"
               and set(report[-1]) == {"harness", "version", "switch", "route",
                                       "receives", "settings", "failing",
                                       "fixed"}, str(report[-1:]))
-        w2 = subprocess.Popen(["sh", str(box / "wait.sh")],
-                              stdout=subprocess.PIPE, text=True)
+
+        # --- mail already waiting, and a newer waiter ----------------------------
+        w2 = start_waiter(api, home)
         waiters.append(w2)
-        got = w2.communicate(timeout=10)[0]
-        check("a waiter started while mail waits exits at once",
-              "Call a2a_inbox" in got, got)
+        check("a waiter started while mail waits rings at once, and keeps "
+              "running", wait_for(lambda: len(api.rings()) == 2, 10)
+              and w2.poll() is None, str(api.rings()))
+        w2b = start_waiter(api, home)
+        waiters.append(w2b)
+        got = finish(w2)
+        outputs.append(got)
+        check("a newer waiter takes over: the old one stops, saying there is "
+              "nothing to do", "newer waiter took over" in got, got)
+        out = c.call("a2a_inbox", conv="c-root")
+        check("and a2a_inbox then says the waiter is running",
+              'id="m-2"' in out and "already running" in out, out[-200:])
+
+        # --- a ring that fails ------------------------------------------------
+        api.fail.write_text("")
+        broker.push(msg("m-ring", "ring fails"))
+        got = finish(w2b, 15)
+        outputs.append(got)
+        check("a ring that fails makes the waiter EXIT, which wakes agy the "
+              "old way, saying to call a2a_inbox",
+              w2b.returncode == 0 and "Call a2a_inbox" in got, got)
+        w5 = start_waiter(api, home)
+        waiters.append(w5)
+        got = finish(w5)
+        outputs.append(got)
+        check("a waiter that cannot reach agentapi (the sandbox) stops at "
+              "once and says to start it with BypassSandbox: true",
+              w5.returncode == 1 and "BypassSandbox: true" in got, got)
+        check("and takes its early beat with it, so nothing reads it as a "
+              "running waiter", not (box / "beat").exists())
+        api.fail.unlink()
         c.call("a2a_inbox", conv="c-root")
+
+        w6 = start_waiter(api, home, drop=("ANTIGRAVITY_CONVERSATION_ID",))
+        got = finish(w6)
+        check("outside agy (no conversation id) the waiter does nothing",
+              "only runs inside agy" in got, got)
+        w7 = start_waiter(api, home, conv="c-unknown")
+        got = finish(w7)
+        check("and in a conversation no mailbox answers in, it says to call "
+              "a2a_inbox", "no a2a mailbox" in got, got)
+
+        # --- the route moves -------------------------------------------------
+        w8 = start_waiter(api, home)
+        waiters.append(w8)
+        wait_for(lambda: (box / "waiter").read_text().strip() == str(w8.pid), 8)
+        api.fail.write_text("")
+        w9 = start_waiter(api, home)
+        got = finish(w9)
+        api.fail.unlink()
+        time.sleep(0.2)
+        check("a sandboxed second start beside a running waiter fails without "
+              "touching it: same `waiter`, its beat kept, still running",
+              w9.returncode == 1 and w8.poll() is None
+              and (box / "waiter").read_text().strip() == str(w8.pid)
+              and wait_for(lambda: (box / "beat").exists(), 4), got)
+        c.call("list_channels", conv="c-moved")
+        got = finish(w8)
+        outputs.append(got)
+        check("when a2a moves to another conversation (a /clear, a new chat) "
+              "the waiter stops", "another conversation" in got, got)
+        c.call("list_channels", conv="c-root")
 
         # --- what is read elsewhere leaves the queue ----------------------------
         broker.push(msg("m-3", "room post", channel="ops"))
@@ -461,10 +647,10 @@ def main() -> int:
                                    for m, p, a in broker.requests), 15),
               str([r for r in broker.requests if r[1].startswith("/stream")]))
 
-        w3 = subprocess.Popen(["sh", str(box / "wait.sh")],
-                              stdout=subprocess.PIPE, text=True)
+        w3 = start_waiter(api, home)
         waiters.append(w3)
-        wait_for(lambda: hk._age(str(box / "beat")) < 2, 8)
+        wait_for(lambda: (box / "waiter").read_text().strip() == str(w3.pid)
+                 and hk._age(str(box / "beat")) < 2, 8)
         before = (proj / ".a2a.json").read_text()
         st = json.loads(c.call("a2a_channel_status", {"fix": True},
                                conv="c-root"))
@@ -474,7 +660,7 @@ def main() -> int:
               f"{st['fixed']} {st['next_step']}")
 
         # --- one receiver per project ------------------------------------------
-        c2 = Client(broker, proj, data, tmpdir, home)
+        c2 = Client(broker, proj, data, home)
         clients.append(c2)
         c2.rpc("initialize")
         time.sleep(1.0)
@@ -489,7 +675,7 @@ def main() -> int:
         # --- the app only sends ---------------------------------------------------
         appdata = home / ".gemini" / "antigravity" / "plugin_data" / "a2a"
         streams = broker.streams
-        c3 = Client(broker, proj, appdata, tmpdir, home)
+        c3 = Client(broker, proj, appdata, home)
         clients.append(c3)
         c3.rpc("initialize")
         time.sleep(1.0)
@@ -503,9 +689,9 @@ def main() -> int:
         # --- off -----------------------------------------------------------------
         off = root / "off-proj"
         off.mkdir()
-        offbox = tmpdir / "a2a-agy" / hk.project_hash(str(off))
+        offbox = data / "boxes" / hk.project_hash(str(off))
         streams = broker.streams
-        c4 = Client(broker, off, data, tmpdir, home)
+        c4 = Client(broker, off, data, home)
         clients.append(c4)
         init = c4.rpc("initialize")["result"]
         time.sleep(1.0)
@@ -522,15 +708,21 @@ def main() -> int:
         check("the client exits cleanly when agy closes its stdin", code == 0,
               str(code))
         check("and takes `live` with it", not (box / "live").exists())
-        try:
-            got = w3.communicate(timeout=10)[0]
-        except subprocess.TimeoutExpired:
-            got = "(still running)"
+        got = finish(w3)
+        outputs.append(got)
         check("a waiter still running then says the project stopped receiving",
               "not receiving" in got, got)
         code, out = run_hook({"conversationId": "c-root",
                               "workspacePaths": [str(proj)]}, hook_env)
         check("and the hook goes silent", out == {}, str(out))
+
+        # --- agy's CSRF token went nowhere ------------------------------------
+        leaked = [str(p) for p in root.rglob("*") if p.is_file()
+                  and SECRET in p.read_text(errors="replace")]
+        check("the waiter never wrote agy's CSRF token anywhere, nor passed "
+              "agentapi's reply (which carries it) through",
+              leaked == [] and not any(SECRET in o for o in outputs),
+              f"{leaked} {[o for o in outputs if SECRET in o]}")
         check("nothing was written into the plugin folder",
               not any(p.name == "__pycache__" for p in PLUGIN.rglob("*")))
     finally:
@@ -547,7 +739,7 @@ def main() -> int:
     for f in fails:
         print("FAIL", f)
     print("FAILED" if fails else
-          "PASS — queued unacked, woken by the waiter, nudged by the hook")
+          "PASS — queued unacked, rung by the waiter, nudged by the hook")
     return 1 if fails else 0
 
 

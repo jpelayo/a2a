@@ -545,19 +545,17 @@ def run_codex(contents, follow=()) -> dict:
 
 def run_agy(contents, follow=()) -> dict:
     """The real Antigravity client as agy runs it: cwd = the PLUGIN folder,
-    PWD = the project, PLUGIN_DATA and TMPDIR of its own (kept out of the
-    real ~/.gemini), spoken to over MCP stdio."""
+    PWD = the project, PLUGIN_DATA of its own (kept out of the real
+    ~/.gemini; the mailbox is under it), spoken to over MCP stdio."""
     fb = FakeBroker()
     proj = _project(contents)
     side = proj.parent / (proj.name + "-agy")
-    tmp = side / "tmp"
-    tmp.mkdir(parents=True)
+    data = side / "antigravity-cli" / "plugin_data" / "a2a"
+    data.mkdir(parents=True)
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("A2A_", "PLUGIN_"))}
     env.update(A2A_URL=fb.url, A2A_TOKEN="t", PWD=str(proj),
-               PLUGIN_ROOT=str(AGY.parent), TMPDIR=str(tmp),
-               PLUGIN_DATA=str(side / "antigravity-cli" / "plugin_data"
-                               / "a2a"))
+               PLUGIN_ROOT=str(AGY.parent), PLUGIN_DATA=str(data))
     proc = subprocess.Popen([sys.executable, "-B", "-I", str(AGY)],
                             cwd=str(AGY.parent), env=env, text=True,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -572,13 +570,13 @@ def run_agy(contents, follow=()) -> dict:
     say({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     time.sleep(1.5)
     before = list(fb.calls)
-    boxes = list((tmp / "a2a-agy").glob("*/live"))
+    boxes = list((data / "boxes").glob("*/live"))
     for i, (name, args) in enumerate(follow):
         say({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call",
              "params": {"name": name, "arguments": args}})
         time.sleep(1.5)
     after = fb.calls[len(before):]
-    live_after = list((tmp / "a2a-agy").glob("*/live"))
+    live_after = list((data / "boxes").glob("*/live"))
     proc.stdin.close()
     out, err = proc.communicate(timeout=30)
     fb.close()

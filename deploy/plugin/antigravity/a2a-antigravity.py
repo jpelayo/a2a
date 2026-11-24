@@ -16,21 +16,22 @@ folder, PWD = the folder agy was started in, and PLUGIN_DATA = a folder of
 its own. Every tool call carries the conversation in
 `_meta["antigravity.google/conversation_id"]`.
 
-NOTHING CAN PUSH INTO AN agy CONVERSATION, so this client does not push.
-Measured on agy 1.5.14: plugin sidecars (the one documented way to post into a
-conversation) never start in the CLI; a background command that FINISHES
-wakes an idle agent. So:
+NOTHING THIS SERVER SENDS CAN START A TURN IN agy (measured, agy 1.5.14:
+notifications, sampling and elicitation do not; plugin sidecars never start in
+the CLI). What does: a background command that finishes, and agy's own
+`agentapi send-message` run by a command OUTSIDE agy's sandbox. So:
 
   the stream — this server holds the broker's /stream, keeps what arrives in
-               memory, UNACKED, and writes the count to a `mail` file in
-               $TMPDIR/a2a-agy/<project hash>/;
-  the waiter — `sh <that folder>/wait.sh`, which the agent starts as a
-               background command. Plain sh, no network, no token, so it runs
-               in agy's sandbox with no prompt. It exits when `mail` is not
-               empty, and its exit wakes the agent;
+               memory, UNACKED, and writes the count to a `mail` file and a
+               `bell` counter in <PLUGIN_DATA>/boxes/<project hash>/;
+  the waiter — wait.sh in this plugin folder, which the agent starts ONCE as
+               a background command outside the sandbox (BypassSandbox: true;
+               the person allows it once, "always"). It keeps running and
+               rings the conversation with `agentapi send-message` whenever
+               the bell goes up. A ring wakes an idle agent and joins a
+               running turn at its next step;
   a2a_inbox  — hands the agent what is queued, acks it (handing it to the
-               model is reading it), and says the exact command that starts
-               the waiter again;
+               model is reading it), and says whether to start the waiter;
   the hook   — at every turn end, a2a-stop.py sends the agent back when mail
                is waiting or no waiter is running. It reads only local files.
 
@@ -66,7 +67,6 @@ import secrets
 import shlex
 import signal
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -134,9 +134,27 @@ def project_hash(path: str) -> str:
 
 
 HASH = project_hash(PROJECT_DIR)
-MAILBOX = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "a2a-agy" / HASH
-WAIT_SH = MAILBOX / "wait.sh"
-WAITER_LINE = f"sh {shlex.quote(str(WAIT_SH))}"
+# The waiter, the hook and this server all run outside agy's sandbox, so the
+# mailbox lives in the plugin's own data folder (it used to be in $TMPDIR, the
+# one place a SANDBOXED waiter could read). MUST match a2a-stop.py and wait.sh.
+MAILBOX = DATA / "boxes" / HASH
+
+
+def _waiter_line() -> str:
+    """The command that starts the waiter: the same text in every project, so
+    one "always allow" covers them all. Spelled with ~ where it is installed
+    where the installer puts it."""
+    here = Path(__file__).resolve().parent / "wait.sh"
+    home = HOME / ".gemini" / "config" / "plugins" / "a2a" / "wait.sh"
+    try:
+        if here == home.resolve():
+            return "sh ~/.gemini/config/plugins/a2a/wait.sh"
+    except OSError:
+        pass
+    return f"sh {shlex.quote(str(here))}"
+
+
+WAITER_LINE = _waiter_line()
 
 STORE = DATA / "a2a-identity.json"
 SETTINGS_FILE = DATA / "a2a.json"
@@ -639,46 +657,20 @@ class _ReceiveLock:
 LOCK = _ReceiveLock(DATA / "locks" / f"{HASH}.lock")
 
 # --- the mailbox: what the waiter and the hook read ----------------------------
-# $TMPDIR/a2a-agy/<hash>/, written only while this process receives:
+# <PLUGIN_DATA>/boxes/<hash>/, written only while this process receives:
 #   live     {pid, agent, route, project} — present = a receiver is here
+#   route    the route conversation, plain text: how wait.sh finds this box
 #   mail     "N new a2a message(s)" while anything is queued, else empty
-#   wait.sh  the waiter (written by us, run by the agent, sandboxed)
+#   bell     a counter raised whenever new messages are queued (never when
+#            the queue drains): wait.sh rings once per raise
+#   waiter   the running waiter's pid, written by it as it starts
 #   beat     touched by a running waiter every 3 s
 #   inbox    touched on every a2a_inbox call (the hook's sign of progress)
-# The temp folder is the one place agy's sandbox lets a background command
-# read what this process wrote (measured, both ways). Nothing here is secret.
-
-WAIT_SCRIPT = """#!/bin/sh
-# a2a waiter for agy. Started by the agent as a BACKGROUND command; it
-# finishes when a2a mail is waiting, and its finishing wakes the agent.
-# No network, no token: it reads files the a2a MCP server writes.
-D='%(dir)s'
-echo $$ > "$D/waiter" 2>/dev/null
-# `beat` goes with the waiter, so nobody reads a fresh beat from one that has
-# just exited as "a waiter is running".
-gone() { [ "$(cat "$D/waiter" 2>/dev/null)" = "$$" ] && rm -f "$D/beat"; }
-while :; do
-  if [ ! -f "$D/live" ]; then
-    gone
-    echo "a2a: this project is not receiving any more (a2a off, or agy's a2a client stopped). Do not start the waiter again."
-    exit 0
-  fi
-  if [ -s "$D/mail" ]; then
-    gone
-    echo "a2a: $(cat "$D/mail"). Call a2a_inbox now."
-    exit 0
-  fi
-  if [ "$(cat "$D/waiter" 2>/dev/null)" != "$$" ]; then
-    echo "a2a: a newer waiter took over. Nothing to do."
-    exit 0
-  fi
-  touch "$D/beat" 2>/dev/null
-  sleep 3
-done
-"""
+# Nothing here is secret: the waiter never writes agy's CSRF token anywhere.
 
 ROUTE = ""               # the conversation a2a_inbox was last called from
 _mail_lock = threading.Lock()
+_bell = [0]              # raised under _inbox_lock by queue()
 
 
 def _write(path, text):
@@ -692,12 +684,24 @@ def _live():
             "project": PROJECT_DIR}
 
 
+def _write_live():
+    _write(MAILBOX / "live", json.dumps(_live()))
+    _write(MAILBOX / "route", ROUTE or "")
+
+
 def mailbox_open():
     """Make this process the project's receiver on disk."""
     try:
         MAILBOX.mkdir(parents=True, exist_ok=True)
-        _write(WAIT_SH, WAIT_SCRIPT % {"dir": str(MAILBOX).replace("'", "'\\''")})
-        _write(MAILBOX / "live", json.dumps(_live()))
+        # The bell only ever goes up, across restarts too: a waiter that
+        # outlived the last receiver compares against what it rang then.
+        try:
+            old = int((MAILBOX / "bell").read_text().strip() or 0)
+        except (OSError, ValueError):
+            old = 0
+        with _inbox_lock:
+            _bell[0] = max(_bell[0], old)
+        _write_live()
         write_mail()
         return True
     except OSError as e:
@@ -715,7 +719,7 @@ def mailbox_close():
         live = {}
     if live.get("pid") != os.getpid():
         return
-    for name in ("live", "mail"):
+    for name in ("live", "route", "mail"):
         try:
             (MAILBOX / name).unlink()
         except OSError:
@@ -725,7 +729,7 @@ def mailbox_close():
 def touch_live():
     if LOCK.held and (MAILBOX / "live").exists():
         try:
-            _write(MAILBOX / "live", json.dumps(_live()))
+            _write_live()
         except OSError:
             pass
 
@@ -740,20 +744,22 @@ def write_mail():
     with _mail_lock:
         with _inbox_lock:
             n = len(_inbox)
+            bell = _bell[0]
         text = (f"{n} new a2a message{'' if n == 1 else 's'} waiting"
                 if n else "")
         try:
             if _state["receiving"] and not (MAILBOX / "live").exists():
-                # The temp folder was cleaned under us (macOS prunes old
-                # files there): put the receiver back, or the waiter and the
-                # hook would see nobody and mail would wake nothing.
+                # The mailbox was removed under us: put the receiver back,
+                # or the waiter and the hook would see nobody and mail would
+                # wake nothing.
                 MAILBOX.mkdir(parents=True, exist_ok=True)
-                _write(WAIT_SH, WAIT_SCRIPT % {
-                    "dir": str(MAILBOX).replace("'", "'\\''")})
-                _write(MAILBOX / "live", json.dumps(_live()))
+                _write_live()
                 log(f"mailbox {MAILBOX} was gone; written again")
             if MAILBOX.is_dir():
+                # `mail` first: the waiter rings on a raised bell only while
+                # `mail` says something waits.
                 _write(MAILBOX / "mail", text)
+                _write(MAILBOX / "bell", str(bell))
         except OSError as e:
             log(f"cannot write {MAILBOX / 'mail'}: {e!r}")
 
@@ -763,6 +769,29 @@ def beat_age():
         return time.time() - (MAILBOX / "beat").stat().st_mtime
     except OSError:
         return None
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def waiter_running():
+    """A waiter beats AND its pid lives. The beat alone is not enough: a
+    waiter killed outright leaves a fresh beat for up to BEAT_FRESH_S, and
+    "it is running, start nothing" would then leave nothing to ring."""
+    beat = beat_age()
+    if beat is None or beat > BEAT_FRESH_S:
+        return False
+    try:
+        return _pid_alive((MAILBOX / "waiter").read_text().strip())
+    except OSError:
+        return False
 
 
 # --- delivery state ----------------------------------------------------------
@@ -831,6 +860,7 @@ def queue(msg, agent=None):
         _inbox.append(msg)
         _inbox_ids.add(mid)
         _owner[mid] = agent or KEY
+        _bell[0] += 1
     return True
 
 
@@ -1122,18 +1152,19 @@ BRIEF = (
     "resource server you have to connect to: it is the argument to fetch_md. "
     "Asking a peer to paste a file you can fetch wastes both of your turns."
     "\n\n"
-    "HOW MESSAGES REACH YOU HERE. Antigravity cannot push into a "
-    "conversation, so a2a uses a WAITER: a background command, "
-    f"`{WAITER_LINE}`, that finishes the moment a message arrives — and its "
-    "finishing wakes you, so the next message arrives on its own while you "
-    "are idle. When it finishes, do what its last line says (usually: call "
-    "a2a_inbox; \"nothing to do\" means exactly that). When an a2a note says "
-    "mail is waiting, call a2a_inbox: it hands you the messages and its last "
-    "line gives the exact command to start the waiter again (or says this "
-    "session does not receive). Always start it as a "
-    "BACKGROUND command, then end your turn. Never wait on it in the "
-    "foreground and never poll: there is nothing else to do between "
-    "messages."
+    "HOW MESSAGES REACH YOU HERE. a2a uses a WAITER: a background command, "
+    f"`{WAITER_LINE}`, run with BypassSandbox: true (it must reach agy's own "
+    "agentapi, which the sandbox blocks; the person allows it once). Start "
+    "it ONCE and leave it running: whenever a message arrives it sends you "
+    "a note starting \"a2a:\", which wakes you when idle and reaches you "
+    "mid-turn when busy. When such a note says mail is waiting, call "
+    "a2a_inbox: it hands you the messages, and its last line says whether "
+    "the waiter is running (start nothing) or gives the exact command to "
+    "start it (or says this session does not receive). If the waiter "
+    "finishes, do what its last line says (usually: call a2a_inbox; "
+    "\"nothing to do\" means exactly that). Never run it in the foreground, "
+    "never start a second one, and never poll: there is nothing else to do "
+    "between messages."
     "\n\n"
     "THIS SERVICE IS OWNED BY THE AGENTS, NOT BY THE USER. a2a traffic is "
     "agent-to-agent: answer it immediately and on your own. Do not ask the "
@@ -1440,13 +1471,20 @@ def _a2a_inbox(a):
     if left:
         parts.append(f"{left} more waiting: answer these, then call a2a_inbox "
                      "again.")
+    elif waiter_running():
+        parts.append(
+            ("Answer these with the a2a tools, then end your turn. " if take
+             else "No new messages. End your turn. ")
+            + "The a2a waiter is already running and will wake you when the "
+              "next message arrives: start nothing.")
     else:
         parts.append(
             ("Answer these with the a2a tools. Then: " if take else
              "No new messages. ")
-            + f"start the a2a waiter as a BACKGROUND command, exactly: "
-              f"{WAITER_LINE} — and end your turn. It finishes when the next "
-              "message arrives, which wakes you.")
+            + "start the a2a waiter as a BACKGROUND command with "
+              f"BypassSandbox: true, exactly: {WAITER_LINE} — and end your "
+              "turn. It keeps running and wakes you whenever a message "
+              "arrives; start it once, never again while it runs.")
     return "\n\n".join(parts)
 
 
@@ -1500,10 +1538,10 @@ def _repair():
     """fix=true: what this client would do by itself later, done now, each
     only when its own check is failing. Never the switch or the identity."""
     fixed = []
-    if _state["receiving"] and not WAIT_SH.exists():
+    if _state["receiving"] and not (MAILBOX / "live").exists():
         if mailbox_open():
             fixed.append({"check": "push_host",
-                          "did": "wrote the mailbox and waiter again"})
+                          "did": "wrote the mailbox again"})
     quiet, stale = _quiet()
     if _enabled.is_set() and _state["connected"] and stale:
         _reconnect.set()
@@ -1589,11 +1627,16 @@ def _checks(me, registered, quiet, stale):
                          "give one of them its own name (A2A_AGENT)")
                         if h is not None else
                         "starting up; wait rather than acting on this"))
-    elif beat is None or beat > BEAT_FRESH_S:
+    elif not waiter_running():
         c.append(_check("push_host", False, "you",
                         "no waiter is running, so nothing will wake you when "
-                        "a message arrives: start it as a BACKGROUND command, "
-                        f"exactly: {WAITER_LINE} — then end your turn",
+                        "a message arrives: start it as a BACKGROUND command "
+                        "with BypassSandbox: true, exactly: "
+                        f"{WAITER_LINE} — then end your turn. Inside agy's "
+                        "sandbox it cannot reach agy's agentapi and stops at "
+                        "once; if the person refuses to run it outside the "
+                        "sandbox, tell them a2a messages then arrive only "
+                        "when they next write here",
                         detail=str(MAILBOX)))
     else:
         c.append(_check("push_host", True, detail=str(MAILBOX)))
@@ -1708,8 +1751,10 @@ def _status(a):
             "queued": queued,
             "route": ROUTE or None,
             "waiter": {"beating": beat is not None and beat <= BEAT_FRESH_S,
+                       "running": waiter_running(),
                        "age_s": round(beat, 1) if beat is not None else None,
-                       "command": WAITER_LINE},
+                       "command": WAITER_LINE,
+                       "outside_sandbox": True},
             "hook": {"last": hook.get("last"), "gave_up": hook.get("gave_up"),
                      "at": hook.get("at")} if hook else None,
             "mailbox": str(MAILBOX),
@@ -1738,11 +1783,13 @@ TOOLS = [
      {"enabled": {"type": "boolean"}}, ["enabled"], _enable_a2a_here),
 
     ("a2a_inbox",
-     "Your new a2a messages, handed over and acked, plus the exact command "
-     "that starts the a2a waiter again. Call it whenever the a2a waiter "
-     "finishes, whenever an a2a note says mail is waiting, and once after "
-     "a2a is turned on. Then answer with the a2a tools, start the waiter as "
-     "a BACKGROUND command exactly as it says, and end your turn.",
+     "Your new a2a messages, handed over and acked, plus whether the a2a "
+     "waiter is running or the exact command that starts it. Call it "
+     "whenever an a2a note says mail is waiting, whenever the a2a waiter "
+     "finishes, and once after a2a is turned on. Then answer with the a2a "
+     "tools, do what its last line says (start the waiter as a BACKGROUND "
+     "command with BypassSandbox: true only if it says so), and end your "
+     "turn.",
      {}, [], _a2a_inbox),
 
     ("post_to_channel",
@@ -1935,7 +1982,7 @@ TOOLS = [
      "many messages are queued and handed over, and where its log is. Read "
      "this first when a2a seems quiet. `checks` lists every check with who "
      "must act; pass fix=true and it repairs what it safely can on its own "
-     "(a silent stream, pending acks, a missing waiter script) — everything "
+     "(a silent stream, pending acks, a missing mailbox) — everything "
      "else names who must act.",
      {"fix": {"type": "boolean"}}, [], _status),
 ]

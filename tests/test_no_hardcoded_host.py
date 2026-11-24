@@ -47,6 +47,7 @@ DOC_HOSTS = {
     "pi.dev", "opencode.ai", "claude.ai", "github.com", "anthropic.com",
     "docs.anthropic.com", "modelcontextprotocol.io", "www.gnu.org",
     "opensource.org", "hub.docker.com", "www.apache.org", "apache.org",
+    "antigravity.google",
 }
 # Any host in a url. Ports and paths trimmed by the group itself.
 URL_HOST = re.compile(r"https?://([^/\s\"'`)\]}>,;]+)", re.I)

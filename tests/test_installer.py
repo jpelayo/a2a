@@ -816,7 +816,8 @@ def main() -> int:
         check("antigravity: the plugin lands in ~/.gemini/config/plugins/a2a, "
               "where agy keeps installed plugins",
               names == ["a2a-antigravity.py", "a2a-stop.py", "hooks.json",
-                        "mcp_config.json", "plugin.json", "rules/AGENTS.md"],
+                        "mcp_config.json", "plugin.json", "rules/AGENTS.md",
+                        "wait.sh"],
               str(names))
         srv = (pdir / "a2a-antigravity.py").read_text() if names else ""
         check("antigravity: with the token baked into the server's seam",
@@ -829,6 +830,7 @@ def main() -> int:
               "rule to add, and that the app only sends",
               "quit agy" in out and "mcp(a2a_a2a/*)" in out
               and "/permissions" in out and "only sends" in out
+              and "plugins/a2a/wait.sh` outside the sandbox" in out
               and "enable a2a here" in out, out[-1800:])
         code, out = run_installer(installer, home, bin_, cwd, [
             "all", TOKEN, "y"])

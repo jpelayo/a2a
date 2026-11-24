@@ -207,23 +207,28 @@ def main() -> int:
     # Antigravity: the MCP server and the Stop hook, and the three JSON files
     # agy reads to find them — a typo there loads a plugin with neither.
     python_client(AGY, "antigravity", ("handle", "pump", "BRIEF", "TOOLS"))
-    python_client(AGY_HOOK, "antigravity hook", ("decide", "main"))
+    python_client(AGY_HOOK, "antigravity hook",
+                  ("decide", "decide_start", "main"))
     try:
         manifest = json.loads((AGY.parent / "plugin.json").read_text())
         mcp = json.loads((AGY.parent / "mcp_config.json").read_text())
         hooks = json.loads((AGY.parent / "hooks.json").read_text())
         server = mcp["mcpServers"]["a2a"]
         stop = [h for g in hooks.values() for h in g.get("Stop") or []]
+        start = [h for g in hooks.values()
+                 for h in g.get("SessionStart") or []]
         ok = (manifest.get("name") == "a2a"
               and server["args"][-1] == "${PLUGIN_ROOT}/" + AGY.name
-              and len(stop) == 1
+              and len(stop) == 1 and len(start) == 1
               and stop[0]["command"].endswith("./" + AGY_HOOK.name)
+              and start[0]["command"].endswith("./" + AGY_HOOK.name)
               and (AGY.parent / "rules" / "AGENTS.md").is_file())
         detail = f"{manifest} {server} {stop}"
     except Exception as e:
         ok, detail = False, f"{type(e).__name__}: {e}"
     check("antigravity: plugin.json names the plugin a2a, mcp_config.json "
-          "starts the server, hooks.json runs the Stop hook, rules/AGENTS.md "
+          "starts the server, hooks.json runs the Stop and SessionStart "
+          "hooks, rules/AGENTS.md "
           "is there", ok, detail)
 
     print()

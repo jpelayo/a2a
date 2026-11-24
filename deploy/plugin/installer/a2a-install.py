@@ -1407,6 +1407,10 @@ def next_steps(targets, pending, hermes_touched, failed=(), claude=None):
         steps.append(["Antigravity: a2a's tools ask before every call until "
                       "you allow them, once: in agy type /permissions, pick "
                       f"Global, then the allow list, press A and add {AGY_ALLOW}",
+                      "The first time a2a starts its waiter, agy asks to run "
+                      "`sh ~/.gemini/config/plugins/a2a/wait.sh` outside the "
+                      "sandbox: allow it always. It only rings agy when an "
+                      "a2a message arrives.",
                       "a2a receives in the agy CLI; the Antigravity app only "
                       "sends."])
     off = [NAMES[k] for k in ("opencode", "pi", "codex", "kilocode", "dsh",

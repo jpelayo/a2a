@@ -150,7 +150,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
 | Kilo Code | `~/.config/kilo/plugins/a2a-kilocode.js` (its own client, one file) | — | restart `kilo` |
 | DeepSeek Harness | `~/.dsh/a2a/plugin/` (a dsh bundle package) | `dsh plugin --profile web add link:~/.dsh/a2a/plugin`, and the same for `desktop` if the Desktop app made that profile — each only if not already done | restart `dsh web`; quit and reopen the Desktop app |
-| Antigravity CLI | `~/.gemini/config/plugins/a2a/` (an agy plugin: an MCP server, a turn-end hook, a rule) | — | restart `agy`; once, in agy, `/permissions` → Global → allow → add `mcp(a2a_a2a/*)` |
+| Antigravity CLI | `~/.gemini/config/plugins/a2a/` (an agy plugin: an MCP server, a turn-end hook, a rule, the waiter) | — | restart `agy`; once, in agy, `/permissions` → Global → allow → add `mcp(a2a_a2a/*)`; the first time a2a starts its waiter, allow it always |
 
 **Claude Code: the flag is what carries push.** Without it everything else
 works and nothing ever arrives; the startup dialog must show
@@ -203,21 +203,35 @@ dsh serves every project you open in it, and each project is its own agent;
 `dsh web` and the Desktop app receive, any other profile only sends. Messages
 show in the chat as a collapsed notice labelled *a2a*.
 
-**Antigravity CLI: a waiter instead of push.** Nothing can be pushed into an
-agy conversation, so a2a waits for messages with a background command. The
-plugin's MCP server holds the stream and keeps arriving messages unacked. The
-agent starts `sh $TMPDIR/a2a-agy/<project>/wait.sh` in the background and ends
-its turn. That command finishes the moment a message arrives, and its finishing
-wakes the agent, which calls `a2a_inbox`, answers, and starts the waiter again.
-A turn-end hook sends the agent back when mail is waiting or no waiter is
-running. The waiter is plain `sh` with no network, so it runs in agy's sandbox
-without asking. The one prompt is for a2a's MCP tools, hence the allow rule
-above. Limits:
-- nothing arrives before the first turn in a project ends;
-- a message that arrives mid-turn waits for that turn to end;
+**Antigravity CLI: a waiter rings the conversation.** Nothing a plugin's
+server sends can start a turn in agy, so a2a uses a background command, the
+**waiter**:
+- the plugin's MCP server holds the stream and keeps arriving messages
+  unacked;
+- in your first turn, the agent starts
+  `sh ~/.gemini/config/plugins/a2a/wait.sh` in the background, and it keeps
+  running for the whole session. In a new conversation a start hook asks for
+  it inside that turn; in a resumed one (`agy -c`) the turn-end hook asks
+  for it when that turn ends;
+- when a message arrives, the waiter rings the conversation with agy's own
+  `agentapi send-message`. That wakes an idle agent, and reaches a busy one
+  at its next step. The agent calls `a2a_inbox` and answers;
+- a turn-end hook sends the agent back when mail is waiting or no waiter is
+  running.
+
+agy's sandbox blocks `agentapi`, so the waiter runs **outside the sandbox**.
+agy asks once: allow it always. That gives that one `sh` loop full network and
+disk access. Read it first (it is short): it reads a2a's mailbox files and
+calls nothing but `agentapi`. The command is the same in every project, so one
+"always allow" covers them all. The other prompt is for a2a's MCP tools, hence
+the allow rule above.
+
+Limits:
+- nothing arrives before your first prompt in a project: agy runs no hook at
+  launch;
 - only the agy CLI receives. The Antigravity app loads the same plugin and only
   sends, and so does a second `agy` in the same project;
-- if the waiter cannot start (you denied the command), the hook asks twice and
+- if you refuse to run the waiter outside the sandbox, the hook asks twice and
   then lets the turn end; nothing arrives until your next turn there.
 
 **Antigravity CLI: Google's terms, and your responsibility.** Section 6 of the
@@ -234,10 +248,11 @@ We believe this client does not breach them, because of how it is built:
   never runs `agy -p`. No other program starts or drives agy: you start it, in
   your own terminal;
 - it is an agy plugin, using only agy's own plugin, MCP, hook and rule
-  mechanisms. The model runs only inside agy, under agy's own sandbox and
+  mechanisms, and agy's own `agentapi`, which agy puts on every command's
+  path. The model runs only inside agy, under agy's own sandbox and
   permission prompts;
-- it adds no way in: the waiter is a plain `sh` loop that agy runs and that
-  you can see.
+- it adds no way in: the waiter is a plain `sh` loop that the agent starts
+  inside agy, with your approval, and that you can read.
 
 That is our reading, not Google's, and Google has said nothing about plugins
 of this kind. **Using a2a with Antigravity is your responsibility alone.** It
@@ -420,7 +435,7 @@ How each harness gets them differs, and it is worth knowing which you are on:
 | **Hermes** | the plugin, as REST wrappers | `inject_message` into one conversation of the bot: a Hermes app conversation (by its session key, in the app's backend) or a messaging chat (run by its gateway) |
 | **Kilo Code** | the plugin, as REST wrappers | `client.session.promptAsync`, from the terminal app's own server only, and only between turns |
 | **DeepSeek Harness** | the plugin, as REST wrappers | `agent.followup` — starts a turn when idle, queues one after a running turn |
-| **Antigravity CLI** | the plugin's MCP server, as REST wrappers, plus `a2a_inbox` | none: a background waiter finishes when mail arrives, which wakes the agent; it then calls `a2a_inbox` (see [Install](#install-or-update)) |
+| **Antigravity CLI** | the plugin's MCP server, as REST wrappers, plus `a2a_inbox` | none: a background waiter, started once, rings the conversation with agy's `agentapi` when mail arrives; the agent then calls `a2a_inbox` (see [Install](#install-or-update)) |
 
 Claude Code is the odd one. OpenCode and Pi push by calling an API their
 harness always exposes, so it works the moment you install them. Claude Code's

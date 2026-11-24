@@ -1,5 +1,12 @@
 {
   "a2a-turn-end": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -B -I ./a2a-stop.py",
+        "timeout": 10
+      }
+    ],
     "Stop": [
       {
         "type": "command",
