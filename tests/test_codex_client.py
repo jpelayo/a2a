@@ -22,9 +22,14 @@ the shared suites, so they are covered here:
                    stream must never be claimed, because delivery is a
                    destructive read.
   ownership        only a server the a2a launch line started — socket
-                   `a2a-*.sock` — is pushed into or reaped. The reaper once
-                   SIGTERMed the shared control-socket server every fifteen
-                   seconds and took every Codex session on it down.
+                   `a2a-*.sock` — is reaped. The reaper once SIGTERMed the
+                   shared control-socket server every fifteen seconds and
+                   took every Codex session on it down.
+  the background   Codex's own managed server (a plain `codex`, 0.157+) is
+  server           pushed into — this session's thread only, named by Codex
+                   in each tool call, never a subagent's — only while a
+                   Codex TUI is open in the project, and never stopped
+                   (daemon_cases).
 
 Pure python3 stdlib.
 """
@@ -78,12 +83,15 @@ def load(sock: str = "", agent: str = "", cwd: str | None = None):
 class MockAppServer(threading.Thread):
     """Just enough app-server: the websocket upgrade, then JSON-RPC replies."""
 
-    def __init__(self, path, threads=("t-1",), cwds=None):
+    def __init__(self, path, threads=("t-1",), cwds=None, extra=None):
         super().__init__(daemon=True)
         self.path = path
         self.threads = list(threads)
         # thread id -> the cwd thread/read reports for it
         self.cwds = dict(cwds or {t: os.getcwd() for t in self.threads})
+        # thread id -> more fields of its thread/read record (source, …)
+        self.extra = dict(extra or {})
+        self.init_params = []    # every initialize's params
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
         self.srv.listen(1)
@@ -173,6 +181,7 @@ class MockAppServer(threading.Thread):
     def _reply(self, msg):
         method, rid = msg.get("method"), msg.get("id")
         if method == "initialize":
+            self.init_params.append(msg.get("params"))
             return {"id": rid, "result": {"userAgent": "mock"}}
         if method == "thread/loaded/list":
             return {"id": rid, "result": {"data": self.threads,
@@ -180,7 +189,8 @@ class MockAppServer(threading.Thread):
         if method == "thread/read":
             tid = msg["params"]["threadId"]
             return {"id": rid, "result": {"thread": {
-                "id": tid, "cwd": self.cwds.get(tid, "")}}}
+                "id": tid, "cwd": self.cwds.get(tid, ""),
+                **self.extra.get(tid, {})}}}
         if method == "turn/start":
             if self.fail_turns:
                 return {"id": rid, "error": {"code": -32600,
@@ -201,6 +211,289 @@ class MockAppServer(threading.Thread):
         else:
             head = b"\x81\x7f" + struct.pack(">Q", n)
         conn.sendall(head + payload)
+
+
+DAEMON_ARGV = ("/x/codex app-server --listen unix:// "
+               "--analytics-default-enabled --managed-daemon")
+
+
+class Stop(Exception):
+    pass
+
+
+def daemon_cases(tmp, proj, msg, codex_home):
+    """Codex's own background server (Codex 0.157+: a plain `codex` runs on
+    it). Push into THIS session's thread only, never stop the server, and
+    hold the stream only while a Codex TUI is open in the project."""
+    home = Path(tempfile.mkdtemp(prefix="cxd-", dir="/private/tmp")).resolve()
+    (home / "app-server-control").mkdir(parents=True)
+    os.environ["CODEX_HOME"] = str(home)
+    ctl = home / "app-server-control" / "app-server-control.sock"
+    try:
+        md = MockAppServer(str(ctl), threads=("t-me", "t-far"),
+                           cwds={"t-me": str(proj), "t-far": "/other/proj"})
+        md.start()
+
+        def daemon_client(argv=DAEMON_ARGV):
+            d = load(cwd=str(proj))
+            os.environ.pop("A2A_CODEX_SOCK", None)
+            d._SOCK_ENV = None
+            d._parent_argv = lambda: argv
+            d.send = lambda obj: None
+            return d
+
+        d = daemon_client()
+        check("daemon: Codex's managed background server is recognised as "
+              "the parent — its argv, its control socket",
+              d.daemon_parent() and d.host_kind() == "codex-daemon"
+              and d.control_socket() == str(ctl), d.control_socket())
+        bare = daemon_client("codex app-server --listen unix://")
+        check("daemon: a server somebody started by hand on the control "
+              "socket, without --managed-daemon, is still not pushed into",
+              bare.host_kind() == "" and bare.control_socket() == "",
+              bare.control_socket())
+        srv = d.get_server()
+        check("daemon: it picks the one thread in THIS project, among the "
+              "server's other sessions",
+              srv.session_thread() == "t-me", str(srv.thread_id))
+        check("daemon: and delivers into it as today, with turn/start",
+              d.deliver(msg) and bool(md.turns) and "hi" in md.turns[-1],
+              str(md.turns[-1:])[:200])
+        name = ((md.init_params[-1] or {}).get("clientInfo") or {}).get("name")
+        check("daemon: it introduces itself with a name the app-server treats "
+              "as NOT originating — any other rewrites the server-wide "
+              "originator and user agent of every session on it",
+              name == "codex_app_server_daemon", str(name))
+        used = set(md.methods)
+        check("daemon: it only reads threads and starts turns — never "
+              "resume, subscribe, the queue, or anything that changes the "
+              "server",
+              used <= {"initialize", "initialized", "thread/loaded/list",
+                       "thread/read", "turn/start"}, str(sorted(used)))
+        d.drop_server()             # the mock serves one connection at a time
+
+        # --- presence -------------------------------------------------------
+        d._present.clear()
+        check("daemon: with no Codex TUI open in the project the stream is "
+              "not claimed — the background server outlives the terminal",
+              not d._injectable())
+        d._present.set()
+
+        ps = ("  101 /usr/local/bin/codex\n"
+              "  102 codex app-server --listen unix:// --managed-daemon\n"
+              "  103 node /opt/homebrew/bin/codex resume --last\n"
+              "  104 codex exec fix the exec bug\n"
+              "  105 codex -m gpt-x \"why does exec fail\"\n"
+              "  106 /usr/bin/python3 a2a-codex.py\n"
+              "  107 codex mcp list\n")
+        check("presence: interactive Codex sessions are told from the "
+              "background server, exec, mcp and other processes — by the "
+              "first non-flag word only, since a prompt may say anything",
+              d._codex_tuis(ps) == [101, 103, 105], str(d._codex_tuis(ps)))
+
+        class FakeSub:
+            def __init__(self, cwds):
+                self.cwds = cwds
+
+            def run(self, argv, **kw):
+                if argv[0] == "ps":
+                    out = ps
+                else:
+                    pid = int(argv[argv.index("-p") + 1])
+                    out = (f"p{pid}\nfcwd\nn{self.cwds[pid]}\n"
+                           if pid in self.cwds else "")
+                return types.SimpleNamespace(stdout=out, returncode=0)
+
+        real_sub = d.subprocess
+        d.subprocess = FakeSub({101: "/elsewhere", 103: str(proj),
+                                105: "/elsewhere"})
+        here = d.tui_here()
+        d.subprocess = FakeSub({101: "/elsewhere", 103: "/elsewhere",
+                                105: "/elsewhere"})
+        away = d.tui_here()
+        d.subprocess = real_sub
+        check("presence: a TUI counts only when its cwd is this project",
+              here is True and away is False, f"{here} {away}")
+
+        seq = iter([True, False, False, False, True])
+        seen = []
+        pw = daemon_client()
+        pw._present.clear()
+        pw.tui_here = lambda: next(seq)
+
+        def sleep(s):
+            seen.append(pw._present.is_set())
+            if len(seen) >= 5:
+                raise Stop()
+        pw.time = types.SimpleNamespace(sleep=sleep, time=time.time,
+                                        strftime=time.strftime,
+                                        gmtime=time.gmtime)
+        try:
+            pw.presence_watch()
+        except Stop:
+            pass
+        check("presence: seen → receiving; gone for three checks in a row → "
+              "released; back → receiving again",
+              seen == [True, True, True, False, True], str(seen))
+
+        # --- the stream is released mid-way, nothing consumed --------------
+        rel = daemon_client()
+        rel.api = lambda *a, **k: {}
+        rel.resolve_name = lambda: None
+        rel.check_version = lambda: None
+        rel.catch_up = lambda: None
+        rel._injectable = lambda: True
+        emitted = []
+        rel.emit = lambda line: emitted.append(line)
+        lines = [b'{"id": "m-a"}\n', b'{"id": "m-b"}\n']
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield lines[0]
+                rel._present.clear()          # the TUI just closed
+                yield lines[1]
+                rel._enabled.clear()          # end the test's pump
+
+        real_open = rel.urllib.request.urlopen
+        rel.urllib.request.urlopen = lambda req, timeout=None: Resp()
+        rel.time = types.SimpleNamespace(sleep=lambda s: rel._enabled.clear(),
+                                         time=time.time,
+                                         strftime=time.strftime,
+                                         gmtime=time.gmtime)
+        rel._enabled.set()
+        try:
+            rel.pump()
+        finally:
+            rel.urllib.request.urlopen = real_open
+        check("presence: a line read after the TUI closed is left on the "
+              "broker, like one read after the project was turned off",
+              emitted == ['{"id": "m-a"}'], str(emitted))
+
+        # --- a subagent's own a2a server, and Codex naming the thread -------
+        ms = MockAppServer(str(home / "app-server-control" / "s.sock"),
+                           threads=("t-root", "t-sub"),
+                           cwds={"t-root": str(proj), "t-sub": str(proj)},
+                           extra={"t-root": {"threadSource": "user",
+                                             "source": "vscode"},
+                                  "t-sub": {"threadSource": "subagent",
+                                            "parentThreadId": "t-root",
+                                            "source": {"subAgent": {}}}})
+        ms.start()
+
+        def on_ms():
+            c = load(sock=ms.path, cwd=str(proj))
+            c.send = lambda obj: None
+            return c
+
+        def call_from(c, tid):
+            c.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "no_such_tool", "arguments": {},
+                                 "_meta": {"x-codex-turn-metadata": {
+                                     "thread_id": tid, "turn_id": "u"}}}})
+
+        g = on_ms()
+        try:
+            g.get_server().session_thread()
+            guessed = "picked"
+        except g.WSError as e:
+            guessed = str(e)
+        check("thread: before Codex names it, a session and its subagent in "
+              "one directory are two threads — refused, as today",
+              "2 live threads" in guessed, guessed)
+        call_from(g, "t-root")
+        check("thread: once a tool call names the thread, that is the "
+              "thread, exactly — even with a second one in the directory",
+              g.get_server().session_thread() == "t-root" and g._injectable(),
+              str(g.get_server().thread_id))
+        g.drop_server()             # the mock serves one connection at a time
+        sub = on_ms()
+        call_from(sub, "t-sub")
+        try:
+            sub.get_server().session_thread()
+            said = "picked"
+        except sub.WSError as e:
+            said = str(e)
+        check("thread: a subagent's own a2a server never pushes — its "
+              "parent session has its own, and two would fight over the "
+              "stream",
+              "subagent" in said and sub._pinned["subagent"]
+              and not sub._injectable(), said)
+        sub.drop_server()
+        first = on_ms()
+        first._pinned["thread"] = None
+        srvf = first.get_server()
+        srvf.thread_id = "t-guess"
+        call_from(first, "t-root")
+        check("thread: a name from Codex replaces an earlier directory guess",
+              srvf.session_thread() == "t-root", str(srvf.thread_id))
+
+        # --- the handshake ----------------------------------------------------
+        hs = daemon_client()
+        got = []
+        hs.send = lambda obj: got.append(obj)
+        for asked in ("2025-06-18", "2025-11-25", "2026-07-28", None):
+            params = {"clientInfo": {"name": "codex-mcp-client",
+                                     "version": "0.172.0"}}
+            if asked:
+                params["protocolVersion"] = asked
+            hs.handle({"jsonrpc": "2.0", "id": 9, "method": "initialize",
+                       "params": params})
+        versions = [o["result"]["protocolVersion"] for o in got]
+        check("handshake: it answers only a protocol version it speaks — "
+              "claiming 2026-07-28 could let Codex share one a2a process "
+              "between several threads",
+              versions == ["2025-06-18", "2025-11-25", "2025-06-18",
+                           "2025-06-18"], str(versions))
+        check("handshake: it remembers which Codex started it",
+              hs._codex["version"] == "0.172.0", hs._codex["version"])
+
+        # --- lazy start (Codex 0.172) -----------------------------------------
+        cfg = home / "config.toml"
+        for text, ver, want in (
+                ("", "0.172.0", True), ("", "0.171.3", False), ("", "", None),
+                ("[features]\nmcp_lazy_stdio_startup = false\n", "0.172.0",
+                 False),
+                ('[mcp_servers.a2a]\ncommand = "python3"\n'
+                 "[features]\nmcp_lazy_stdio_startup = true\n", "0.171.0",
+                 True)):
+            cfg.write_text(text)
+            hs._codex["version"] = ver
+            check(f"lazy start: config {text.strip()[-28:]!r} on Codex "
+                  f"{ver or '?'} → {want}", hs.lazy_start() is want,
+                  str(hs.lazy_start()))
+        cfg.unlink()
+
+        # --- the doctor ---------------------------------------------------------
+        doc = daemon_client()
+        doc.api = lambda meth, path, body=None, timeout=30: (
+            {"agent": doc.KEY, "stations": ["acme"], "registered": True}
+            if path == "/me" else {"channels": []} if path == "/channels"
+            else {})
+        doc._codex["version"] = "0.172.0"
+        doc._state["connected"] = True          # a healthy stream
+        doc._state["last_line"] = time.time()
+        rep = json.loads(doc._status({}))
+        check("doctor: it says which server it pushes through, and that "
+              "Codex starts a2a lazily in new chats — with the fix",
+              rep["push"]["host"] == "codex-daemon"
+              and rep["push"]["lazy_start"] is True
+              and "mcp_lazy_stdio_startup" in (rep["next_step"] or ""),
+              json.dumps(rep["push"]) + str(rep["next_step"]))
+        doc._present.clear()
+        rep = json.loads(doc._status({}))
+        ph = next(c for c in rep["checks"] if c["check"] == "push_host")
+        check("doctor: with no Codex TUI open in the project, push_host says "
+              "so, for the user",
+              ph["ok"] is False and ph["who"] == "user"
+              and "no Codex TUI is open" in (ph["do"] or ""), str(ph))
+    finally:
+        os.environ["CODEX_HOME"] = str(codex_home)
 
 
 def main() -> int:
@@ -469,6 +762,13 @@ def main() -> int:
           "TUI is gone — the parent, with SIGTERM, then this client exits",
           killed == [(os.getppid(), signal.SIGTERM)] and exited,
           f"{killed} exited={exited}")
+    killed, exited = reap("/x/codex app-server --listen unix:// "
+                          "--analytics-default-enabled --managed-daemon")
+    check("the reaper NEVER stops Codex's own background server either — "
+          "every Codex session the person has lives there",
+          killed == [] and not exited, f"{killed} exited={exited}")
+
+    daemon_cases(tmp, proj, msg, codex_home)
 
     # --- the orient call, in the two states an agent is actually stuck in ----
     b5.api = lambda meth, path, body=None, timeout=30: (

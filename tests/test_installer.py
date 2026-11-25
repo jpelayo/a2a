@@ -138,9 +138,11 @@ class FakeBroker:
 # A machine: HOME with harness folders, fake harness binaries on PATH
 # ---------------------------------------------------------------------------
 
-def machine(root: Path, gateway_chats=False):
+def machine(root: Path, gateway_chats=False, codex_lazy=False):
     """`gateway_chats`: a Hermes that runs its chats in a gateway, which is
-    how the installer tells: `hermes gateway --help` lists `ensure`."""
+    how the installer tells: `hermes gateway --help` lists `ensure`.
+    `codex_lazy`: a Codex 0.172+, whose `codex features list` shows
+    mcp_lazy_stdio_startup on (an older one has no such row)."""
     home, bin_, cwd = root / "home", root / "bin", root / "cwd"
     for d in (home / ".claude", home / ".config" / "opencode",
               home / ".pi" / "agent", home / ".codex",
@@ -160,16 +162,24 @@ def machine(root: Path, gateway_chats=False):
                      + ('[ "$*" = "gateway --help" ] && echo "  ensure  '
                         'Ensure a local runtime"\n'
                         if gateway_chats and name == "hermes" else "")
+                     + ('[ "$*" = "features list" ] && printf "%s\\n" '
+                        '"mcp_connection_sharing  under development  false" '
+                        '"mcp_lazy_stdio_startup  stable             true"\n'
+                        if codex_lazy and name == "codex" else "")
                      + 'case "$*" in "-p bot1 plugins enable a2a") exit 1;; '
                      'esac\n')
         p.chmod(0o755)
     return home, bin_, cwd, log
 
 
+READ_ONLY = ("hermes gateway --help", "codex features list")
+
+
 def commands(log: Path) -> list:
-    """What was run, without the read-only look at `hermes gateway --help`."""
+    """What was run, without the read-only looks (`hermes gateway --help`,
+    `codex features list`)."""
     ran = log.read_text().splitlines() if log.is_file() else []
-    return [r for r in ran if r != "hermes gateway --help"]
+    return [r for r in ran if r not in READ_ONLY]
 
 
 def snapshot(root: Path) -> dict:
@@ -549,7 +559,7 @@ def main() -> int:
               "node_modules)", (pi / "node_modules" / "keep.txt").is_file())
         check("update: the default bot keeps the id it already had",
               '"agent": "botd"' in (hd / "__init__.py").read_text())
-        ran = log.read_text().splitlines() if log.is_file() else []
+        ran = commands(log)
         check("update: codex mcp add is not offered again once Codex has "
               "the server registered",
               ran and not any(r.startswith("codex") for r in ran),
@@ -606,7 +616,8 @@ def main() -> int:
         code, out = run_installer(installer, home, bin_, cwd, [
             "4", TOKEN, "y", "n"])
         check("declined: the install still finishes", code == 0, out[-800:])
-        check("declined: no command ran", not log.exists(),
+        check("declined: no command ran — only the read-only look at "
+              "`codex features list`", not commands(log),
               log.read_text() if log.exists() else "")
         check("declined: and they are under Needs you, to run by hand",
               "they are under Needs you" in out
@@ -615,6 +626,44 @@ def main() -> int:
         check("declined: with OpenCode not picked, its config is not touched",
               not list((home / ".config" / "opencode").iterdir())
               and "Setting it will change" not in out)
+        check("declined: an older Codex (no mcp_lazy_stdio_startup row in "
+              "`codex features list`) is not asked to disable it — `codex "
+              "features disable` refuses a feature it does not know",
+              "features disable" not in out, out[-800:])
+
+        # --- Codex 0.172: MCP servers start lazily ----------------------------
+        m3 = root / "m3"
+        home, bin_, cwd, log = machine(m3, codex_lazy=True)
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "4", TOKEN, "y", "y"])
+        ran = commands(log)
+        check("lazy: on a Codex that starts MCP servers lazily, the installer "
+              "offers Codex's own command to turn that off, after the "
+              "registration, and runs it on yes",
+              code == 0 and ran == [
+                  f"codex mcp add a2a -- python3 "
+                  f"{home / '.codex' / 'a2a' / 'a2a-codex.py'}",
+                  "codex features disable mcp_lazy_stdio_startup"],
+              "\n".join(ran) + out[-600:])
+        check("lazy: before it is run, it says what it changes, for every "
+              "MCP server",
+              0 <= out.find("as before 0.172") < out.find("Run these"),
+              out[-2500:])
+        check("lazy: the next steps say a plain codex receives, and keep the "
+              "launch line for the sessions that cannot",
+              "a plain `codex` (0.157 or later) receives" in out
+              and "app-server --listen unix://" in out, out[-1500:])
+        (home / ".codex" / "config.toml").write_text(
+            '[mcp_servers.a2a]\ncommand = "python3"\n\n'
+            "[features]\nmcp_lazy_stdio_startup = true\n")
+        log.unlink()
+        code, out = run_installer(installer, home, bin_, cwd, [
+            "4", TOKEN, "y", "y"])
+        ran = log.read_text().splitlines() if log.is_file() else []
+        check("lazy: a value config.toml already sets — even `true` — is left "
+              "alone, and Codex is not even asked",
+              code == 0 and not any("features" in r for r in ran),
+              "\n".join(ran))
 
         # --- Claude Code's a2a switched off ----------------------------------
         # What a real machine had for days: /plugin switched a2a off, its

@@ -218,6 +218,47 @@ def codex_registered():
             is not None
 
 
+CODEX_LAZY = "mcp_lazy_stdio_startup"
+
+
+def codex_lazy_start():
+    """Does this Codex start a2a in a new chat only at its first a2a tool
+    call? True means: offer `codex features disable mcp_lazy_stdio_startup`.
+
+    Codex 0.172 turned that feature on by default: an optional stdio MCP
+    server whose tools Codex has cached is not started for a new chat until
+    one is called, so the chat gets no stream, no catch-up, no brief.
+    `required = true` on the server would exempt it, but a required server
+    that fails to start stops every Codex session, in every project — so it
+    is not used. A value config.toml already sets is left alone; otherwise
+    Codex itself is asked, read-only (`codex features list`), because an
+    older Codex has no such feature and `codex features disable` refuses an
+    unknown one. Its output is read, never shown."""
+    p = HOME / ".codex" / "config.toml"
+    try:
+        text = p.read_text(errors="replace")
+    except OSError:
+        text = ""
+    try:
+        import tomllib
+        if CODEX_LAZY in (tomllib.loads(text).get("features") or {}):
+            return False
+    except Exception:
+        if re.search(r"(?ms)^\[features\][^\[]*?^\s*" + CODEX_LAZY + r"\s*=",
+                     text):
+            return False
+    try:
+        r = subprocess.run(["codex", "features", "list"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True,
+                           errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    m = re.search(r"(?m)^" + CODEX_LAZY + r"\s+.*?\s(true|false)\s*$",
+                  r.stdout or "")
+    return bool(m and m.group(1) == "true")
+
+
 # ---------------------------------------------------------------------------
 # Rows and the checklist keys — pure, so they are testable with no terminal
 # ---------------------------------------------------------------------------
@@ -1222,6 +1263,11 @@ def setup_needed(targets):
             cmds.append((t.label, "register a2a with Codex",
                          ["codex", "mcp", "add", "a2a", "--", "python3",
                           str(t.dest / "a2a-codex.py")]))
+        if t.key == "codex" and codex_lazy_start():
+            cmds.append((t.label, "start a2a with every new chat — Codex "
+                         "0.172 starts MCP servers only at their first tool "
+                         "call; this applies to all of them, as before 0.172",
+                         ["codex", "features", "disable", CODEX_LAZY]))
         if t.key == "hermes":
             enabled, allowed, _ = _hermes_config(t.dest.parent.parent)
             p = ["hermes", "-p", t.profile]
@@ -1438,10 +1484,14 @@ def next_steps(targets, pending, hermes_touched, failed=(), claude=None):
         if key not in keys:
             continue
         if key == "codex" and "codex" in changed:
-            steps.append([("Codex: start each session like this to receive "
-                           "messages:" if "codex" in first else
-                           "Codex: restart running sessions, starting each "
-                           "like this to receive messages:"),
+            steps.append([("Codex: a plain `codex` (0.157 or later) receives "
+                           "messages." if "codex" in first else
+                           "Codex: restart running sessions; a plain "
+                           "`codex` (0.157 or later) receives messages."),
+                          "A session started with --no-daemon, -c, --enable, "
+                          "--disable or --profile, or an older Codex, runs "
+                          "inside Codex and cannot; start one of those like "
+                          "this:",
                           f"   {CODEX_LAUNCH}"])
         elif key in changed and key not in first:
             # OpenCode 2 watches its plugin files and reloads a changed one by

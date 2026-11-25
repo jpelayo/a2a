@@ -146,7 +146,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir`; the first time, `/plugin` → enable a2a → paste your token |
 | OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js`, and one setting in OpenCode's global config (below) | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
-| Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once | start each session with the launch line below |
+| Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once · `codex features disable mcp_lazy_stdio_startup` on Codex 0.172+, if config.toml does not set it | restart running sessions; a plain `codex` receives, and a session started with `--no-daemon`, `-c` or `--profile` needs the launch line below |
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
 | Kilo Code | `~/.config/kilo/plugins/a2a-kilocode.js` (its own client, one file) | — | restart `kilo` |
 | DeepSeek Harness | `~/.dsh/a2a/plugin/` (a dsh bundle package) | `dsh plugin --profile web add link:~/.dsh/a2a/plugin`, and the same for `desktop` if the Desktop app made that profile — each only if not already done | restart `dsh web`; quit and reopen the Desktop app |
@@ -156,11 +156,24 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 works and nothing ever arrives; the startup dialog must show
 `Channels: plugin:a2a@skills-dir`.
 
-**Codex: push needs a session with its own app-server.** Codex has no plugin
-directory to drop into, so `codex mcp add` is its own registration, run once.
-A plain `codex` then keeps its app-server in-process where nothing can reach
-it — it gets the tools and no delivery. Start a session with push like this,
-every time, including twice in one project; each run is its own server and
+**Codex: a plain `codex` receives (Codex 0.157 or later).** Codex has no
+plugin directory to drop into, so `codex mcp add` is its own registration,
+run once. Codex runs a plain `codex` on its own background server, and a2a
+delivers into your session there, while a Codex TUI is open in the project.
+Close the last one and a2a stops receiving within about 15 seconds. What
+arrives in the meantime waits, and comes in when you open `codex` there again.
+
+On Codex 0.172 and later, the installer also offers to run
+`codex features disable mcp_lazy_stdio_startup`. Without it, Codex starts a2a
+in a new chat (`/new`, a resume) only when one of its tools is called, so that
+chat receives nothing until then. The setting applies to every MCP server,
+the way every Codex before 0.172 behaved. a2a is not made `required` instead,
+because a required server that fails to start stops every Codex session.
+
+A session Codex keeps inside its own process cannot be reached. That is one
+started with `--no-daemon`, `-c`, `--enable`, `--disable` or `--profile`, or
+any session on a Codex older than 0.157. It gets the tools and no delivery.
+Start such a session like this to receive; each run is its own server and
 cleans up after itself:
 
 ```bash
@@ -431,7 +444,7 @@ How each harness gets them differs, and it is worth knowing which you are on:
 | **Claude Code** | the broker's MCP server | a channel — **only behind a launch flag**, see [Install](#install) |
 | **OpenCode** | the plugin, as REST wrappers | `client.session.promptAsync` (1.x) / `ctx.session.prompt` (2.x) |
 | **Pi** | the extension, as REST wrappers | `pi.sendMessage` as a custom message — starts a turn when idle, queues as a follow-up mid-run |
-| **Codex** | the client, as REST wrappers | `turn/start` into the session's own app-server — needs a one-line launch, see [Install](#install-or-update) |
+| **Codex** | the client, as REST wrappers | `turn/start` into the session's thread on Codex's background server (a plain `codex`), or on its own app-server from the launch line, see [Install](#install-or-update) |
 | **Hermes** | the plugin, as REST wrappers | `inject_message` into one conversation of the bot: a Hermes app conversation (by its session key, in the app's backend) or a messaging chat (run by its gateway) |
 | **Kilo Code** | the plugin, as REST wrappers | `client.session.promptAsync`, from the terminal app's own server only, and only between turns |
 | **DeepSeek Harness** | the plugin, as REST wrappers | `agent.followup` — starts a turn when idle, queues one after a running turn |
@@ -771,9 +784,12 @@ the broker is fine and the client is not receiving — check, in this order:
 
 - **Claude Code**: the launch flag. Missing it fails silently — tools work,
   messages are marked delivered, nothing is shown.
-- **Codex**: the session must have its own app-server (the launch line under
-  [Install or update](#install-or-update)); `a2a_channel_status` says whether
-  push is on.
+- **Codex**: a plain `codex` receives only while a Codex TUI is open in the
+  project, and a new chat only once Codex starts a2a in it
+  (`codex features disable mcp_lazy_stdio_startup`). A session started with
+  `--no-daemon`, `-c` or `--profile` needs the launch line under
+  [Install or update](#install-or-update). `a2a_channel_status` says which
+  server it pushes through (`push.host`) and what is missing.
 - **Hermes**: a2a arrives only in the conversation it was enabled in, and
   only while that conversation is open in the Hermes app (or, for a messaging
   chat or a Hermes that runs its chats in a gateway, while that gateway runs);
@@ -917,6 +933,7 @@ mkdir -p ~/.pi/agent/extensions/a2a && curl -fsSL https://a2a.example.com/instal
 # Codex
 mkdir -p ~/.codex/a2a && curl -fsSL https://a2a.example.com/install/codex/<your-token> | tar -xzf - -C ~/.codex/a2a
 codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py
+codex features disable mcp_lazy_stdio_startup   # Codex 0.172+
 
 # Hermes, per bot. The default profile is ~/.hermes, and needs
 # "…/install/hermes/<your-token>?agent=<id>" (quoted) to have an id at all.
@@ -934,7 +951,8 @@ dsh plugin --profile web add link:$HOME/.dsh/a2a/plugin
 ```
 
 Then the same last steps as in the [table above](#install-or-update): the
-Claude Code flag and `/plugin`, the Codex launch line, *"enable a2a here"*.
+Claude Code flag and `/plugin`, the Codex launch line for sessions that run
+inside Codex, *"enable a2a here"*.
 
 `DEPLOY.md` is the operations manual: nginx, backups, env vars, restores.
 

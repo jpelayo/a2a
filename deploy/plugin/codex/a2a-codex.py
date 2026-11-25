@@ -19,10 +19,21 @@ Two halves, both here, both dependency-free:
           message into THIS session as a user turn, so the agent answers while
           idle with no human turn.
 
-PUSH NEEDS A REACHABLE SESSION, and a plain `codex` is not one: it runs its
-app-server inside its own process, with no socket, so nothing can deliver into
-it. ONE LINE gives a session its own server, its own socket and push — no
-script, no wrapper, nothing but codex:
+PUSH NEEDS A REACHABLE SESSION. Two kinds are:
+
+  Codex's own background server. Since Codex 0.157 a plain `codex` runs its
+  sessions on a shared server Codex starts and manages itself
+  (`codex app-server --listen unix:// --managed-daemon`, on the control
+  socket). This client may push into ITS OWN thread there — never anyone
+  else's — and never stops that server (see daemon_parent). Because that
+  server outlives the terminal, the stream is held only while a Codex TUI is
+  open in this project (see presence_watch).
+
+  A server of its own, from the launch line below. A session Codex keeps
+  in-process — `--no-daemon`, `-c`, `--enable`, `--disable`, `--profile` —
+  has no socket and nothing can deliver into it. ONE LINE gives such a
+  session its own server, its own socket and push — no script, no wrapper,
+  nothing but codex:
 
     codex app-server --listen unix://$TMPDIR/a2a-$$.sock & sleep 1; \
         codex --remote unix://$TMPDIR/a2a-$$.sock
@@ -55,11 +66,14 @@ read, one key per client. Off, the tools are listed and do nothing until
 called: no brief, no stream, no turn injected. enable_a2a_here flips it in
 place, with no restart.
 
-As a second guard it still identifies the thread by cwd — the app-server spawns
-it with cwd = the thread's project directory — and injects only when EXACTLY
-ONE live thread matches. And it never claims the broker stream while it cannot
-render, because delivery is a destructive read: an undeliverable message must
-wait on the broker, not vanish into a session that cannot show it.
+As a second guard it identifies the thread: exactly, once Codex has named it
+(every tool call carries `_meta["x-codex-turn-metadata"].thread_id`), and by
+cwd until then — the app-server spawns it with cwd = the thread's project
+directory — injecting only when EXACTLY ONE live thread matches. A process
+that belongs to a subagent's thread never pushes. And it never claims the
+broker stream while it cannot render, because delivery is a destructive read:
+an undeliverable message must wait on the broker, not vanish into a session
+that cannot show it.
 
 AGENT ID: A2A_AGENT if set, else the id baked at install, else whatever this
 client last recorded for the project in ~/.codex/a2a-identity.json, else the
@@ -133,15 +147,43 @@ def _parent_argv() -> str:
 LAUNCH_SOCKET = re.compile(r"^a2a-[^/]*\.sock$")
 
 
-def parent_socket() -> str:
+# Codex's well-known control socket: where `--listen unix://` with no path
+# binds, and where Codex's own background server listens.
+CONTROL_SOCKET = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+
+
+def parent_socket(argv=None) -> str:
     """The socket our parent app-server listens on, read from its argv, or
     "" when it has none. Says nothing about whether the server is ours."""
-    m = re.search(r"--listen[= ]+unix://(\S*)", _parent_argv())
+    m = re.search(r"--listen[= ]+unix://(\S*)",
+                  _parent_argv() if argv is None else argv)
     if not m:
         return ""
-    # `--listen unix://` with no path binds Codex's well-known control socket.
-    return m.group(1) or str(CODEX_HOME / "app-server-control"
-                             / "app-server-control.sock")
+    return m.group(1) or str(CONTROL_SOCKET)
+
+
+def daemon_parent(argv=None) -> bool:
+    """Is our parent Codex's own managed background server?
+
+    Since Codex 0.157 a plain `codex` runs on it by default. Codex starts it
+    as `codex app-server --listen unix:// … --managed-daemon`, on the control
+    socket, and it serves every session attached to it. This client may push
+    into its OWN thread there (session_thread names it) and must never stop
+    it: reaper() still acts only on a server the launch line started.
+    """
+    argv = _parent_argv() if argv is None else argv
+    words = argv.split()
+    return ("app-server" in words and "--managed-daemon" in words
+            and parent_socket(argv) == str(CONTROL_SOCKET))
+
+
+def host_kind(argv=None) -> str:
+    """'launch-line', 'codex-daemon' or '' — what kind of server spawned
+    this client, which decides how push behaves (presence, reaping)."""
+    argv = _parent_argv() if argv is None else argv
+    if daemon_parent(argv):
+        return "codex-daemon"
+    return "launch-line" if ours(parent_socket(argv)) else ""
 
 
 def ours(path: str) -> bool:
@@ -165,18 +207,22 @@ def control_socket() -> str:
     from here, and a plain `codex` — whose app-server is in-process and has no
     --listen at all — finds nothing and simply runs without push.
 
-    Deliberately NOT the well-known control socket, not even when it is our
-    own parent's: that server is shared — whatever started it put other
-    sessions on it — so injecting there could land in somebody else's window.
-    Only a server the launch line started (see ours) is reachable.
+    Two servers qualify: one the launch line started (see ours), and Codex's
+    own managed background server when it is our parent (see daemon_parent).
+    Anything else listening on the control socket — a server somebody started
+    by hand with `--listen unix://` — is not reachable: it is shared, by
+    whatever put sessions on it, and nothing says which of them is this one.
+    On the managed server the thread is still chosen by evidence (see
+    session_thread), never by position.
 
     Re-evaluated per reconnect rather than cached: the server is an ordinary
     foreground process and may outlive or predecease this one.
     """
     if _SOCK_ENV is not None:
         return _SOCK_ENV
-    path = parent_socket()
-    if not ours(path):
+    argv = _parent_argv()
+    path = parent_socket(argv)
+    if not (ours(path) or daemon_parent(argv)):
         return ""
     return path if os.path.exists(path) else ""
 STORE = CODEX_HOME / "a2a-identity.json"
@@ -692,8 +738,16 @@ class AppServer:
         if self.sock is not None:
             return
         self._connect()
+        # The name is one the app-server treats as NOT originating: any
+        # other name rewrites that server's process-wide client identity —
+        # the originator (first client wins, for the server's life) and the
+        # user-agent suffix of every model request of EVERY session on it
+        # (app-server initialize_processor.rs NON_ORIGINATING_CLIENT_NAMES).
+        # On Codex's shared background server that would be every session
+        # the person has; on a launch-line server, the session itself.
         self.call("initialize", {"clientInfo": {
-            "name": "a2a", "title": "a2a channel", "version": "0.1.0"}})
+            "name": APP_SERVER_CLIENT_NAME, "title": "a2a channel",
+            "version": CLIENT_VERSION or "0"}})
         self._send_frame({"method": "initialized", "params": {}})
         log(f"app-server connected on {self.path}")
 
@@ -711,19 +765,38 @@ class AppServer:
     def session_thread(self):
         """The id of THIS session's thread, or None while it cannot be known.
 
-        The control socket is shared by whatever sessions attach to that
-        server, so the thread is picked by evidence, not position: the
-        app-server spawns this client with cwd = the thread's project
-        directory (verified), and thread/read reports each thread's cwd. The
-        rule is EXACTLY ONE match — zero means our session has not opened its
-        thread yet (retried later), and more than one means two live sessions
-        share a directory, where any choice could inject into the wrong
-        window, so none is made. Refusing is recoverable: the message stays
-        pending on the broker. Mis-delivering is not.
+        A server may carry many sessions — Codex's background server carries
+        all of them — so the thread is picked by evidence, not position.
+
+        Exactly, once Codex has said: every tool call carries the calling
+        thread in `_meta["x-codex-turn-metadata"].thread_id` (pinned by
+        handle()). Codex starts one MCP process per thread, so that is this
+        process's thread. If it is a subagent's, this process is the
+        subagent's a2a server and never pushes: the session it serves is the
+        parent's, which has its own.
+
+        Until then, by cwd: the app-server spawns this client with cwd = the
+        thread's project directory (verified), and thread/read reports each
+        thread's cwd. The rule is EXACTLY ONE match among every loaded thread
+        — zero means our session has not opened its thread yet (retried
+        later), and more than one means two live threads share a directory
+        (two sessions, or a session and its subagent), where any choice could
+        inject into the wrong window, so none is made. Refusing is
+        recoverable: the message stays pending on the broker. Mis-delivering
+        is not.
         """
         if self.thread_id:
             return self.thread_id
         self.open()
+        pinned = _pinned["thread"]
+        if pinned:
+            rd = self.call("thread/read", {"threadId": pinned})
+            if _subagent_thread(rd.get("thread") or {}):
+                _pinned["subagent"] = True
+                raise WSError("this a2a server belongs to a subagent's thread: "
+                              "only its parent session receives")
+            self.thread_id = pinned
+            return pinned
         rows = self.call("thread/loaded/list", {}).get("data") or []
         # The payload is a list of id STRINGS, not objects.
         ids = [r if isinstance(r, str) else (r.get("id") or r.get("threadId"))
@@ -773,6 +846,156 @@ _server_lock = threading.Lock()
 # _enabled: that is the human's switch, and toggling it would re-run
 # catch_up(), which injects a turn.
 _reconnect = threading.Event()
+
+# The thread Codex named in a tool call's _meta (see handle()), and whether it
+# turned out to be a subagent's. Once named, it replaces the cwd guess.
+_pinned = {"thread": None, "subagent": False}
+_pin_lock = threading.Lock()
+# How this client introduces itself to an app-server: see AppServer.open.
+APP_SERVER_CLIENT_NAME = "codex_app_server_daemon"
+
+
+def _subagent_thread(t) -> bool:
+    """Is this thread (a thread/read `thread`) a subagent's, not a person's?
+    Its own record says so: a parent thread, a subagent source, or a thread
+    source other than the user."""
+    if not isinstance(t, dict):
+        return False
+    src = t.get("source")
+    return bool(t.get("parentThreadId")
+                or (isinstance(src, dict) and "subAgent" in src)
+                or t.get("threadSource") not in (None, "user"))
+
+
+def pin_thread(tid):
+    """Codex named the calling thread: from now on that is the thread, and a
+    different earlier guess is dropped (the next delivery re-resolves)."""
+    if not isinstance(tid, str) or not tid:
+        return
+    with _pin_lock:
+        if _pinned["thread"] == tid:
+            return
+        was = _pinned["thread"]
+        _pinned["thread"] = tid
+        _pinned["subagent"] = False
+    srv = _server
+    if srv is not None and srv.thread_id and srv.thread_id != tid:
+        log(f"Codex names this session's thread {tid}; the directory guess "
+            f"was {srv.thread_id}, now dropped")
+        srv.thread_id = None
+    elif was is None:
+        log(f"Codex names this session's thread: {tid}")
+
+
+# --- is anybody there? (Codex's background server only) ---------------------
+# A launch-line server lives as long as its TUI: the reaper stops it once the
+# TUI is gone. Codex's background server outlives every TUI, and keeps a
+# thread loaded for a while after its last client leaves (60 s by default,
+# longer while turns run — and a delivered message IS a turn), so on it this
+# client holds the stream only while a Codex TUI is open in this project.
+# Codex offers no way to ask whether a client is attached to a thread, so the
+# evidence is the same kind the reaper uses: the processes. Gone for
+# PRESENCE_MISSES checks in a row → the stream is released (nothing killed,
+# nothing consumed); back → it reconnects, and the broker's replay hands over
+# whatever waited.
+PRESENCE_EVERY_S = 5.0
+PRESENCE_MISSES = 3
+# Set everywhere but on Codex's background server, where main() clears it
+# before any thread starts and presence_watch sets it once a TUI is seen.
+_present = threading.Event()
+_present.set()
+# Codex subcommands that are not an interactive session. Only the first
+# non-flag word is looked at: a prompt may contain any of these words.
+_NOT_TUI = {"app-server", "exec", "e", "mcp", "mcp-server", "queue",
+            "features", "login", "logout", "apply", "a", "sandbox", "debug",
+            "doctor", "completion", "cloud", "archive", "delete", "unarchive",
+            "remote-control", "update", "plugin", "marketplace",
+            "exec-server", "responses-api-proxy", "stdio-to-uds", "review"}
+
+
+def _codex_tuis(ps_out):
+    """Pids of the interactive Codex sessions in `ps -axo pid=,args=` output:
+    `codex …` (or node running its npm shim) whose first non-flag word is not
+    a non-interactive subcommand."""
+    pids = []
+    for line in ps_out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        words = parts[1].split()
+        i = 0
+        if os.path.basename(words[0]) in ("node", "nodejs", "bun") \
+                and len(words) > 1:
+            i = 1
+        if os.path.basename(words[i]) not in ("codex", "codex.js"):
+            continue
+        first = next((w for w in words[i + 1:] if not w.startswith("-")), "")
+        if first in _NOT_TUI:
+            continue
+        pids.append(int(parts[0]))
+    return pids
+
+
+def _cwd_of(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")       # Linux
+    except OSError:
+        pass
+    try:                                              # macOS
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd",
+                              "-Fn"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return ""
+    return next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), "")
+
+
+def tui_here():
+    """Is a Codex TUI open in this project? None when it cannot be told."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return None
+    me = os.path.realpath(os.getcwd())
+    for pid in _codex_tuis(out):
+        cwd = _cwd_of(pid)
+        if cwd and os.path.realpath(cwd) == me:
+            return True
+    return False
+
+
+def presence_watch():
+    """Keep _present: set while a Codex TUI is open in this project. Only on
+    Codex's background server; anywhere else it is simply set. When the
+    processes cannot be read it is left set — the same choice the reaper
+    makes: pushing is the normal state, and a broken diagnostic must not
+    stop it."""
+    if host_kind() != "codex-daemon":
+        _present.set()
+        return
+    misses, said = PRESENCE_MISSES, False
+    while True:
+        here = tui_here()
+        if here is None:
+            if not said:
+                log("cannot read the process list; assuming a Codex TUI is "
+                    "open in this project")
+                said = True
+            here = True
+        if here:
+            misses = 0
+            if not _present.is_set():
+                log("a Codex TUI is open in this project; receiving")
+                _present.set()
+        else:
+            misses += 1
+            if misses >= PRESENCE_MISSES and _present.is_set():
+                log("no Codex TUI open in this project for "
+                    f"{int(PRESENCE_EVERY_S * PRESENCE_MISSES)}s — releasing "
+                    "the stream; messages wait on the broker")
+                _present.clear()
+        time.sleep(PRESENCE_EVERY_S)
 
 
 def get_server():
@@ -905,6 +1128,8 @@ def _injectable():
     socket exists AND exactly one live thread is ours. Checked BEFORE the
     stream is claimed, because delivery on the broker is a destructive read —
     a session that cannot render must not consume its agent's inbox."""
+    if not _present.is_set() or _pinned["subagent"]:
+        return False
     srv = get_server()
     if srv is None:
         return False
@@ -932,12 +1157,32 @@ def pump():
         if not _enabled.is_set():
             return
         if not said_off:
-            log("push is off: this session has no app-server socket. Give "
-                f"it one with: {LAUNCH_LINE} . Tools work either way.")
+            log("push is off: " + (
+                "no Codex TUI is open in this project" if not
+                _present.is_set() else
+                "this a2a server belongs to a subagent's thread"
+                if _pinned["subagent"] else
+                "this session has no app-server socket. A plain `codex` "
+                "receives on Codex's background server; a session started "
+                "with --no-daemon, -c, --enable, --disable or --profile "
+                f"needs: {LAUNCH_LINE} .") + " Tools work either way.")
             said_off = True
         time.sleep(10)
     catch_up()
+    said_away = False
     while _enabled.is_set():
+        # Codex's background server: hold the stream only while a Codex TUI
+        # is open here. Closed, nothing is read, so nothing is consumed.
+        if not _present.is_set() or _pinned["subagent"]:
+            _state["connected"] = False
+            if not said_away:
+                log("not receiving: " + ("no Codex TUI open in this project"
+                                         if not _present.is_set() else
+                                         "a subagent's a2a server"))
+                said_away = True
+            time.sleep(1)
+            continue
+        said_away = False
         # Built per connection from the CURRENT key: rename_me changes it, and
         # a url hoisted out of the loop would keep streaming as the old agent.
         stream_key = KEY
@@ -971,6 +1216,11 @@ def pump():
                         break
                     if KEY != stream_key:
                         log("agent id changed; reconnecting")
+                        break
+                    if not _present.is_set() or _pinned["subagent"]:
+                        # Left unacked on the broker, like a line read
+                        # after the project was turned off.
+                        log("releasing the stream")
                         break
                     if _reconnect.is_set():
                         _reconnect.clear()
@@ -1410,6 +1660,44 @@ DOCTOR_CHECKS = ("install", "identity", "settings", "switch", "broker",
                  "client", "registered", "push_host", "stream", "version")
 
 
+LAZY_FIX = ("codex features disable mcp_lazy_stdio_startup, then restart "
+            "Codex (the installer offers to run it)")
+# What Codex said it is in MCP initialize (clientInfo.version).
+_codex = {"version": ""}
+
+
+def _vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def lazy_start():
+    """Does Codex start this server only at a chat's first a2a tool call?
+
+    Codex 0.172 turned `mcp_lazy_stdio_startup` on by default: an optional
+    stdio server whose tools it has cached is not started for a new chat
+    until one of them is called — so a new chat (`/new`, a resume, every
+    chat on Codex's background server) gets no stream, no catch-up and no
+    brief. config.toml's `[features]` decides when it names the key;
+    otherwise the Codex version that initialized this server does (on from
+    0.172). None when neither says."""
+    try:
+        text = (CODEX_HOME / "config.toml").read_text(errors="replace")
+    except OSError:
+        text = ""
+    try:
+        import tomllib
+        feats = tomllib.loads(text).get("features") or {}
+        if isinstance(feats.get("mcp_lazy_stdio_startup"), bool):
+            return feats["mcp_lazy_stdio_startup"]
+    except Exception:
+        m = re.search(r"(?ms)^\[features\][^\[]*?^\s*mcp_lazy_stdio_startup"
+                      r"\s*=\s*(true|false)", text)
+        if m:
+            return m.group(1) == "true"
+    v = _vtuple(_codex["version"])
+    return (v >= (0, 172, 0)) if v else None
+
+
 def _check(check, ok, who=None, do=None, detail=None):
     return {"check": check, "ok": ok,
             "who": who if ok is False else None,
@@ -1517,15 +1805,36 @@ def _checks(me, registered, thread, thread_err, quiet, stale):
                             "— no restart needed"))
         else:
             c.append(_check("registered", True))
+    kind = host_kind()
     if not on:
         c.append(_check("push_host", None, detail="skipped: a2a is off"))
+    elif _pinned["subagent"]:
+        c.append(_check("push_host", None,
+                        detail="this a2a server belongs to a subagent's "
+                               "thread; its parent session receives"))
+    elif kind == "codex-daemon" and not _present.is_set():
+        c.append(_check("push_host", False, "user",
+                        "nothing arrives while no Codex TUI is open in this "
+                        f"project ({os.getcwd()}): open `codex` here and it "
+                        "receives on its own, with what waited meanwhile"))
     elif not thread:
         c.append(_check("push_host", False, "user",
                         "push is off, so nothing will arrive on its own. "
-                        f"Start Codex with its own app-server: {LAUNCH_LINE}"
+                        + ("This session runs inside Codex itself (started "
+                           "with --no-daemon, -c, --enable, --disable or "
+                           "--profile, or a Codex older than 0.157). Start "
+                           "a plain `codex`, or give it its own app-server: "
+                           if not get_server() else
+                           "Close the other Codex session in this directory, "
+                           "or start this one with its own app-server: ")
+                        + LAUNCH_LINE
                         + (f" (note: {thread_err})" if thread_err else "")))
     else:
-        c.append(_check("push_host", True, detail=thread))
+        c.append(_check("push_host", True,
+                        detail=f"{thread} on "
+                               + ("Codex's background server"
+                                  if kind == "codex-daemon"
+                                  else "its own app-server")))
     if c[-1]["ok"] is not True:
         c.append(_check("stream", None,
                         detail="skipped: this session cannot be pushed into"))
@@ -1606,6 +1915,12 @@ def _status(a):
             "one, and it is not this session's): close the other Codex "
             "session using this agent, or give one of them its own name"))
     step = next((c["do"] for c in checks if c["ok"] is False), None)
+    lazy = lazy_start()
+    if step is None and lazy and _enabled.is_set():
+        # This session receives; the NEXT chat would not.
+        step = ("this chat receives, but Codex starts a2a in a new chat only "
+                f"once an a2a tool is called there. Tell the user to run: "
+                f"{LAZY_FIX}")
 
     return json.dumps({
         "agent": NAME,
@@ -1623,7 +1938,13 @@ def _status(a):
             "last_delivery": _state["last"] or None,
             "last_error": _state["error"] or None,
             "app_server_socket": sock or None,
+            "host": host_kind() or None,
+            "tui_open": (_present.is_set()
+                         if host_kind() == "codex-daemon" else None),
             "session_thread": thread,
+            "thread_named_by_codex": bool(_pinned["thread"]),
+            "lazy_start": lazy,
+            "codex_version": _codex["version"] or None,
         },
         # Local only, and deliberately: /pending MARKS MESSAGES READ, so a
         # status call that counted the inbox would consume it. Use my_pending
@@ -1849,6 +2170,8 @@ TOOL_BY_NAME = {t[0]: t for t in TOOLS}
 # the pump legitimate: it is not a daemon anybody has to manage.
 
 _out_lock = threading.Lock()
+# The MCP protocol versions this server implements; initialize answers one.
+MCP_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 
 
 def send(obj):
@@ -1874,9 +2197,18 @@ def handle(msg):
     mid = msg.get("id")
     method = msg.get("method")
     if method == "initialize":
+        asked = (msg.get("params") or {}).get("protocolVersion")
+        info = (msg.get("params") or {}).get("clientInfo") or {}
+        if isinstance(info, dict) and isinstance(info.get("version"), str):
+            _codex["version"] = info["version"]
         result = {
-            "protocolVersion": (msg.get("params") or {}).get(
-                "protocolVersion", "2025-06-18"),
+            # Only a version this server implements. Echoing any other would
+            # claim a protocol it does not speak — and under MCP 2026-07-28
+            # Codex may share ONE server process between several threads
+            # (codex-mcp connection_pool.rs), which would break the rule
+            # that this process serves exactly one session.
+            "protocolVersion": asked if asked in MCP_VERSIONS
+            else "2025-06-18",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "a2a", "version": CLIENT_VERSION or "0"},
         }
@@ -1896,6 +2228,12 @@ def handle(msg):
         send({"jsonrpc": "2.0", "id": mid, "result": {"tools": tool_list()}})
     elif method == "tools/call":
         params = msg.get("params") or {}
+        # Codex names the calling thread on every tool call; that is this
+        # process's thread (one MCP process per thread), exactly.
+        turn = (params.get("_meta") or {}).get("x-codex-turn-metadata") \
+            if isinstance(params.get("_meta"), dict) else None
+        if isinstance(turn, dict):
+            pin_thread(turn.get("thread_id"))
         name = params.get("name")
         args = params.get("arguments") or {}
         spec = TOOL_BY_NAME.get(name)
@@ -1928,16 +2266,24 @@ def main():
             "installer (curl -fsSL <broker>/install | python3), or set "
             "A2A_URL and A2A_TOKEN.\n")
         return 1
-    psock = parent_socket()
+    argv = _parent_argv()
+    psock, kind = parent_socket(argv), host_kind(argv)
     log(f"starting as {KEY} (explicit={EXPLICIT}) "
-        f"socket={control_socket() or None}"
-        + (f" — parent listens on {psock}, which the a2a launch line did "
-           f"not start: no push into it, and it is never reaped"
-           if psock and not ours(psock) else ""))
+        f"socket={control_socket() or None} host={kind or None}"
+        + (" — Codex's background server: push into this session's thread "
+           "only, while a Codex TUI is open here; it is never reaped"
+           if kind == "codex-daemon" else
+           f" — parent listens on {psock}, which neither the a2a launch line "
+           f"nor Codex's background server started: no push into it, and it "
+           f"is never reaped" if psock and not kind else ""))
     if not _enabled.is_set():
         log(f"a2a is off in {os.getcwd()}: {PROJECT_FILE} does not say "
             f'{{"{ENABLE_KEY}": true}}. The tools are listed; nothing is '
             f"streamed or injected.")
+    if kind == "codex-daemon":
+        _present.clear()            # until presence_watch sees a TUI here
+    threading.Thread(target=presence_watch, name="a2a-presence",
+                     daemon=True).start()
     threading.Thread(target=pump_guard, name="a2a-pump", daemon=True).start()
     threading.Thread(target=reaper, name="a2a-reaper", daemon=True).start()
     for raw in sys.stdin:
