@@ -146,7 +146,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 | Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir`; the first time, `/plugin` → enable a2a → paste your token |
 | OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js`, and one setting in OpenCode's global config (below) | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
-| Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once · `codex features disable mcp_lazy_stdio_startup` on Codex 0.172+, if config.toml does not set it | restart running sessions; a plain `codex` receives, and a session started with `--no-daemon`, `-c` or `--profile` needs the launch line below |
+| Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once · `codex features disable mcp_lazy_stdio_startup` on Codex 0.172+, if config.toml does not set it | restart running sessions, then open `codex` as always |
 | Hermes | `plugins/a2a/` in each bot's profile | `hermes -p <bot> plugins enable a2a` · `hermes -p <bot> config set plugins.entries.a2a.allow_gateway_injection true` — each only if not already done | quit the Hermes app and open it again; then, in the app conversation with the bot that should carry a2a, say *"enable a2a here"* |
 | Kilo Code | `~/.config/kilo/plugins/a2a-kilocode.js` (its own client, one file) | — | restart `kilo` |
 | DeepSeek Harness | `~/.dsh/a2a/plugin/` (a dsh bundle package) | `dsh plugin --profile web add link:~/.dsh/a2a/plugin`, and the same for `desktop` if the Desktop app made that profile — each only if not already done | restart `dsh web`; quit and reopen the Desktop app |
@@ -951,8 +951,8 @@ dsh plugin --profile web add link:$HOME/.dsh/a2a/plugin
 ```
 
 Then the same last steps as in the [table above](#install-or-update): the
-Claude Code flag and `/plugin`, the Codex launch line for sessions that run
-inside Codex, *"enable a2a here"*.
+Claude Code flag and `/plugin`, restarting open Codex sessions, *"enable a2a
+here"*.
 
 `DEPLOY.md` is the operations manual: nginx, backups, env vars, restores.
 
