@@ -67,8 +67,6 @@ HERMES_IDENTITY = ("config.yaml", ".env", "SOUL.md", "profile.yaml",
 GENERIC_PROFILES = {"default", "custom", ""}
 AGENT_ID = re.compile(r"^[^\s/]{1,128}$")
 
-CODEX_LAUNCH = ("codex app-server --listen unix://$TMPDIR/a2a-$$.sock "
-                "& sleep 1; codex --remote unix://$TMPDIR/a2a-$$.sock")
 CLAUDE_LAUNCH = ("claude --dangerously-load-development-channels "
                  "plugin:a2a@skills-dir")
 
@@ -1484,15 +1482,15 @@ def next_steps(targets, pending, hermes_touched, failed=(), claude=None):
         if key not in keys:
             continue
         if key == "codex" and "codex" in changed:
-            steps.append([("Codex: a plain `codex` (0.157 or later) receives "
-                           "messages." if "codex" in first else
-                           "Codex: restart running sessions; a plain "
-                           "`codex` (0.157 or later) receives messages."),
-                          "A session started with --no-daemon, -c, --enable, "
-                          "--disable or --profile, or an older Codex, runs "
-                          "inside Codex and cannot; start one of those like "
-                          "this:",
-                          f"   {CODEX_LAUNCH}"])
+            # Only what this person does: open `codex` as always. The rare
+            # sessions that cannot receive (--no-daemon, -c, --profile, a
+            # Codex before 0.157) are in the README and in the doctor's
+            # push_host text, never on this screen: shown here, the old
+            # launch line read as still needed.
+            steps.append(["Codex: open it as always, with `codex`."
+                          if "codex" in first else
+                          "Codex: close the Codex sessions you have open and "
+                          "open them again, with `codex` as always."])
         elif key in changed and key not in first:
             # OpenCode 2 watches its plugin files and reloads a changed one by
             # itself; 1.x loads them once per process, so it needs a restart.
