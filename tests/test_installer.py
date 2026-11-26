@@ -435,7 +435,8 @@ def main() -> int:
               "setting changed", "orphan_end_grace_s" not in out, out[-1500:])
         check("fresh: the next steps name what no installer can do",
               "plugin:a2a@skills-dir" in steps and "enable a2a here" in steps
-              and "app-server --listen unix://" in steps, steps[:1500])
+              and "Codex: open it as always, with `codex`." in steps
+              and "app-server --listen" not in steps, steps[:1500])
         occ = home / ".config" / "opencode" / "opencode.jsonc"
         check("fresh: OpenCode's global config gets its one setting, in a new "
               "opencode.jsonc — the file OpenCode itself writes when there is "
@@ -518,7 +519,8 @@ def main() -> int:
         check("update: Codex is brought to the broker's version",
               f'"version": "{b.VERSION}"' in cx.read_text())
         check("update: a client that was behind is told to restart",
-              "Codex: restart running sessions" in out, out[-1500:])
+              "Codex: close the Codex sessions you have open and open them "
+              "again" in out, out[-1500:])
         check("update: a client whose files are byte-identical is 'already "
               "current' and not told to restart — nothing changed",
               "Claude Code: restart" not in out
@@ -649,10 +651,11 @@ def main() -> int:
               "MCP server",
               0 <= out.find("as before 0.172") < out.find("Run these"),
               out[-2500:])
-        check("lazy: the next steps say a plain codex receives, and keep the "
-              "launch line for the sessions that cannot",
-              "a plain `codex` (0.157 or later) receives" in out
-              and "app-server --listen unix://" in out, out[-1500:])
+        check("the next steps say to open `codex` as always, and show no "
+              "launch line",
+              "Codex: open it as always, with `codex`." in out
+              and "app-server --listen" not in out
+              and "--remote" not in out, out[-1500:])
         (home / ".codex" / "config.toml").write_text(
             '[mcp_servers.a2a]\ncommand = "python3"\n\n'
             "[features]\nmcp_lazy_stdio_startup = true\n")
