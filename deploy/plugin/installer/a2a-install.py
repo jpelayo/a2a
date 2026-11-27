@@ -69,6 +69,8 @@ AGENT_ID = re.compile(r"^[^\s/]{1,128}$")
 
 CLAUDE_LAUNCH = ("claude --dangerously-load-development-channels "
                  "plugin:a2a@skills-dir")
+# Once managed settings allowlist a2a (claude_allowed), the plain flag.
+CLAUDE_CHANNELS = "claude --channels plugin:a2a@skills-dir"
 
 
 # ---------------------------------------------------------------------------
@@ -1221,9 +1223,39 @@ def claude_state():
     return None if has_token else "no_token"
 
 
+def claude_allowed():
+    """Whether Claude Code's managed settings put a2a on the channel
+    allowlist (`allowedChannelPlugins` holding {marketplace: skills-dir,
+    plugin: a2a}), so a plain `--channels` loads it with no development flag.
+
+    Read only, like claude_state(). Claude Code reads that key ONLY from a
+    managed source (user and project settings are ignored), so only those
+    files are looked at. A personal account honours it: measured 2026-11-27.
+    The installer never creates or edits that file — it needs admin rights
+    and is the person's choice; the README says how."""
+    for path in CLAUDE_MANAGED:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        allowed = data.get("allowedChannelPlugins") if isinstance(
+            data, dict) else None
+        if isinstance(allowed, list) and any(
+                isinstance(e, dict) and e.get("plugin") == "a2a"
+                and e.get("marketplace") == "skills-dir" for e in allowed):
+            return True
+    return False
+
+
+def claude_launch():
+    """The line that starts Claude Code with a2a's channel."""
+    return CLAUDE_CHANNELS if claude_allowed() else CLAUDE_LAUNCH
+
+
 def claude_advice(state, first):
     """The lines that tell what to do about claude_state(), or []."""
     a = G.arrow
+    launch = claude_launch()
     if state in ("off", "off_no_token"):
         gone = state == "off_no_token"
         return [("Claude Code: a2a is switched OFF"
@@ -1232,16 +1264,16 @@ def claude_advice(state, first):
                 f"In Claude Code: /plugin {a} a2a {a} Enable"
                 + (f" {a} paste your token" if gone else "")
                 + ". Then start your sessions with:",
-                f"   {CLAUDE_LAUNCH}"]
+                f"   {launch}"]
     if state == "no_token" and first:
         return ["Claude Code: start it with",
-                f"   {CLAUDE_LAUNCH}",
+                f"   {launch}",
                 f"then type /plugin {a} enable a2a {a} paste your token."]
     if state == "no_token":
         return ["Claude Code: a2a has no token.",
                 f"In Claude Code: /plugin {a} a2a {a} Disable, then Enable "
                 f"{a} paste your token. Then start your sessions with:",
-                f"   {CLAUDE_LAUNCH}"]
+                f"   {launch}"]
     return []
 
 

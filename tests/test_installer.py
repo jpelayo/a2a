@@ -232,6 +232,43 @@ def pure():
           m.checklist_key(r, 0, "enter")[2] == "ok")
     check("keys: ESC cancels", m.checklist_key(rows, 0, "esc")[2] == "cancel")
 
+    # Claude Code's launch line: --channels only once a MANAGED file
+    # allowlists a2a@skills-dir; the user's own settings never count.
+    mdir = Path(tempfile.mkdtemp(prefix="a2a-inst-managed-"))
+    managed = mdir / "managed-settings.json"
+    real_managed = m.CLAUDE_MANAGED
+    m.CLAUDE_MANAGED = (managed,)
+    check("claude: no managed file → the development-flag line",
+          m.claude_launch() == m.CLAUDE_LAUNCH)
+    managed.write_text(json.dumps({"channelsEnabled": True,
+                                   "allowedChannelPlugins": [
+                                       {"marketplace": "skills-dir",
+                                        "plugin": "a2a"}]}))
+    check("claude: a managed file that allowlists a2a → plain --channels",
+          m.claude_launch() == "claude --channels plugin:a2a@skills-dir"
+          and "dangerously" not in m.claude_launch())
+    check("claude: the advice lines carry that line",
+          any("claude --channels plugin:a2a@skills-dir" in l
+              for l in m.claude_advice("no_token", True)))
+    managed.write_text(json.dumps({"allowedChannelPlugins": [
+        {"marketplace": "claude-plugins-official", "plugin": "telegram"}]}))
+    check("claude: an allowlist without a2a → the development-flag line",
+          m.claude_launch() == m.CLAUDE_LAUNCH)
+    managed.write_text("{not json")
+    check("claude: an unreadable managed file → the development-flag line",
+          m.claude_launch() == m.CLAUDE_LAUNCH)
+    managed.unlink()
+    (mdir / ".claude").mkdir()
+    (mdir / ".claude" / "settings.json").write_text(json.dumps(
+        {"allowedChannelPlugins": [{"marketplace": "skills-dir",
+                                    "plugin": "a2a"}]}))
+    real_home, m.HOME = m.HOME, mdir
+    check("claude: the same key in the user's settings.json does not count "
+          "(Claude Code reads it only from a managed source)",
+          m.claude_launch() == m.CLAUDE_LAUNCH)
+    m.HOME, m.CLAUDE_MANAGED = real_home, real_managed
+    shutil.rmtree(mdir, ignore_errors=True)
+
     home = Path(tempfile.mkdtemp(prefix="a2a-inst-rows-"))
     (home / ".claude" / "skills" / "a2a").mkdir(parents=True)
     (home / ".claude" / "skills" / "a2a" / ".mcp.json").write_text(json.dumps(

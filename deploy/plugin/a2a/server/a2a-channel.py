@@ -22,6 +22,11 @@ and no listener is ever attached:
 
     claude --dangerously-load-development-channels plugin:a2a@skills-dir
 
+or, once Claude Code's managed settings put {marketplace: skills-dir, plugin:
+a2a} in `allowedChannelPlugins` (a personal account honours it; 2026-11-27):
+
+    claude --channels plugin:a2a@skills-dir
+
 Disable the hello with A2A_HELLO=0.
 
 Diagnostics go to stderr, which Claude Code collects in
@@ -830,7 +835,9 @@ def _checks(me: dict, registered: bool, alive: bool, quiet, stale) -> list:
                         "that seems wrong, Claude Code only renders pushes "
                         "when it was started with "
                         "`--dangerously-load-development-channels "
-                        "plugin:a2a@skills-dir` — without it the broker "
+                        "plugin:a2a@skills-dir`, or with `--channels "
+                        "plugin:a2a@skills-dir` where Claude Code's managed "
+                        "settings allowlist a2a — without either the broker "
                         "delivers and nothing is shown"))
     else:
         c.append(_check("push_host", True))

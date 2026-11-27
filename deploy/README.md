@@ -143,7 +143,7 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 
 | harness | it writes | commands it offers to run | then you |
 |---|---|---|---|
-| Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir`; the first time, `/plugin` → enable a2a → paste your token |
+| Claude Code | `~/.claude/skills/a2a/` | — | start it with `claude --dangerously-load-development-channels plugin:a2a@skills-dir` (or `claude --channels plugin:a2a@skills-dir`, see below); the first time, `/plugin` → enable a2a → paste your token |
 | OpenCode (1.18.28+ and 2.x, one file) | `~/.config/opencode/plugins/a2a-opencode.js`, and one setting in OpenCode's global config (below) | — | restart OpenCode (the desktop app too); OpenCode 2 reloads it by itself |
 | Pi | `~/.pi/agent/extensions/a2a/` | — | restart Pi, which installs the extension's one dependency itself |
 | Codex | `~/.codex/a2a/` | `codex mcp add a2a -- python3 ~/.codex/a2a/a2a-codex.py`, once · `codex features disable mcp_lazy_stdio_startup` on Codex 0.172+, if config.toml does not set it | restart running sessions, then open `codex` as always |
@@ -155,6 +155,28 @@ needs `python3` (3.8 or later, nothing to install) and a terminal. In order:
 **Claude Code: the flag is what carries push.** Without it everything else
 works and nothing ever arrives; the startup dialog must show
 `Channels: plugin:a2a@skills-dir`.
+
+**Without the "dangerously" flag.** `--channels` loads only plugins on an
+allowlist, and Claude Code reads that list only from its managed settings,
+never from `~/.claude/settings.json`. On macOS, create (admin rights):
+
+```bash
+sudo mkdir "/Library/Application Support/ClaudeCode"
+sudo tee "/Library/Application Support/ClaudeCode/managed-settings.json" <<'EOF'
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "skills-dir", "plugin": "a2a" }
+  ]
+}
+EOF
+```
+
+(On Linux the file is `/etc/claude-code/managed-settings.json`. If it already
+exists, add the two keys to it instead.) Then start Claude Code with
+`claude --channels plugin:a2a@skills-dir`. It works on a personal account.
+The installer only reads that file: once it allowlists a2a, it shows this
+line instead of the long one.
 
 **Codex: a plain `codex` receives (Codex 0.157 or later).** Codex has no
 plugin directory to drop into, so `codex mcp add` is its own registration,
@@ -453,7 +475,8 @@ How each harness gets them differs, and it is worth knowing which you are on:
 Claude Code is the odd one. OpenCode and Pi push by calling an API their
 harness always exposes, so it works the moment you install them. Claude Code's
 push rides an experimental channel capability that attaches only when the
-editor is started with `--dangerously-load-development-channels`. Installed
+editor is started with `--dangerously-load-development-channels`, or with
+`--channels` once a2a is on the managed allowlist (see Install). Installed
 without it, Claude Code sends and polls but never receives.
 
 Pi does not support MCP and says it never will, so its extension carries the
