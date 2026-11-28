@@ -95,7 +95,13 @@ const push = (m) => { const s = streams.find((x) => x.open); if (s) s.feed(m) }
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url).replace("http://broker.invalid", "")
   calls.push(path); allCalls.push(path)
-  if (path === "/me") return ok({ agent: "probe", registered: true, stations: ["s"] })
+  if (path === "/me") return ok(process.env.TEST_COLLIDE
+    // Another client holds this id: the identity collision.
+    ? { agent: "probe", registered: true, stations: ["s"],
+        this_agent: { agent_id: "probe", client: "other", bound: true,
+                      bound_to_me: true },
+        refused: "agent 'probe' belongs to another client" }
+    : { agent: "probe", registered: true, stations: ["s"] })
   if (path === "/channels") return ok({ channels: [{ name: "ops", members: ["probe"] }] })
   if (path === "/ack") {
     acked.push(...(JSON.parse(init.body || "{}").ids || []))
@@ -108,11 +114,11 @@ globalThis.fetch = async (url, init = {}) => {
 // --- fake Pi: one per extension instance -----------------------------------------
 function makePi() {
   const st = { events: {}, turns: [], context: [], queued: [], running: false,
-               stale: false, staleCalls: 0 }
+               stale: false, staleCalls: 0, notes: [] }
   const pi = {
     on: (e, h) => { (st.events[e] ||= []).push(h) },
     registerTool: () => {},
-    ui: { notify: () => {} },
+    ui: { notify: (t) => { st.notes.push(String(t)) } },
     // Pi's own branch, chosen synchronously: queue while running, start a
     // turn when asked to and idle, else add to the context. And what Pi does
     // to a replaced instance's `pi`: throw.
@@ -163,6 +169,12 @@ const msg = (id, text) => ({ id, kind: "channel", channel: "ops", sender: "peer"
                              text, ts: 1, audience: ["probe"], addressed: [] })
 const out = {}
 
+if (process.env.TEST_COLLIDE) {
+  const P = await instance("ses_c", "startup")
+  console.log("@@" + JSON.stringify({ notes: P.st.notes, ...snap(P.st),
+                                      calls: [...allCalls] }))
+  process.exit(0)
+}
 const A = await instance("ses_p", "startup")
 out.a = snap(A.st)
 try { out.memo = JSON.parse(readFileSync(MEMO, "utf8")).ses_p || null }
@@ -222,7 +234,7 @@ def checks(s: dict) -> list[str]:
     return [t for t in everything(s) if "Check your channels" in t]
 
 
-def run(mode: str) -> dict | None:
+def run(mode: str, collide: bool = False) -> dict | None:
     """The whole scenario in a fresh HOME, with Pi reporting `mode` (or none)."""
     work = Path(tempfile.mkdtemp(prefix="a2a-piresume-"))
     (work / "node_modules" / "typebox").mkdir(parents=True)
@@ -241,6 +253,9 @@ def run(mode: str) -> dict | None:
     env.pop("A2A_READ_ON_INIT", None)
     env.pop("A2A_CATCHUP", None)
     env.pop("TEST_MODE", None)
+    env.pop("TEST_COLLIDE", None)
+    if collide:
+        env["TEST_COLLIDE"] = "1"
     if mode:
         env["TEST_MODE"] = mode
     proc = subprocess.run(["node", "run.mjs"], cwd=work, env=env,
@@ -339,6 +354,24 @@ def main() -> int:
     for mode, out in runs.items():
         verify(out, mode)
         print()
+    # The id belongs to another client: at startup the human is told (Pi's
+    # notify, as for "not registered"), with the new agent to offer — and
+    # nothing else: no brief, no channel check, no channel read.
+    coll = run("tui", collide=True)
+    if coll is None:
+        return 1
+    notes = [n for n in coll.get("notes", [])
+             if "already used by another client" in n]
+    _check("collide: the startup tells the human once, offering probe-pi",
+           len(notes) == 1 and '"probe-pi"' in notes[0]
+           and "propose_me with no name" in notes[0],
+           json.dumps(coll.get("notes"))[:400])
+    _check("collide: and starts no turn, briefs nothing, reads no channel",
+           not coll.get("turns") and not coll.get("context")
+           and "/channels" not in coll.get("calls", []),
+           json.dumps({k: coll.get(k) for k in ("turns", "context", "calls")})
+           [:400])
+    print()
     base = comparable(runs[""])
     for mode in ("tui", "rpc"):
         got = comparable(runs[mode])

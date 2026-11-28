@@ -830,6 +830,11 @@ the broker is fine and the client is not receiving — check, in this order:
 - **DeepSeek Harness**: only `dsh web` and the Desktop app receive, and only
   for projects opened in that Host since it started; running both on one
   project makes them take the stream from each other.
+- **"belongs to another client"**: two harnesses in one folder got the same
+  name, and another one holds it. The session says so at start and offers a
+  new agent (`<name>-<harness>`, e.g. `a2a-opencode`): say yes, then approve
+  it in the TUI. Do not ask for the old name — that would take it from the
+  other harness.
 - **any client**: its log, capped and per agent — `a2a_channel_status` names
   the file.
 

@@ -733,6 +733,7 @@ def main() -> int:
     doctor()
     cron()
     propose()
+    collision()
 
     print()
     for f in fails:
@@ -1685,6 +1686,47 @@ def cron() -> None:
     stop(ctx)
     fb.close()
     JOBS.clear()
+
+
+def collision() -> None:
+    """The bot's id belongs to another client (another harness, folder or
+    token). The stream's 403 makes the plugin look at /me; from then on the
+    route's next new session gets a notice INSTEAD of the brief, the doctor
+    says the bot can fix it (who: you), and propose_me with no name asks for
+    a NEW agent — the stem plus -hermes — never the id itself (a transfer).
+    The other clients are in test_propose_station.py and
+    test_collision_notice.py."""
+    fb = FakeBroker()
+    fb.collide = {"bot-claudecode"}
+    mod = load(fb.url)
+    ctx = Ctx("bot", config=dict(ON, agent="bot-claudecode"))
+    start(mod, ctx)
+    inst = ctx.hooks["pre_llm_call"][0].__self__
+    until(lambda: inst._collision)
+    check("collision: the stream's 403 is recognised as another client "
+          "holding the id, offering the stem plus -hermes",
+          bool(inst._collision) and '"bot-hermes"' in inst._collision,
+          str(inst._collision))
+    got = ctx.turn(ALICE, "s-coll", "hi", first=True)
+    ctxt = " ".join(str((r or {}).get("context") or "") for r in got)
+    check("collision: the route's new session gets the notice, not the brief",
+          "already used by another client" in ctxt
+          and "propose_me with no name" in ctxt
+          and "You are a2a agent" not in ctxt, ctxt[:300])
+    st = ctx.call("a2a_channel_status", ALICE, {})
+    c = next((x for x in (st or {}).get("checks") or []
+              if x.get("check") == "client"), {})
+    check("collision: the doctor's client check is the bot's to fix",
+          c.get("ok") is False and c.get("who") == "you"
+          and '"bot-hermes"' in (c.get("do") or ""), str(c))
+    ctx.call("propose_me", ALICE, {"note": "c"})
+    sent = [b.get("agent_id") for p, b in fb.bodies if p == "/me/proposals"]
+    check("collision: propose_me with no name asks for bot-hermes, never "
+          "bot-claudecode", sent[:1] == ["bot-hermes"], str(sent))
+    check("collision: and the notice is dropped — the collision was the old "
+          "id's", inst._collision is None, str(inst._collision))
+    stop(ctx)
+    fb.close()
 
 
 def propose() -> None:

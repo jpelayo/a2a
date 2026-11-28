@@ -293,6 +293,34 @@ async function core(host) {
   // `<folder>-kilo`, because every harness in a folder derives the same
   // `dir`, and a request for it is a request for the other harnesses' name.
   const PROPOSE_SUFFIX = "kilo"
+  // Every harness's suffix, the same list in every client. When this id is
+  // held by another client, the variant offered keeps the stem they share
+  // (a2a-claudecode → a2a) and adds this harness's. A trailing -N after our
+  // own suffix counts on (a2a-kilo → a2a-kilo-2).
+  const VARIANT_RE = new RegExp("^(.+?)-(claudecode|antigravity|opencode|" +
+    "claude|codex|hermes|kilo|dsh|pi)(?:-(\\d+))?$")
+  function variant(id) {
+    const m = String(id || "").match(VARIANT_RE)
+    const stem = m ? m[1] : id
+    if (m && m[2] === PROPOSE_SUFFIX) {
+      return `${stem}-${PROPOSE_SUFFIX}-${(m[3] ? Number(m[3]) : 1) + 1}`
+    }
+    return `${stem}-${PROPOSE_SUFFIX}`
+  }
+  // A collision: the name exists and someone else holds it — another harness
+  // or folder (client pin), or another token. Read from /me's fields, never
+  // from the text of `refused`.
+  const collides = (me) => !!(me && me.registered && me.this_agent && (
+    me.this_agent.client === "other"
+    || (me.this_agent.bound && !me.this_agent.bound_to_me)))
+  const collisionText = (id, refused) =>
+    `"${id}" is already used by another client (another harness, folder or ` +
+    `token${refused ? `: ${refused}` : ""}), so nothing arrives here as ` +
+    `"${id}". Ask the user whether to create a new agent "${variant(id)}" ` +
+    `for this session; if yes, call propose_me with no name — the operator ` +
+    `approves it with one key and this connects with no restart. Do NOT ` +
+    `pass name="${id}": that asks to take the agent away from the other ` +
+    `client.`
   // Kilo's own folders (packages/core/src/global.ts: app "kilo", XDG dirs) —
   // never OpenCode's. A Kilo and an OpenCode in one directory are two
   // agents, each with its own store, key and switch; and Kilo nags about
@@ -404,6 +432,11 @@ async function core(host) {
    *  derives that same name, so the request is for `<folder>-kilo`. Nothing
    *  else reads this: the id itself is resolved exactly as before. */
   async function defaultProposal() {
+    // Held by another client: a request for this id would be a TRANSFER
+    // (taking it from them), so the default is a new agent, the variant.
+    try {
+      if (collides(await json("GET", "/me"))) return variant(key)
+    } catch { /* the broker did not answer: the rules below */ }
     if (explicit || key !== dir) return key
     if ((await readStore())[directory]) return key
     return `${dir}-${PROPOSE_SUFFIX}`
@@ -613,6 +646,7 @@ async function core(host) {
   // session or read a channel: it has no receipts, and the only thing worth
   // saying to its human is how to register it.
   let registered = false
+  let collision = false
   // What to tell the human when it is not. Held rather than said immediately:
   // at the moment we find out there is usually no session to say it into, and
   // a warning delivered to nowhere leaves the operator with nothing to act on.
@@ -887,7 +921,7 @@ async function core(host) {
   }
   /** The instructions for this session's system prompt, or null. */
   async function systemFor(sessionID) {
-    if (!ENABLED || stopped || !registered) return null
+    if (!ENABLED || stopped || !registered || collision) return null
     return (await isOurRoot(sessionID)) ? instructions(name) : null
   }
 
@@ -907,7 +941,9 @@ async function core(host) {
   }
 
   function brief(id = sessionID) {
-    if (!id || !registered) return Promise.resolve()
+    // Held by another client: the start notice (setupHint) took the brief's
+    // place, and a channel check as an agent the broker refuses reads nothing.
+    if (!id || !registered || collision) return Promise.resolve()
     if (children.has(id)) return Promise.resolve()
     // One promise per id, awaited by every caller: a boolean set before an
     // await is not a lock, and delivery overtook the briefing every time.
@@ -1085,6 +1121,15 @@ async function core(host) {
     const me = await json("GET", "/me")
     name = me.agent || key
     registered = !!me.registered
+    // Registered, but held by another client: say so at session start (the
+    // brief loop says setupHint instead of the channel check), and offer
+    // the variant. Nothing can be read as an agent the broker refuses.
+    collision = collides(me)
+    if (collision) {
+      setupHint = collisionText(key, me.refused)
+      log("warn", `${key} is held by another client; offering ${variant(key)}`)
+      return true
+    }
     if (registered) return true
 
     // Not registered — and this plugin does NOT create the agent. Self-
@@ -1192,7 +1237,7 @@ async function core(host) {
             // how to fix that. Said HERE rather than at the moment we found out,
             // because at that moment there was no session to say it into and the
             // warning was simply lost.
-            if (!registered) {
+            if (!registered || collision) {
               if (HELLO) {
                 await say(`[a2a] connected as ${name} — ${URL_BASE}`,
                           { noReply: true }, sn.id)
@@ -1406,7 +1451,12 @@ async function core(host) {
       checks.push(check("broker", true, null, null, URL_BASE))
       // Another client holds this agent, or this install is too old to send
       // a client key: nothing else worth suggesting works until it is fixed.
-      checks.push(me.refused
+      // Held by another client or token: the agent can fix that itself, by
+      // offering the user a new agent (the variant) — not the operator.
+      checks.push(collides(me)
+        ? check("client", false, "you", collisionText(key, me.refused),
+          me.refused || null)
+        : me.refused
         ? check("client", false, "operator",
           `the broker refuses to act as this agent: ${me.refused}`)
         : check("client", true))
@@ -1908,7 +1958,10 @@ async function core(host) {
         "approved. Pass name to ask for a name of your choosing; without " +
         `it, an id that is only this folder's name asks for ` +
         `"<folder>-${PROPOSE_SUFFIX}" instead, so each harness in a folder ` +
-        "asks for its own. Once the broker takes a request for another " +
+        "asks for its own. If this id belongs to another client, a call " +
+        `with no name asks for a NEW agent, the stem plus "-${PROPOSE_SUFFIX}" ` +
+        "(a2a-claudecode → a2a-" + PROPOSE_SUFFIX + "); name the id to ask " +
+        "for a transfer instead. Once the broker takes a request for another " +
         "name, this client goes by that name (kept for this project, as " +
         "rename_me keeps one) and connects under it when it is approved. " +
         "The operator approves or denies the name.",
@@ -1940,6 +1993,8 @@ async function core(host) {
           await pin(filed)
           key = filed
           name = filed
+          // A new name: the collision was the old one's.
+          collision = false
           stream?.abort()
           res = { ...res, was }
           log("info", `proposed ${filed} (was ${was}); going by it now`)

@@ -197,6 +197,83 @@ def main() -> int:
           "would make this create_agent with extra steps",
           not approve_routes, str(approve_routes))
 
+    check("and no route switches auto-approve — only the operator can "
+          "decide a token's new agents need no asking",
+          not [p for p in paths if "auto" in p.lower()],
+          str([p for p in paths if "auto" in p.lower()]))
+
+    # --- auto-approve: per token, NEW agents only --------------------------
+    # The operator's switch (the TUI's `t`). On, a CLAIM the token asks for
+    # becomes an agent at once, through the same approve() as by hand; a
+    # transfer always waits. It may be switched on only once an agent
+    # creation has been approved for the token — counted from now on, or an
+    # agent it already owns (approvals before the counter were not recorded).
+    sid3 = b.STATIONS.create("auto")["station_id"]
+    t3 = b.TOKENS.create(user="carol", label="auto")
+    t4 = b.TOKENS.create(user="dave", label="owner")
+    t5 = b.TOKENS.create(user="erin", label="legacy")
+    h3, h4 = b.TOKENS._hash_of(t3["prefix"]), b.TOKENS._hash_of(t4["prefix"])
+    h5 = b.TOKENS._hash_of(t5["prefix"])
+    check("auto: a token with no approved agent is not eligible",
+          not b.TOKENS.auto_eligible(t3["prefix"]))
+    check("auto: and switching it on is refused",
+          _raises(lambda: b.TOKENS.set_auto_approve(t3["prefix"], True),
+                  ValueError))
+    out = b.PROPOSALS.propose(sid3, "carol-one", h3)
+    check("auto: off, a claim is a request, as always",
+          out["status"] == "pending approval"
+          and not b.AGENTS.list_all(sid3), str(out))
+    b.PROPOSALS.approve(sid3, "carol-one")
+    row = b.TOKENS.list(include_revoked=True)
+    got = {r["prefix"]: r for r in row}
+    check("auto: approving a claim by hand counts it for the token",
+          got[t3["prefix"]]["claims_approved"] == 1,
+          str(got[t3["prefix"]]))
+    check("auto: and makes it eligible", b.TOKENS.auto_eligible(t3["prefix"]))
+    b.AGENTS.add(sid3, "erin-old", owner_token_hash=h5)
+    check("auto: a token that already owns an agent is eligible — approvals "
+          "made before the counter existed were not recorded",
+          b.TOKENS.auto_eligible(t5["prefix"])
+          and got[t5["prefix"]]["claims_approved"] == 0)
+    b.TOKENS.set_auto_approve(t3["prefix"], True)
+    check("auto: the operator switches it on",
+          b.TOKENS.auto_approves(h3))
+    out = b.PROPOSALS.propose(sid3, "carol-two", h3, note="new")
+    agents = {a["agent_id"]: a for a in b.AGENTS.list_all(sid3)}
+    check("auto: on, a CLAIM becomes an agent at once, bound to the token "
+          "that asked, and the reply says so",
+          out.get("status") == "approved" and out.get("auto_approved")
+          and agents.get("carol-two", {}).get("owner_prefix") == t3["prefix"],
+          f"{out} {agents.get('carol-two')}")
+    check("auto: and leaves no request behind",
+          "carol-two" not in [p["agent_id"] for p in b.PROPOSALS.list(sid3)])
+    got = {r["prefix"]: r for r in b.TOKENS.list(include_revoked=True)}
+    check("auto: an automatic approval counts too",
+          got[t3["prefix"]]["claims_approved"] == 2,
+          str(got[t3["prefix"]]["claims_approved"]))
+    b.AGENTS.add(sid3, "dave-agent", owner_token_hash=h4)
+    b.STATIONS.allow(sid3, t3["prefix"])
+    out = b.PROPOSALS.propose(sid3, "dave-agent", h3)
+    check("auto: on, a TRANSFER still waits for a human",
+          out.get("status") == "pending approval"
+          and out.get("kind") == "transfer"
+          and b.AGENTS.get(sid3, "dave-agent")
+          and [p["agent_id"] for p in b.PROPOSALS.list(sid3)] == ["dave-agent"],
+          str(out))
+    b.PROPOSALS.reject(sid3, "dave-agent", lock=False)
+    b.TOKENS.set_auto_approve(t3["prefix"], False)
+    out = b.PROPOSALS.propose(sid3, "carol-three", h3)
+    check("auto: switched off, claims wait again",
+          out["status"] == "pending approval"
+          and "carol-three" not in {a["agent_id"]
+                                    for a in b.AGENTS.list_all(sid3)},
+          str(out))
+    b.TOKENS.set_auto_approve(t3["prefix"], True)
+    b.TOKENS.revoke(t3["prefix"])
+    check("auto: a revoked token neither auto-approves nor is eligible",
+          not b.TOKENS.auto_approves(h3)
+          and not b.TOKENS.auto_eligible(t3["prefix"]))
+
     # /me/* must stay exempt from the unknown-agent denial or an unregistered
     # client could never ask for anything.
     src = BROKER.read_text()

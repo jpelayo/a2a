@@ -76,7 +76,15 @@ globalThis.fetch = async (url, init = {}) => {
   calls.push({ method: init.method || "GET", path: u.pathname, agent,
                client: init.headers?.["X-A2A-Client"] || "",
                body: init.body ? JSON.parse(init.body) : null })
-  if (u.pathname === "/me") return ok({ agent, registered: true, stations: ["s"] })
+  if (u.pathname === "/me") {
+    const me = { agent, registered: true, stations: ["s"] }
+    // job.collide: ids another client holds (the identity collision).
+    if ((job.collide || []).includes(agent))
+      Object.assign(me, { this_agent: { agent_id: agent, client: "other",
+        bound: true, bound_to_me: true },
+        refused: `agent '${agent}' belongs to another client` })
+    return ok(me)
+  }
   if (u.pathname === "/healthz") return ok({ ok: true, clients: "0" })
   if (u.pathname === "/channels")
     return ok({ channels: [{ name: "ops", members: [basename(A), basename(B)] }] })
@@ -238,6 +246,31 @@ def main() -> int:
             results[profile]["_pkg_after"] = sorted(p.name for p in pkg.iterdir())
             results[profile]["_state"] = sorted(
                 str(p.relative_to(home)) for p in home.rglob("*") if p.is_file())
+
+        # alpha's id is held by another client: its session is told at
+        # start, with the new agent to offer, instead of a channel check.
+        croot = base / "collide"
+        chome = croot / "home"
+        cpkg = croot / "pkg"
+        chome.mkdir(parents=True)
+        shutil.copytree(DSH_DIR, cpkg)
+        coll = run({"root": str(croot), "profile": "web",
+                    "entry": str(cpkg / "index.js"), "collide": ["alpha"]},
+                   {"HOME": str(chome), "DSH_HOME": str(chome / ".dsh"),
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        csent = coll.get("sent") or []
+        notes = [x for x in csent if x["agent"] == "sesA"
+                 and "already used by another client" in x["text"]]
+        check("collide: alpha's session is told once, with inject (no turn), "
+              "offering alpha-dsh", len(notes) == 1
+              and notes[0]["how"] == "inject"
+              and '"alpha-dsh"' in notes[0]["text"],
+              json.dumps(csent)[:500] + str(coll.get("__error__", "")))
+        check("collide: instead of alpha's channel check; beta's is as before",
+              not any(x["agent"] == "sesA" and "Check your channels" in x["text"]
+                      for x in csent)
+              and any(x["agent"] == "sesB" and "Check your channels" in x["text"]
+                      for x in csent), json.dumps(csent)[:500])
 
         web = results["web"]
         if "__error__" in web:

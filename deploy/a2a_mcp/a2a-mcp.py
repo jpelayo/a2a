@@ -868,6 +868,17 @@ CREATE TABLE IF NOT EXISTS logs (
     """
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS
   owner_client_hash VARCHAR(64) NULL AFTER owner_token_hash;""",
+    # Auto-approve, per token, switched only by an operator (the TUI's `t` on
+    # the agents tab): a CLAIM this token asks for becomes an agent at once,
+    # in PROPOSALS.propose(). A transfer always waits. claims_approved counts
+    # the claims approved for it, by hand or not — with "owns an agent", what
+    # makes the token eligible (TOKENS.auto_eligible).
+    """
+ALTER TABLE tokens ADD COLUMN IF NOT EXISTS
+  auto_approve TINYINT NOT NULL DEFAULT 0;""",
+    """
+ALTER TABLE tokens ADD COLUMN IF NOT EXISTS
+  claims_approved INT NOT NULL DEFAULT 0;""",
 )
 
 
@@ -3098,7 +3109,8 @@ class TokenRegistry:
     ) -> list[dict]:
         sql = (
             "SELECT t.token_hash, t.user, t.label, t.prefix, "
-            "t.created_at, t.revoked_at, t.last_used_at FROM tokens t"
+            "t.created_at, t.revoked_at, t.last_used_at, t.auto_approve, "
+            "t.claims_approved FROM tokens t"
         )
         where: list[str] = []
         params: list = []
@@ -3125,6 +3137,58 @@ class TokenRegistry:
                 names.get(g, g) for g in self.grants(r["token_hash"])
             ]
         return rows
+
+    # --- auto-approve: an operator's per-token setting ----------------------
+    def auto_eligible(self, token_or_prefix: str) -> bool:
+        """May auto-approve be switched ON for this token? Only once an
+        agent creation has been approved for it: a claim approved since this
+        was recorded (claims_approved), or an agent it owns today — every
+        such agent was created or approved by an operator, and approvals
+        made before the counter existed were not recorded anywhere else."""
+        h = self._hash_of(token_or_prefix)
+        return bool(h) and self._eligible(h)
+
+    def _eligible(self, h: str) -> bool:
+        row = CONN.execute(
+            "SELECT claims_approved, revoked_at FROM tokens "
+            "WHERE token_hash = %s", (h,)
+        ).fetchone()
+        if not row or row["revoked_at"] is not None:
+            return False
+        if (row["claims_approved"] or 0) > 0:
+            return True
+        return CONN.execute(
+            "SELECT 1 FROM agents WHERE owner_token_hash = %s LIMIT 1", (h,)
+        ).fetchone() is not None
+
+    def auto_approves(self, token_hash: str) -> bool:
+        """Is auto-approve on for this token (and the token still valid)?"""
+        row = CONN.execute(
+            "SELECT auto_approve, revoked_at FROM tokens "
+            "WHERE token_hash = %s", (token_hash,)
+        ).fetchone()
+        return bool(row and row["auto_approve"] and row["revoked_at"] is None)
+
+    def set_auto_approve(self, token_or_prefix: str, on: bool) -> dict:
+        """Switch auto-approve. ON is refused unless auto_eligible(): the
+        TUI asks first, and this is where the rule actually holds. Off is
+        always allowed. Only operator surfaces call this — no route does."""
+        h = self._hash_of(token_or_prefix)
+        if not h:
+            raise KeyError(f"token {token_or_prefix!r} not found")
+        if on and not self._eligible(h):
+            raise ValueError(
+                f"token {token_or_prefix} has no approved agent yet — "
+                f"approve one of its requests first")
+        with CONN:
+            CONN.execute("UPDATE tokens SET auto_approve = %s "
+                         "WHERE token_hash = %s", (1 if on else 0, h))
+        prefix = CONN.execute("SELECT prefix FROM tokens WHERE token_hash = %s",
+                              (h,)).fetchone()["prefix"]
+        log(f"auto-approve of new agents {'ON' if on else 'off'} for token "
+            f"{prefix}", event="token.auto_approve", actor=prefix,
+            level="WARN" if on else "INFO")
+        return {"prefix": prefix, "auto_approve": bool(on)}
 
     def delete(self, token_or_prefix: str) -> int:
         """Hard-delete a token and its grants (revoke only marks it)."""
@@ -3987,6 +4051,22 @@ class ProposalRegistry:
                      note = VALUES(note), expires_at = VALUES(expires_at)""",
                 (sid, agent_id, token_hash, note or "", now, expires_at),
             )
+        # A NEW name from a token the operator auto-approves: approved here,
+        # by the same approve() as the TUI's `a`, so it is created and bound
+        # exactly as by hand. Never a transfer — taking a name from someone
+        # always waits for a human.
+        if kind == "claim" and TOKENS.auto_approves(token_hash):
+            done = self.approve(sid, agent_id)
+            prefix = (CONN.execute(
+                "SELECT prefix FROM tokens WHERE token_hash = %s",
+                (token_hash,)).fetchone() or {}).get("prefix") or "?"
+            log(f"claim of {agent_id!r} auto-approved for token {prefix}",
+                event="proposal.auto_approve", station=sid, actor=agent_id)
+            return {"agent_id": agent_id, "station_id": sid,
+                    "station_name": st["name"], "created_at": now,
+                    "kind": "claim", "status": "approved",
+                    "auto_approved": True,
+                    "bound_to": done.get("bound_to")}
         return {"agent_id": agent_id, "station_id": sid,
                 "station_name": st["name"], "created_at": now,
                 "expires_at": expires_at, "kind": kind,
@@ -4140,6 +4220,11 @@ class ProposalRegistry:
                 out = dict(AGENTS.add(sid, agent_id,
                                       owner_token_hash=holder),
                            kind="claim")
+                # What makes the token eligible for auto-approve: an agent
+                # creation approved for it. Transfers do not count.
+                CONN.execute(
+                    "UPDATE tokens SET claims_approved = claims_approved + 1 "
+                    "WHERE token_hash = %s", (holder,))
             CONN.execute(
                 "DELETE FROM agent_proposals "
                 "WHERE station_id = %s AND agent_id = %s",
@@ -7016,7 +7101,9 @@ def build_app() -> Starlette:
         the unknown-agent denial so a client can provision itself.
 
         This creates nothing an agent can use. Only an operator, on the TUI or
-        CLI, can turn a proposal into an agent.
+        CLI, can turn a proposal into an agent — by hand, or by switching
+        auto-approve on for this token, which then approves its CLAIMS here
+        (PROPOSALS.propose); a transfer always waits. No route sets that.
         """
         auth = require_auth()
         try:
@@ -7042,7 +7129,14 @@ def build_app() -> Starlette:
             "waiting for an operator to approve it. Nothing to do but keep "
             "streaming — this client connects with no restart once approved."
         )
-        if out.get("kind") == "transfer":
+        if out.get("status") == "approved":
+            # The operator auto-approves new agents for this token.
+            out["note"] = (
+                "approved automatically — the operator auto-approves new "
+                "agents for this token. This client connects under the name "
+                "now, with no restart."
+            )
+        elif out.get("kind") == "transfer":
             out["note"] = (
                 "that name belongs to another client, so this is a TRANSFER "
                 "request and an operator has to agree to move it. Nothing to "
@@ -8269,14 +8363,19 @@ class _Tui:
         # "ack all", not "screen": the CLI verb is `screen`, but on a row an
         # operator is looking at, the useful label is what it DOES. A key
         # nobody recognises is a key nobody presses.
-        "stations": "n new · g grant token · v revoke grant · o open/close · "
-                    "l link stations · x delete · e purge empty · s ack all · "
-                    "c collect · ⏎ agents",
+        # The station's tokens live behind `t` (station_tokens): there the
+        # removal says "from this station", which a bare `v` here did not.
+        "stations": "n new · t tokens · o open/close · l link stations · "
+                    "x delete · e purge empty · s ack all · c collect · "
+                    "⏎ agents",
         "tokens":   "n new · g grant into station · v revoke · x delete · "
                     "z purge revoked · c collect",
         # A request is answered with one key, no y/N; new ones appear by
         # themselves (run() looks every REFRESH_MS).
-        "agents":   "request: a approve · x reject (one key) · agent: n add · "
+        # `t` is per TOKEN (the row's): its new agents are approved by the
+        # broker itself; a transfer always waits for a or x.
+        "agents":   "request: a approve · x reject (one key) · "
+                    "t auto-approve this token's new agents · agent: n add · "
                     "f free · m move · b bind · s ack all · x remove · "
                     "u unlock transfer · ⏎ client state · c collect",
         # Read-only on purpose. Everything here is history; the way to
@@ -8306,6 +8405,16 @@ class _Tui:
         self.ch_station: str | None = None
         self.msg = ""
         self.rows: list[dict] = []
+        # The key-help carousel (help_line): how far it has slid, and the
+        # tab it is sliding for — a new tab starts at its first key.
+        self.help_off = 0
+        self._help_for = None
+        self._scrolling = False
+        self._help_start = 0
+        self._help_width = 0
+        self._full_wait = True
+        # When the bottom-line message goes by itself (`t`), or None.
+        self.msg_until: float | None = None
 
     # --- data ------------------------------------------------------------
     @staticmethod
@@ -8398,15 +8507,16 @@ class _Tui:
             # Proposals sit in the same list as agents, and first: a name
             # waiting on the operator is the row they are here to act on, and
             # in a long station it would otherwise sort out of sight.
-            revoked = {
-                t["prefix"] for t in TOKENS.list(include_revoked=True)
-                if t.get("revoked_at")
-            }
+            toks = TOKENS.list(include_revoked=True)
+            revoked = {t["prefix"] for t in toks if t.get("revoked_at")}
+            # Tokens whose new agents the broker approves by itself (`t`).
+            auto = {t["prefix"] for t in toks if t.get("auto_approve")}
             # `kind` here means "which sort of ROW is this" and is already
             # spoken for, so the request's own kind (claim/transfer) rides
             # along as `request` rather than being overwritten by the merge.
             pending = [
-                dict(p, kind="proposal", request=p.get("kind") or "claim")
+                dict(p, kind="proposal", request=p.get("kind") or "claim",
+                     auto=p.get("owner_prefix") in auto)
                 for p in PROPOSALS.list()
             ]
             agents = []
@@ -8415,7 +8525,7 @@ class _Tui:
             states = {(s["station_id"], s["agent_id"]): s
                       for s in CLIENT_STATE.all()}
             for r in AGENTS.list_all():
-                r = dict(r, kind="agent")
+                r = dict(r, kind="agent", auto=r.get("owner_prefix") in auto)
                 if not r.get("owner_token_hash"):
                     r["status"] = "pending token"
                 elif r.get("owner_prefix") in revoked:
@@ -8459,6 +8569,8 @@ class _Tui:
         if self.view == "tokens":
             status = ("revoked" if r.get("revoked_at")
                       else ("used" if r.get("last_used_at") else "fresh"))
+            if r.get("auto_approve") and not r.get("revoked_at"):
+                status += " · auto-approve"
             return (f"{r['prefix']:<10} {(r.get('user') or '-')[:14]:<14} "
                     f"{(r.get('label') or '')[:16]:<16} "
                     f"{','.join(r.get('stations') or [])[:24]:<24} {status}")
@@ -8517,7 +8629,8 @@ class _Tui:
             status = r.get("status", "")
         return (f"{r['agent_id'][:28]:<28} "
                 f"{(r.get('station_name') or '')[:16]:<16} "
-                f"{who:<10} {status}")
+                f"{who:<10} " + ("[auto] " if r.get("auto") else "")
+                + status)
 
     def draw(self) -> None:
         import curses
@@ -8542,7 +8655,14 @@ class _Tui:
             hint = f"[{self.ch_station} only] " + hint
         elif self.view == "messages" and self.msg_station:
             hint = f"[{self.msg_station}] " + hint
-        self.scr.addnstr(1, 0, " " + hint, w - 1)
+        self.scr.addnstr(1, 0, " " + self.help_line(hint, w - 2), w - 1)
+        # The `t` of the agents tab, reversed (dark on light) while the token
+        # under the cursor auto-approves; a plain `t` otherwise. It follows
+        # the cursor and the slide; off screen, nothing is drawn.
+        if self.view == "agents" and (self.current() or {}).get("auto"):
+            col = self.key_col(hint, self.AUTO_KEY)
+            if col is not None:
+                self.scr.addnstr(1, 1 + col, "t", 1, curses.A_REVERSE)
         self.scr.addnstr(2, 0, " " + "─" * (w - 2), w - 1)
         top = 3
         # Scroll with the selection: drawing a fixed slice from 0 let the
@@ -8634,8 +8754,10 @@ class _Tui:
             elif c in (curses.KEY_ENTER, 10, 13):
                 return items[i][0]
 
-    def show_token(self, row: dict) -> None:
-        """A new token is shown once, exactly like `token create`."""
+    def show_token(self, row: dict, reach: str | None = None) -> None:
+        """A new token is shown once, exactly like `token create`. `reach`
+        replaces the "reaches nothing yet" line when it was granted at once
+        (the station tab's token manager)."""
         import curses
         self.scr.erase()
         w = self.scr.getmaxyx()[1]
@@ -8646,6 +8768,7 @@ class _Tui:
             "",
             f"   user: {row['user'] or '-'}   prefix: {row['prefix']}",
             "",
+            f"   {reach}" if reach else
             "   it can reach nothing yet — grant it into a station (g)",
             "",
             " press any key",
@@ -8769,21 +8892,8 @@ class _Tui:
             out = STATIONS.set_open(row["station_id"], not row.get("open"))
             self.msg = (f"{out['station']} is now "
                         f"{'OPEN (*)' if out['open'] else 'closed'}")
-        elif ch == "g" and row:
-            p = self.pick(f"grant which token access to {row['name']}?",
-                          self.token_items())
-            if p:
-                STATIONS.allow(row["station_id"], p)
-                self.msg = f"{p} granted access to {row['name']}"
-        elif ch == "v" and row:
-            allowed = STATIONS.allowed(row["station_id"])["tokens"]
-            p = self.pick(
-                f"revoke which token's access to {row['name']}?",
-                [(t["prefix"], f"{t['prefix']}  {t['user'] or '-'}")
-                 for t in allowed],
-            )
-            if p and self.confirm(f"revoke {p}'s access to {row['name']}?"):
-                self.msg = f"{STATIONS.disallow(row['station_id'], p)} revoked"
+        elif ch == "t" and row:
+            self.station_tokens(row)
         elif ch == "s" and row:
             self.screen_confirm(row["station_id"], None, row["name"])
         elif ch == "l" and row:
@@ -8846,6 +8956,98 @@ class _Tui:
                     note = " tick at least one, or choose everyone"
                     continue
                 return [k for k, _ in items if k in on]
+
+    def station_tokens(self, row: dict) -> None:
+        """`t` on a station: the tokens that may act in it, managed in place.
+
+        n mints a token and grants it HERE; g adds an existing one; r removes
+        one from THIS station only (never a revoke or a delete — those stay on
+        the tokens tab, where their reach is every station). Only existing
+        registry calls; esc returns to the stations list, reloaded."""
+        import curses
+        sid, here = row["station_id"], row["name"]
+        i, note = 0, ""
+        while True:
+            st = STATIONS.get(sid) or row
+            is_open = bool(st.get("open"))
+            toks = TOKENS.list(station_id=sid, include_revoked=True)
+            owned: dict[str, int] = {}
+            for a in AGENTS.list_all(sid):
+                p = a.get("owner_prefix")
+                if p:
+                    owned[p] = owned.get(p, 0) + 1
+            i = max(0, min(i, len(toks) - 1))
+
+            h, w = self.scr.getmaxyx()
+            self.scr.erase()
+            self.scr.addnstr(0, 0, f" tokens of {here} — n new · g add existing"
+                                   f" · r remove from station · esc back",
+                             w - 1, curses.A_BOLD)
+            self.scr.addnstr(1, 0, "  open (*): every token acts here; these "
+                                   "are its explicit grants" if is_open else
+                                   "  closed: only these tokens act here",
+                             w - 1)
+            page = max(1, h - 4)
+            off = self.offset(i, len(toks), page)
+            if not toks:
+                self.scr.addnstr(3, 2, "(no tokens — n creates one, g adds "
+                                       "an existing one)", w - 4)
+            for n, t in enumerate(toks[off:off + page]):
+                status = ("revoked" if t.get("revoked_at")
+                          else ("used" if t.get("last_used_at") else "fresh"))
+                k = owned.get(t["prefix"], 0)
+                line = (f"{t['prefix']:<10} {(t.get('user') or '-')[:14]:<14} "
+                        f"{(t.get('label') or '-')[:16]:<16} {status:<8} "
+                        f"{k} agent{'' if k == 1 else 's'} here")
+                self.scr.addnstr(3 + n, 2, line.ljust(w - 4), w - 4,
+                                 curses.A_REVERSE if off + n == i else 0)
+            self.scr.addnstr(h - 1, 0, f" {note}"[: w - 1] if note else
+                             " ↑/↓ rows · esc back", w - 1)
+            self.scr.refresh()
+
+            c = self.scr.getch()
+            ch = chr(c).lower() if 0 <= c < 256 else ""
+            cur = toks[i] if toks else None
+            note = ""
+            try:
+                if c == 27 or ch == "q":
+                    break
+                if c in (curses.KEY_UP, ord("k")):
+                    i = max(0, i - 1)
+                elif c in (curses.KEY_DOWN, ord("j")):
+                    i = min(len(toks) - 1, i + 1)
+                elif ch == "n":
+                    user = self.ask("user name:")
+                    label = self.ask("label:")
+                    made = TOKENS.create(user=user, label=label)
+                    STATIONS.allow(sid, made["prefix"])
+                    self.show_token(made, reach=f"granted into {here}")
+                    note = f"{made['prefix']} created and granted into {here}"
+                elif ch == "g":
+                    have = {t["prefix"] for t in toks}
+                    items = [it for it in self.token_items()
+                             if it[0] not in have]
+                    p = self.pick(f"add which token to {here}?", items) \
+                        if items else None
+                    if not items:
+                        note = "no other valid token to add — n creates one"
+                    elif p:
+                        STATIONS.allow(sid, p)
+                        note = f"{p} granted into {here}"
+                elif ch == "r" and cur:
+                    p, k = cur["prefix"], owned.get(cur["prefix"], 0)
+                    what = (f"{k} agent(s) here use it and "
+                            + ("keep working while the station is open"
+                               if is_open else
+                               "will be refused until it is granted again")
+                            ) if k else "no agent here uses it"
+                    if self.confirm(f"remove {p} from {here}? {what}"):
+                        STATIONS.disallow(sid, p)
+                        note = f"{p} removed from {here} (still valid elsewhere)"
+            except (KeyError, ValueError) as e:
+                note = f"error: {e}"
+        self.load()
+        self.msg = f"tokens of {here}: {len(toks)}"
 
     def link_station(self, row: dict) -> None:
         """`l` on a station: link it with another for DMs, change who may use
@@ -9071,7 +9273,34 @@ class _Tui:
             if self.confirm("purge ALL revoked tokens?"):
                 self.msg = f"{TOKENS.purge(revoked_only=True)} purged"
 
+    def toggle_auto(self, row: dict) -> None:
+        """`t`: auto-approve the NEW agents of this row's token (the one that
+        asked, on a request; the owner, on an agent). One key, no question,
+        both ways; on needs an agent creation already approved for that
+        token. The state shows as the `t` in the key line, reversed while on
+        (draw). Whatever this writes on the bottom line goes after BANNER_S.
+        Requests already waiting stay for `a`; transfers always wait."""
+        self.msg_until = time.monotonic() + self.BANNER_S
+        prefix = row.get("owner_prefix")
+        # Short: the message is up for BANNER_S only, on one line that may
+        # be narrow, so it has to be read at a glance.
+        if not prefix:
+            self.msg = "no token on this row"
+            return
+        if row.get("auto"):
+            TOKENS.set_auto_approve(prefix, False)
+            self.msg = f"auto-approve off · {prefix}"
+            return
+        if not TOKENS.auto_eligible(prefix):
+            self.msg = f"{prefix}: approve one of its agents first"
+            return
+        TOKENS.set_auto_approve(prefix, True)
+        self.msg = f"auto-approve ON · {prefix}"
+
     def act_agent(self, ch: str, row: dict | None) -> None:
+        if ch == "t" and row:
+            self.toggle_auto(row)
+            return
         # A proposal is not an agent: it cannot be moved, bound or freed,
         # because none of those things exist yet. Approve it or reject it.
         if row and row.get("kind") == "proposal":
@@ -9196,6 +9425,48 @@ class _Tui:
 
     # How long a keypress is waited for before looking for new name requests.
     REFRESH_MS = 2000
+    # The key-help line as wide as the terminal, measured on every redraw.
+    # When the keys fit it stands still; when they do not, it is a carousel
+    # that slides one column every TICK_MS, round and round, so every key
+    # passes through it. Resizing switches between the two.
+    TICK_MS = 150
+    HELP_GAP = "   ·   "
+    # How long a message `t` writes stays on the bottom line.
+    BANNER_S = 3.0
+    # The agents-tab key that is drawn reversed while the token under the
+    # cursor auto-approves.
+    AUTO_KEY = "t auto-approve"
+
+    def help_line(self, hint: str, room: int) -> str:
+        """The key help as drawn now: whole when it fits `room` (the
+        terminal's width), else a window of that width sliding over it in a
+        loop. Sets _scrolling, which wait_key() reads to wake for the next
+        slide, and _help_start, where the window starts."""
+        width = max(1, room)
+        if self._help_for != self.view:
+            self._help_for, self.help_off = self.view, 0
+        self._help_width = width
+        if len(hint) <= width:
+            self._scrolling = False
+            self._help_start = 0
+            return hint
+        self._scrolling = True
+        loop = hint + self.HELP_GAP
+        off = self.help_off % len(loop)
+        self._help_start = off
+        return (loop + loop)[off:off + width]
+
+    def key_col(self, hint: str, key: str) -> int | None:
+        """The column, within the drawn help line, where `key` starts — or
+        None when it is not on screen right now (slid past, or absent)."""
+        at = hint.find(key)
+        if at < 0:
+            return None
+        if not self._scrolling:
+            return at if at < self._help_width else None
+        loop = len(hint) + len(self.HELP_GAP)
+        col = (at - self._help_start) % loop
+        return col if col < self._help_width else None
 
     def requests(self) -> dict:
         """The live name requests, (station_id, agent_id) -> row. {} when
@@ -9207,10 +9478,18 @@ class _Tui:
             return {}
 
     def wait_key(self) -> int:
-        """The next key, or -1 after REFRESH_MS with none. Blocking again
-        straight after: ask(), pick() and getstr() must wait for the operator
-        as they always did, not give up on them after two seconds."""
-        self.scr.timeout(self.REFRESH_MS)
+        """The next key, or -1 after REFRESH_MS with none — or after TICK_MS
+        while the key help is sliding, or sooner when a `t` message is due
+        to go (msg_until). Blocking again straight after: ask(), pick() and
+        getstr() must wait for the operator as they always did, not give up
+        on them after two seconds. _full_wait says whether this wait was the
+        plain REFRESH_MS one."""
+        wait = self.TICK_MS if self._scrolling else self.REFRESH_MS
+        if self.msg_until is not None:
+            left = int((self.msg_until - time.monotonic()) * 1000)
+            wait = max(1, min(wait, left))
+        self._full_wait = wait == self.REFRESH_MS
+        self.scr.timeout(wait)
         try:
             return self.scr.getch()
         finally:
@@ -9221,12 +9500,26 @@ class _Tui:
         curses.curs_set(0)
         seen = self.requests()
         reload = True
+        looked = time.monotonic()
         while True:
             if reload:
                 self.load()
             self.draw()
             c = self.wait_key()
             if c == -1:
+                if (self.msg_until is not None
+                        and time.monotonic() >= self.msg_until):
+                    # A `t` message has had its 3 s: gone, with no key.
+                    self.msg, self.msg_until = "", None
+                if self._scrolling:
+                    self.help_off += 1    # one slide of the key help
+                reload = False
+                # A short wake (a slide, a message going) is not a look for
+                # name requests: those stay every REFRESH_MS.
+                if (not self._full_wait and (time.monotonic() - looked)
+                        * 1000 < self.REFRESH_MS):
+                    continue
+                looked = time.monotonic()
                 # Nobody pressed anything: look for name requests, and
                 # redraw only when they changed — the other tabs are not
                 # re-queried every two seconds for nothing.
@@ -9240,8 +9533,10 @@ class _Tui:
                         for p in new)
                     self.msg = (f"new name request: {names} — tab 3 agents: "
                                 f"a approve · x reject")
+                    self.msg_until = None     # this one stays until a key
                 continue
             reload = True
+            self.msg_until = None
             self.msg = ""
             if not self.act(c):
                 return

@@ -44,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -366,6 +367,10 @@ class FakeBroker:
         self.bodies: list[tuple[str, dict]] = []
         # POST paths answered 409, the way the broker refuses a request.
         self.refuse: set[str] = set()
+        # Agent ids another client holds: /me asked AS one of these answers
+        # registered, with this_agent.client "other" and a refusal — the
+        # identity collision every client must detect.
+        self.collide: set[str] = set()
         self.acked: list[str] = []
         self.unacked: list[dict] = []
         # Unacked but past the replay window: the stream never offers these
@@ -406,6 +411,18 @@ class FakeBroker:
                 path = self.path.split("?")[0]
                 self._record(path)
                 if path == "/stream":
+                    q = urllib.parse.parse_qs(self.path.partition("?")[2])
+                    who = (self.headers.get("X-A2A-Agent")
+                           or (q.get("agent") or [""])[-1])
+                    if who in broker.collide:
+                        # As the broker refuses an agent another client holds.
+                        b = json.dumps({"error": f"agent {who!r} belongs to "
+                                        "another client"}).encode()
+                        self.send_response(403)
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                        return
                     return self._stream()
                 if path == "/pending/peek":
                     if not broker.peek:
@@ -416,10 +433,17 @@ class FakeBroker:
                     # Read-only, like the real one: marks nothing.
                     return self._json({"messages": broker.aged
                                        + list(broker.unacked)})
-                self._json({"agent": "x", "registered": True,
-                            "stations": ["s"], "channels": [],
-                            "agents": [{"agent_id": a}
-                                       for a in broker.me_agents]})
+                me = {"agent": "x", "registered": True,
+                      "stations": ["s"], "channels": [],
+                      "agents": [{"agent_id": a}
+                                 for a in broker.me_agents]}
+                who = self.headers.get("X-A2A-Agent") or ""
+                if path == "/me" and who in broker.collide:
+                    me.update(agent=who, this_agent={
+                        "agent_id": who, "client": "other", "bound": True,
+                        "bound_to_me": True},
+                        refused=f"agent {who!r} belongs to another client")
+                self._json(me)
 
             def do_POST(self):
                 path = self.path.split("?")[0]

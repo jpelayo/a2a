@@ -294,6 +294,47 @@ def legacy_id(project):
 # name, and a request for it is a request for the other harnesses' name.
 PROPOSE_SUFFIX = "codex"
 
+# Every harness's suffix, the same list in every client. When this id is held
+# by another client, the variant offered keeps the stem they share
+# (a2a-claudecode -> a2a) and adds this harness's. A trailing -N after our own
+# suffix counts on (a2a-codex -> a2a-codex-2).
+VARIANT_RE = re.compile(r"^(.+?)-(claudecode|antigravity|opencode|claude|"
+                        r"codex|hermes|kilo|dsh|pi)(?:-(\d+))?$")
+
+
+def variant(agent_id):
+    """The new agent offered when `agent_id` belongs to another client."""
+    m = VARIANT_RE.match(agent_id or "")
+    stem = m.group(1) if m else agent_id
+    if m and m.group(2) == PROPOSE_SUFFIX:
+        return f"{stem}-{PROPOSE_SUFFIX}-{int(m.group(3) or 1) + 1}"
+    return f"{stem}-{PROPOSE_SUFFIX}"
+
+
+def collides(me):
+    """A collision: the name exists and someone else holds it — another
+    harness or folder (client pin), or another token. Read from /me's
+    fields, never from the text of `refused`."""
+    if not isinstance(me, dict) or not me.get("registered"):
+        return False
+    t = me.get("this_agent")
+    return isinstance(t, dict) and (
+        t.get("client") == "other"
+        or bool(t.get("bound") and not t.get("bound_to_me")))
+
+
+def collision_text(agent_id, refused=None):
+    """What the session and the doctor say on a collision."""
+    why = f": {refused}" if refused else ""
+    return (f"\"{agent_id}\" is already used by another client (another "
+            f"harness, folder or token{why}), so nothing arrives here as "
+            f"\"{agent_id}\". Ask the user whether to create a new agent "
+            f"\"{variant(agent_id)}\" for this session; if yes, call "
+            f"propose_me with no name — the operator approves it with one "
+            f"key and this connects with no restart. Do NOT pass "
+            f"name=\"{agent_id}\": that asks to take the agent away from the "
+            f"other client.")
+
 
 def resolve_key():
     """(key, explicit) — the id this session announces.
@@ -1093,8 +1134,24 @@ def catch_up():
     The client does not read the channels itself: reading is receiving, and the
     broker acks what it hands back, so a silent catch-up would consume the very
     messages the agent is supposed to answer.
+
+    Held by another client, the session is told that instead, whatever
+    read_on_init says: nothing can be read as an agent the broker refuses,
+    and the one useful thing is to offer the user a new agent.
     """
-    if not READ_ON_INIT or CATCHUP <= 0 or get_server() is None:
+    if get_server() is None:
+        return
+    me = _me()
+    if collides(me):
+        log(f"{KEY} is held by another client; offering {variant(KEY)}")
+        try:
+            srv = get_server()
+            if srv is not None:
+                srv.submit("[a2a] " + collision_text(KEY, me.get("refused")))
+        except Exception as e:
+            log(f"collision notice failed: {e!r}")
+        return
+    if not READ_ON_INIT or CATCHUP <= 0:
         return
     try:
         chans = api("GET", "/channels", timeout=10)
@@ -1594,7 +1651,12 @@ def _default_proposal():
     is only this folder's name, derived because nothing chose one (no
     A2A_AGENT, nothing baked, nothing stored). Every harness in the folder
     derives that same name, so the request is for `<folder>-codex`. Nothing
-    else reads this: the id itself is resolved exactly as before."""
+    else reads this: the id itself is resolved exactly as before.
+
+    Held by another client, a request for this id would be a TRANSFER
+    (taking it from them), so the default is then a new agent: variant()."""
+    if collides(_me()):
+        return variant(KEY)
     project = os.getcwd()
     if EXPLICIT or KEY != legacy_id(project):
         return KEY
@@ -1789,9 +1851,15 @@ def _checks(me, registered, thread, thread_err, quiet, stale):
               for k in ("client", "registered")]
     else:
         c.append(_check("broker", True, detail=URL))
-        if me.get("refused"):
-            # Another client holds this agent, or this install is too old to
-            # send a client key: nothing else will work until that is fixed.
+        if collides(me):
+            # Held by another client or token: the agent can fix that
+            # itself, by offering the user a new agent — not the operator.
+            c.append(_check("client", False, "you",
+                            collision_text(KEY, me.get("refused")),
+                            detail=me.get("refused")))
+        elif me.get("refused"):
+            # This install is too old to send a client key, or another
+            # refusal only an operator can lift.
             c.append(_check("client", False, "operator",
                             f"the broker refuses to act as this agent: "
                             f"{me['refused']}"))
@@ -2134,7 +2202,11 @@ TOOLS = [
      "does), so this session receives as soon as it is approved. Pass name "
      "to ask for a name of your choosing; without it, an id that is only "
      "this folder's name asks for \"<folder>-" + PROPOSE_SUFFIX + "\" "
-     "instead, so each harness in a folder asks for its own. Once the broker "
+     "instead, so each harness in a folder asks for its own. If this id "
+     "belongs to another client, a call with no name asks for a NEW agent, "
+     "the stem plus \"-" + PROPOSE_SUFFIX + "\" (a2a-claudecode -> a2a-"
+     + PROPOSE_SUFFIX + "); name the id to ask for a transfer instead. "
+     "Once the broker "
      "takes a request for another name, this client goes by that name (kept "
      "for this project, as rename_me keeps one) and connects under it when "
      "it is approved. The operator approves or denies the name.",

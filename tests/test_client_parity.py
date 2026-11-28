@@ -124,7 +124,14 @@ def codex_tools(path: Path = CODEX) -> set[str]:
     return set(re.findall(r'^    \("([a-z_][a-z0-9_]*)",', body, re.M))
 
 
-def status_shapes() -> dict:
+ME_OK = {"agent": "x", "stations": ["s"], "registered": True}
+# Registered, but another client holds it: the identity collision.
+ME_COLLIDES = dict(ME_OK, this_agent={"agent_id": "x", "client": "other",
+                                      "bound": True, "bound_to_me": True},
+                   refused="agent 'x' belongs to another client")
+
+
+def status_shapes(me: dict | None = None) -> dict:
     """Every client's REAL status builder, run with the network stubbed.
 
     The python clients are imported; the JS/TS ones have `statusReport` lifted
@@ -137,6 +144,7 @@ def status_shapes() -> dict:
     import subprocess as _sub
     import sys as _sys
 
+    me = ME_OK if me is None else me
     out = {}
     os.environ.update(A2A_URL="http://127.0.0.1:1", A2A_TOKEN="t",
                       A2A_CODEX_SOCK="")
@@ -145,8 +153,7 @@ def status_shapes() -> dict:
     cx = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cx)
     cx.api = lambda m, p, body=None, timeout=30: (
-        {"agent": "x", "stations": ["s"], "registered": True} if p == "/me"
-        else {"channels": []})
+        dict(me) if p == "/me" else {"channels": []})
     out["codex"] = _json.loads(cx._status({}))
 
     # Antigravity: its data, temp and project folders all under a temp dir.
@@ -178,8 +185,7 @@ def status_shapes() -> dict:
         get_config = lambda self, key, default=None: default  # noqa: E731
 
     hx.api = lambda m, p, body=None, timeout=30, agent="": (
-        {"agent": "x", "stations": ["s"], "registered": True} if p == "/me"
-        else {"channels": []})
+        dict(me) if p == "/me" else {"channels": []})
     inst = hx.A2AHermes(_Ctx())
     out["hermes"] = _json.loads(inst.status())
     inst.stop()
@@ -190,7 +196,7 @@ def status_shapes() -> dict:
     ch = importlib.util.module_from_spec(spec)
     _sys.modules["parity_claude"] = ch
     spec.loader.exec_module(ch)
-    ch._me_view = lambda: {"agent": "x", "stations": ["s"], "registered": True}
+    ch._me_view = lambda: dict(me)
     ch._my_channels = lambda: []
     sent = []
     ch._send = lambda o: sent.append(o)
@@ -217,6 +223,12 @@ def status_shapes() -> dict:
         src = path.read_text()
         i = src.index("async function statusReport")
         body = _re.sub(r"^  ", "", src[i:src.index("\n  }", i) + 4], flags=_re.M)
+        # The collision helpers it calls, lifted verbatim too: from the
+        # harness suffix to the end of collisionText.
+        j = src.index("const PROPOSE_SUFFIX")
+        k = src.index("client.`", src.index("const collisionText", j))
+        k = src.index("\n", k) + 1
+        helpers = _re.sub(r"^  ", "", src[j:k], flags=_re.M)
         # Every free name the lifted statusReport reads. A name missing here
         # is a ReferenceError — which used to be caught, printed and the
         # client SKIPPED: Pi's `sendOnly` went unchecked that way for months.
@@ -229,9 +241,9 @@ def status_shapes() -> dict:
                'const BAKED={version:"0"};\n'
                'const pumpState={connected:true,lastLine:Date.now(),'
                'delivered:0,lastError:null,last:null};\n'
-               'const api=async(m,p)=>p==="/me"?JSON.stringify({agent:"x",'
-               'stations:["s"],registered:true}):'
-               'JSON.stringify({channels:[]});\n')
+               'const api=async(m,p)=>p==="/me"?JSON.stringify('
+               + _json.dumps(me) + '):'
+               'JSON.stringify({channels:[]});\n' + helpers)
         tmp = Path(tempfile.mkdtemp(prefix="a2a-status-")) / f"d{path.suffix}"
         tmp.write_text(pre + body + "\nstatusReport()"
                        ".then(s=>console.log('@@'+s))\n")
@@ -389,6 +401,56 @@ def main() -> int:
         ["claude", "codex", "hermes", "opencode", "pi", "kilocode", "dsh",
          "antigravity"]),
         str(sorted(shapes)))
+
+    # --- an identity collision: the agent acts, not the operator -----------
+    # Registered, but another client holds the id. Every doctor must say so
+    # as `client`, for "you", offering the variant (stem + its own suffix)
+    # and warning that naming the id asks for a transfer. A refusal that is
+    # NOT a collision (an install too old to send a client key) stays the
+    # operator's.
+    suffix = {"claude": "claude", "codex": "codex", "hermes": "hermes",
+              "opencode": "opencode", "pi": "pi", "kilocode": "kilo",
+              "dsh": "dsh", "antigravity": "antigravity"}
+    hit = status_shapes(ME_COLLIDES)
+    hit.pop("kilocode-send-only", None)
+    old = status_shapes(dict(ME_OK, refused="older than the broker",
+                             this_agent={"agent_id": "x", "client": None,
+                                         "bound": True, "bound_to_me": True}))
+    old.pop("kilocode-send-only", None)
+    check("collision: every client's builder ran on a colliding /me",
+          sorted(k for k, v in hit.items() if "__error__" not in v)
+          == sorted(suffix), str({k: v.get("__error__") for k, v in
+                                  hit.items() if "__error__" in v}))
+    for label, shape in hit.items():
+        if "__error__" in shape:
+            continue
+        c = next((x for x in shape.get("checks") or []
+                  if x.get("check") == "client"), {})
+        do = c.get("do") or ""
+        check(f"{label}: on a collision the client check fails for YOU, "
+              f"offering the -{suffix[label]} variant with no name and "
+              f"warning that naming the id is a transfer",
+              c.get("ok") is False and c.get("who") == "you"
+              and f'-{suffix[label]}"' in do
+              and "propose_me with no name" in do
+              and "take the agent away" in do, str(c))
+        first = next((x for x in shape.get("checks") or []
+                      if x.get("ok") is False), {})
+        check(f"{label}: and it is the next_step unless an earlier check "
+              f"fails (here, at most a2a being off)",
+              shape.get("next_step") == do
+              or (first.get("check") == "switch"
+                  and shape.get("next_step") == first.get("do")),
+              str(shape.get("next_step")))
+    for label, shape in old.items():
+        if "__error__" in shape:
+            continue
+        c = next((x for x in shape.get("checks") or []
+                  if x.get("check") == "client"), {})
+        check(f"{label}: a refusal that is not a collision stays the "
+              f"operator's", c.get("ok") is False
+              and c.get("who") == "operator", str(c))
+
     # A Kilo daemon or editor server only sends, like Pi's helper session:
     # by design, so push_host holds and the stream is not applicable.
     if send_only:

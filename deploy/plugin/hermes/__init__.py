@@ -707,6 +707,53 @@ def _waker_status():
     return out
 
 
+# --- identity collisions ---------------------------------------------------
+# This bot's harness suffix, for the variant offered when its id belongs
+# to another client (a2a-claudecode -> a2a -> a2a-hermes).
+PROPOSE_SUFFIX = "hermes"
+
+# Every harness's suffix, the same list in every client. When this id is held
+# by another client, the variant offered keeps the stem they share
+# (a2a-claudecode -> a2a) and adds this harness's. A trailing -N after our own
+# suffix counts on (a2a-hermes -> a2a-hermes-2).
+VARIANT_RE = re.compile(r"^(.+?)-(claudecode|antigravity|opencode|claude|"
+                        r"codex|hermes|kilo|dsh|pi)(?:-(\d+))?$")
+
+
+def variant(agent_id):
+    """The new agent offered when `agent_id` belongs to another client."""
+    m = VARIANT_RE.match(agent_id or "")
+    stem = m.group(1) if m else agent_id
+    if m and m.group(2) == PROPOSE_SUFFIX:
+        return f"{stem}-{PROPOSE_SUFFIX}-{int(m.group(3) or 1) + 1}"
+    return f"{stem}-{PROPOSE_SUFFIX}"
+
+
+def collides(me):
+    """A collision: the name exists and someone else holds it — another
+    harness or folder (client pin), or another token. Read from /me's
+    fields, never from the text of `refused`."""
+    if not isinstance(me, dict) or not me.get("registered"):
+        return False
+    t = me.get("this_agent")
+    return isinstance(t, dict) and (
+        t.get("client") == "other"
+        or bool(t.get("bound") and not t.get("bound_to_me")))
+
+
+def collision_text(agent_id, refused=None):
+    """What the session and the doctor say on a collision."""
+    why = f": {refused}" if refused else ""
+    return (f"\"{agent_id}\" is already used by another client (another "
+            f"harness, folder or token{why}), so nothing arrives here as "
+            f"\"{agent_id}\". Ask the user whether to create a new agent "
+            f"\"{variant(agent_id)}\" for this session; if yes, call "
+            f"propose_me with no name — the operator approves it with one "
+            f"key and this connects with no restart. Do NOT pass "
+            f"name=\"{agent_id}\": that asks to take the agent away from the "
+            f"other client.")
+
+
 # --- the doctor ------------------------------------------------------------------
 # a2a_channel_status lists EVERY check, in this order, in every client — the
 # same ids, so an agent reading one never has to know its harness. `ok` is
@@ -1227,8 +1274,11 @@ TOOLS = [
      "If your token reaches several stations, pass station. Asking also "
      "turns a2a on here when it is off (as enable_a2a_here does, with the "
      "same rules), so this bot receives as soon as it is approved. Pass "
-     "name to ask for a name of your choosing instead of this bot's id; "
-     "once the broker takes the request, the bot goes by that name (as "
+     "name to ask for a name of your choosing instead of this bot's id. If "
+     "this id belongs to another client, a call with no name asks for a NEW "
+     "agent, the stem plus \"-hermes\" (a2a-claudecode -> a2a-hermes); name "
+     "the id to ask for a transfer instead. Once the broker takes the "
+     "request, the bot goes by that name (as "
      "rename_me keeps one) and connects under it when it is approved. The "
      "operator approves or denies the name.",
      {"name": OPT_STR, "note": OPT_STR, "station": OPT_STR}, [],
@@ -1325,6 +1375,11 @@ class A2AHermes:
         self.state = {"connected": False, "delivered": 0, "observed": 0,
                       "acked": 0, "last": "", "error": "", "last_line": 0.0}
         self._version_checked = False
+        # The collision notice, or None: set by the stream thread when the
+        # broker refuses this bot's id because another client holds it, and
+        # said in the route's next new session INSTEAD of the brief
+        # (pre_llm_call may make no HTTP call, so it reads only this).
+        self._collision = None
         self._rejections = 0
         # Set while the route's app conversation is not open in the app: the
         # stream stays closed, so the broker keeps new messages undelivered,
@@ -2136,9 +2191,16 @@ class A2AHermes:
                 return json.dumps(out)
             turned_on = True
         # `name` asks for a name of the bot's choosing; without it, the bot's
-        # id as before. The operator approves or denies the name; this
-        # plugin never refuses one.
-        asked = (a.get("name") or "").strip() or self.key
+        # id as before — unless another client holds that id, where a request
+        # for it would be a TRANSFER: then a new agent, variant(). The
+        # operator approves or denies the name; this plugin never refuses one.
+        asked = (a.get("name") or "").strip()
+        if not asked:
+            try:
+                me = self.api("GET", "/me", timeout=10)
+            except Exception:
+                me = None
+            asked = variant(self.key) if collides(me) else self.key
         body = {"agent_id": asked, "note": a.get("note") or ""}
         station = (a.get("station") or "").strip()
         if station:
@@ -2160,6 +2222,7 @@ class A2AHermes:
             if filed != self.key:
                 was = self.key
                 self._become(filed, moved=False)
+                self._collision = None   # the collision was the old id's
                 out["was"] = was
                 moved = True
         if not turned_on:
@@ -2404,6 +2467,7 @@ class A2AHermes:
             with urllib.request.urlopen(
                     req, timeout=STREAM_READ_TIMEOUT) as resp:
                 self._resp = resp
+                self._collision = None       # the broker takes this id now
                 self.state.update(connected=True, last_line=time.time())
                 if not self._rejections:
                     # A refusal stays on record until an injection succeeds.
@@ -2453,6 +2517,19 @@ class A2AHermes:
             # yet, which an operator fixes.
             wait = UNREGISTERED_S if e.code == 403 else RECONNECT_S
             self.log(f"stream HTTP {e.code}; retrying in {wait}s")
+            if e.code == 403:
+                # Held by another client? Then the route is told, and offered
+                # a new agent, at its next session (pre_llm_call).
+                try:
+                    me = self.api("GET", "/me", timeout=10)
+                except Exception:
+                    me = None
+                was = self._collision
+                self._collision = (collision_text(self.key, me.get("refused"))
+                                   if collides(me) else None)
+                if self._collision and not was:
+                    self.log(f"{self.key} is held by another client; "
+                             f"offering {variant(self.key)}")
             return wait
         except Exception as e:
             if self._stop.is_set():
@@ -2659,6 +2736,10 @@ class A2AHermes:
             # Per session, not per process: a newly pinned chat, a reset
             # session and a gateway restart all start one.
             self._briefed.add(sid)
+            # Held by another client: the notice instead of the brief —
+            # nothing can be read as an id the broker refuses.
+            if self._collision:
+                return {"context": "[a2a] " + self._collision}
             return {"context": brief(self.name)}
         return None
 
@@ -2828,9 +2909,15 @@ class A2AHermes:
                   for k in ("client", "registered")]
         else:
             c.append(_check("broker", True, detail=URL))
-            if me.get("refused"):
-                # Another client holds this agent, or this install is too
-                # old to send a client key: nothing else works until fixed.
+            if collides(me):
+                # Held by another client or token: the bot can fix that
+                # itself, by offering a new agent — not the operator.
+                c.append(_check("client", False, "you",
+                                collision_text(self.key, me.get("refused")),
+                                detail=me.get("refused")))
+            elif me.get("refused"):
+                # This install is too old to send a client key, or another
+                # refusal only an operator can lift.
                 c.append(_check("client", False, "operator",
                                 f"the broker refuses to act as this agent: "
                                 f"{me['refused']}"))

@@ -85,7 +85,15 @@ globalThis.fetch = async (url, init = {}) => {
   const agent = init.headers?.["X-A2A-Agent"] || u.searchParams.get("agent") || ""
   calls.push({ method: init.method || "GET", path, agent,
                body: init.body ? JSON.parse(init.body) : null })
-  if (u.pathname === "/me") return ok({ agent: agent || KEY, registered: true, stations: ["s"] })
+  if (u.pathname === "/me") {
+    const me = { agent: agent || KEY, registered: true, stations: ["s"] }
+    // job.collide: another client holds this id (the identity collision).
+    if (job.collide && (agent || KEY) === KEY)
+      Object.assign(me, { this_agent: { agent_id: KEY, client: "other",
+        bound: true, bound_to_me: true },
+        refused: `agent '${KEY}' belongs to another client` })
+    return ok(me)
+  }
   if (u.pathname === "/healthz") return ok({ ok: true, clients: "0" })
   if (u.pathname === "/channels") return ok({ channels: [{ name: "ops", members: [KEY] }] })
   if (u.pathname === "/stream") {
@@ -261,6 +269,8 @@ def main() -> int:
              "env": env_for("terminal", {"KILO_PROCESS_ROLE": "worker"})},
             {"name": "refused", "switch": on, "deliver": True, "refuse": True,
              "env": env_for("refused", {"KILO_PROCESS_ROLE": "worker"})},
+            {"name": "collide", "switch": on, "collide": True,
+             "env": env_for("collide", {"KILO_PROCESS_ROLE": "worker"})},
         ]
         for j in jobs:
             j["script"] = str(scenario)
@@ -277,6 +287,19 @@ def main() -> int:
         mainrun = run(["node", str(scenario), json.dumps(main_job)], main_env)
 
         tui = workers["tui"]
+        coll = workers.get("collide") or {}
+        notes = [p for p in coll.get("prompts", [])
+                 if "already used by another client" in p["text"]]
+        check("collide: an id another client holds is said at start, once, "
+              "as noReply, offering the stem plus -kilo",
+              len(notes) == 1 and notes[0]["noReply"]
+              and '"proj-collide-kilo"' in notes[0]["text"]
+              and "propose_me with no name" in notes[0]["text"],
+              json.dumps(coll.get("prompts"))[:400])
+        check("collide: instead of the channel check",
+              not any("Check your channels" in p["text"]
+                      for p in coll.get("prompts", [])),
+              json.dumps(coll.get("prompts"))[:400])
         check("the scenarios report", all("error" not in v for v in workers.values())
               and "__error__" not in mainrun,
               json.dumps({**workers, "main": mainrun})[:600])

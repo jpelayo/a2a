@@ -197,6 +197,11 @@ def main() -> int:
         return ord("q")
 
     t = make([first, second, third])
+    # A terminal wide enough for the whole key help, so it does not slide and
+    # the wait is the plain REFRESH_MS one. The sliding help and its faster
+    # ticks, during which requests are still looked for every REFRESH_MS,
+    # are test_tui_help.py's.
+    t.scr.getmaxyx = lambda: (40, 400)
     t.run()
     check("live: a tick with nothing new neither reloads nor clears the "
           "status line",
@@ -216,6 +221,71 @@ def main() -> int:
     check("…and goes back to BLOCKING straight after, so ask() and pick() "
           "wait for the operator as before",
           t.scr.timeouts == [b._Tui.REFRESH_MS, -1] * 3, str(t.scr.timeouts))
+
+    # --- t: auto-approve this row's token's NEW agents ----------------------
+    # Per token, stored on the broker (which approves its claims itself).
+    # One key, no question, both ways; on needs an agent creation already
+    # approved for that token. Transfers are not affected. Its message goes
+    # by itself after BANNER_S (test_tui_help.py drives that through run()).
+    AUTO: dict = {}
+    ELIGIBLE = {"newtok12"}
+    switched: list[tuple] = []
+
+    def set_auto(prefix, on):
+        if on and prefix not in ELIGIBLE:
+            raise ValueError("not eligible")
+        switched.append((prefix, on))
+        AUTO[prefix] = on
+        return {"prefix": prefix, "auto_approve": on}
+    b.TOKENS.list = lambda *a, **k: [
+        {"prefix": p, "auto_approve": 1 if on else 0} for p, on in AUTO.items()]
+    b.TOKENS.auto_eligible = lambda p: p in ELIGIBLE
+    b.TOKENS.set_auto_approve = set_auto
+    check("auto: HELP names the key",
+          "t auto-approve this token's new agents" in b._Tui.HELP["agents"],
+          b._Tui.HELP["agents"])
+
+    PROPS[:] = [proposal("omega")]
+    t = make()
+    t.load()                                   # cursor on omega (newtok12)
+    t.act(ord("t"))
+    check("auto: t on a request of an eligible token switches it on for THAT "
+          "token at once — no question, nothing to type",
+          switched == [("newtok12", True)] and not t.confirms,
+          f"{switched} {t.confirms}")
+    check("auto: and says so, on a message that goes by itself in BANNER_S",
+          "auto-approve ON · newtok12" in t.msg
+          and t.msg_until is not None
+          and abs(t.msg_until - time.monotonic() - b._Tui.BANNER_S) < 1,
+          f"{t.msg} {t.msg_until}")
+    t.load()
+    check("auto: the row then shows [auto]",
+          "[auto]" in t.line(t.current()), t.line(t.current()))
+    check("auto: and the request is still waiting — switching on affects new "
+          "requests only", [p["agent_id"] for p in PROPS] == ["omega"]
+          and not [d for d in done if d[1:] == ("s1", "omega")], str(done))
+    switched.clear()
+    t.confirms.clear()
+    t.act(ord("t"))
+    check("auto: t again switches it off, with no question",
+          switched == [("newtok12", False)] and not t.confirms,
+          f"{switched} {t.confirms}")
+
+    PROPS[:] = []
+    switched.clear()
+    t = make()
+    t.load()                                   # cursor on zeta (abcd1234)
+    t.act(ord("t"))
+    check("auto: on an agent row it is the owner's token, and a token with "
+          "no approved agent is refused with the reason, nothing switched",
+          switched == [] and not t.confirms
+          and t.msg == "abcd1234: approve one of its agents first",
+          f"{switched} {t.msg}")
+    ELIGIBLE.add("abcd1234")
+    t.act(ord("t"))
+    check("auto: and an eligible owner is switched on, with no question",
+          switched == [("abcd1234", True)] and not t.confirms,
+          f"{switched} {t.confirms}")
 
     print()
     for f in fails:

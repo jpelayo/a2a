@@ -81,9 +81,21 @@ notifies = re.findall(r"^\s*_notify\(", py, re.M)
 #     when it is true. Argued for by the alternative: a tool silently absent
 #     with nothing anywhere explaining it, which is what happened to
 #     propose_me and cost an afternoon.
-check("claude: exactly four injection sites remain (message + hello + "
-      "channel check + stale-install notice)",
-      len(notifies) == 4, f"{len(notifies)} found")
+#   5 the identity collision: another client holds this id. Said once, only
+#     when /me says so, and INSTEAD of the channel check (it returns before
+#     it), so it never adds to a session's start. Argued for by a real run:
+#     a second harness in the folder got 403 on everything, nothing said
+#     why, and asked to "use a2a" it filed a transfer that would have taken
+#     the agent from the first.
+check("claude: exactly five injection sites remain (message + hello + "
+      "channel check + stale-install notice + collision notice)",
+      len(notifies) == 5, f"{len(notifies)} found")
+check("claude: the collision notice is one of them, gated on collides() and "
+      "said in place of the channel check",
+      "if collides(me):" in py and "collision_text(KEY" in py
+      and py.index("if collides(me):", py.index("def _check_channels("))
+      < py.index("if CATCHUP <= 0:", py.index("def _check_channels(")),
+      "not gated, or not before the channel check")
 check("claude: the stale-install notice is one of them, and fires only when "
       "the versions actually differ",
       "_check_version()" in py and "theirs != mine" in py, "not gated")

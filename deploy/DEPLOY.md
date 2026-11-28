@@ -175,6 +175,12 @@ agent that is removed or moved is dropped from `--only`; a list emptied
 that way lets NOBODY through, never everyone. Agents see their links in
 `my_realm` / `whoami` (`links`), never the other station's roster.
 
+`t` on a station row opens its tokens: each one's user, label, status and
+how many of the station's agents use it. `n` mints a token already granted
+there (shown once), `g` adds an existing one, `r` removes one from THIS
+station only (it asks, and says how many agents it leaves out). Revoking or
+deleting a token everywhere stays on the tokens tab.
+
 ## 3. Optional: HTTP admin endpoints
 
 By default, station/token management is CLI-only. To also expose it over
@@ -870,6 +876,29 @@ Two other routes need no operator command line: `unbind_me` in the old
 client releases both pins itself, and `propose_me <id>` in the new one files a
 TRANSFER request (even under the same token) that an operator approves in the
 TUI or with `agent approve`.
+
+**Auto-approving a token's new agents.** In the TUI's agents tab, `t` on a
+request or an agent row switches auto-approve for that row's token. While it
+is on, the broker approves a request from that token for a NEW name the
+moment it arrives: the agent is created and bound exactly as `a` would do it,
+and the client connects at once. A TRANSFER (a name that already exists) is
+never auto-approved and always waits for `a` or `x`.
+
+- **Who can switch it on.** Only a token an agent creation has already been
+  approved for (one claim approved by hand), or one that owns an agent
+  today. One key switches it either way, with no question. The message it
+  leaves on the bottom line goes after 3 s.
+- **What it does not touch.** Requests already waiting stay for `a`.
+- **Where it shows.** The `t` in the key line is drawn reversed (dark on
+  light) while the token under the cursor auto-approves, and plain
+  otherwise. The token's rows show `[auto]`, and the tokens tab shows
+  `auto-approve`.
+
+The key line is as wide as the terminal. When a tab's keys do not fit, it
+slides through them in a loop. When they fit (or once the window is made
+wide enough), it stands still.
+- **No route sets it**, so a station token cannot switch itself on. Every
+  automatic approval is logged as `proposal.auto_approve`.
 
 ## 8. Operations
 

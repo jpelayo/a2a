@@ -73,10 +73,14 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 # True for the runs with no A2A_AGENT, where the id is derived from the folder.
 DERIVED = False
+# The id a run starts as (A2A_AGENT), and the ids the fake broker says
+# another client holds — the identity-collision runs set both.
+AGENT = "probe"
+COLLIDE: set = set()
 
 
 def base_env(fb: FakeBroker, tmp: Path) -> dict:
-    env = dict(os.environ, A2A_URL=fb.url, A2A_TOKEN="t", A2A_AGENT="probe",
+    env = dict(os.environ, A2A_URL=fb.url, A2A_TOKEN="t", A2A_AGENT=AGENT,
                A2A_HELLO="0", A2A_READ_ON_INIT="0", HOME=str(tmp),
                XDG_DATA_HOME=str(tmp / "data"))
     for k in ("A2A_CATCHUP", "A2A_CLIENT_VERSION"):
@@ -330,8 +334,21 @@ STARTED = {"Codex": "/me", "Pi": "/stream", "OpenCode": "/stream",
            "Antigravity": "/stream"}
 
 
+def started(label, calls):
+    """Whether the pump started. Codex's first pump call is GET /me — which
+    propose_me now also makes, just before each POST /me/proposals, to see
+    whether the id collides. So for Codex only a /me NOT followed by a
+    proposal counts."""
+    if label != "Codex":
+        return STARTED[label] in calls
+    return any(c == "/me" and (i + 1 == len(calls)
+                               or calls[i + 1] != "/me/proposals")
+               for i, c in enumerate(calls))
+
+
 def run(label, fn, refuse=False):
     fb = FakeBroker()
+    fb.collide = set(COLLIDE)
     if refuse:
         fb.refuse.add("/me/proposals")
     tmp = Path(tempfile.mkdtemp(prefix="a2a-propose-")).resolve()
@@ -422,6 +439,48 @@ def check_naming(label, fn) -> None:
           f"{got} {stored(out)}")
 
 
+def collision_run(label, fn, agent, calls, collide=True):
+    global AGENT, COLLIDE, CALLS
+    AGENT, COLLIDE, CALLS = agent, ({agent} if collide else set()), calls
+    try:
+        return run(label, fn)
+    finally:
+        AGENT, COLLIDE, CALLS = "probe", set(), ORIGINAL_CALLS
+
+
+def check_collision(label, fn) -> None:
+    """The id belongs to another client: no name asks for a NEW agent — the
+    stem plus this harness's suffix — never the id itself (a transfer)."""
+    suf = SUFFIX[label]
+    out, fb = collision_run(label, fn, "team-claudecode",
+                            [{"note": "c1"}, {"note": "c2"},
+                             {"name": "team-claudecode", "note": "c3"}])
+    if "error" in out:
+        check(f"{label} (collision): the client ran", False, out["error"])
+        return
+    got = asked(fb)
+    check(f"{label}: collision — with no name it asks for the stem plus its "
+          f"own suffix, team-claudecode -> team-{suf}",
+          got[:1] == [("team-claudecode", f"team-{suf}")], str(got))
+    check(f"{label}: collision — then goes by it, which collides with "
+          f"nobody, so the next default is that name",
+          got[1:2] == [(f"team-{suf}", f"team-{suf}")], str(got))
+    check(f"{label}: collision — naming the id asks for exactly it (the "
+          f"explicit transfer)", got[2:3] == [(f"team-{suf}",
+                                               "team-claudecode")], str(got))
+    out, fb = collision_run(label, fn, f"team-{suf}", [{"note": "n1"}])
+    got = asked(fb)
+    check(f"{label}: collision with its own variant counts on: "
+          f"team-{suf} -> team-{suf}-2",
+          got[:1] == [(f"team-{suf}", f"team-{suf}-2")], str(got))
+    out, fb = collision_run(label, fn, "nobody-holds-me", [{"note": "o1"}],
+                            collide=False)
+    fb_got = asked(fb)
+    check(f"{label}: no collision — the default is the id, as before",
+          fb_got[:1] == [("nobody-holds-me", "nobody-holds-me")],
+          str(fb_got))
+
+
 def main() -> int:
     for label, fn in (("Claude Code", run_channel), ("Codex", run_codex),
                       ("Pi", run_pi), ("OpenCode", run_opencode),
@@ -440,13 +499,13 @@ def main() -> int:
                   "project — merged, the other keys kept",
                   got == dict(PROJECT, **{SWITCH[label]: True}), str(got))
             check(f"{label}: and connects at once: the pump starts "
-                  f"({STARTED[label]})", STARTED[label] in fb.calls,
+                  f"({STARTED[label]})", started(label, fb.calls),
                   str(fb.calls))
             out2, fb2 = run(label, fn, refuse=True)
             got = project_file(out2.get("project") or Path("/nonexistent"))
             check(f"{label}: a REFUSED request turns nothing on — the file "
                   "is untouched and no pump starts",
-                  got == PROJECT and STARTED[label] not in fb2.calls,
+                  got == PROJECT and not started(label, fb2.calls),
                   f"{got} {fb2.calls}")
         check(f"{label}: propose_me offers a station argument",
               "station" in (out.get("schema") or []), str(out.get("schema")))
@@ -458,6 +517,7 @@ def main() -> int:
               "{agent_id, note}, as before",
               sent[1:3] == WANT[1:3], str(sent[1:3]))
         check_naming(label, fn)
+        check_collision(label, fn)
 
     print()
     for f in fails:

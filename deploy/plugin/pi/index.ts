@@ -286,6 +286,34 @@ export default function (pi: ExtensionAPI) {
   // `<folder>-pi`, because every harness in a folder derives the same `dir`,
   // and a request for it is a request for the other harnesses' name.
   const PROPOSE_SUFFIX = "pi";
+  // Every harness's suffix, the same list in every client. When this id is
+  // held by another client, the variant offered keeps the stem they share
+  // (a2a-claudecode → a2a) and adds this harness's: a2a-pi. A trailing -N
+  // after our own suffix counts on (a2a-pi → a2a-pi-2).
+  const VARIANT_RE = new RegExp("^(.+?)-(claudecode|antigravity|opencode|" +
+    "claude|codex|hermes|kilo|dsh|pi)(?:-(\\d+))?$");
+  function variant(id: string): string {
+    const m = String(id || "").match(VARIANT_RE);
+    const stem = m ? m[1] : id;
+    if (m && m[2] === PROPOSE_SUFFIX) {
+      return `${stem}-${PROPOSE_SUFFIX}-${(m[3] ? Number(m[3]) : 1) + 1}`;
+    }
+    return `${stem}-${PROPOSE_SUFFIX}`;
+  }
+  // A collision: the name exists and someone else holds it — another harness
+  // or folder (client pin), or another token. Read from /me's fields, never
+  // from the text of `refused`.
+  const collides = (me: any): boolean => !!(me && me.registered && me.this_agent && (
+    me.this_agent.client === "other"
+    || (me.this_agent.bound && !me.this_agent.bound_to_me)));
+  const collisionText = (id: string, refused?: string | null): string =>
+    `"${id}" is already used by another client (another harness, folder or ` +
+    `token${refused ? `: ${refused}` : ""}), so nothing arrives here as ` +
+    `"${id}". Ask the user whether to create a new agent "${variant(id)}" ` +
+    `for this session; if yes, call propose_me with no name — the operator ` +
+    `approves it with one key and this connects with no restart. Do NOT ` +
+    `pass name="${id}": that asks to take the agent away from the other ` +
+    `client.`;
 
   // --- the project switch ---------------------------------------------------
   // a2a is OFF in a project until <project>/.a2a.json says {"enabled": true}.
@@ -444,6 +472,11 @@ export default function (pi: ExtensionAPI) {
    *  else reads this: the id itself is resolved exactly as before. */
   async function defaultProposal(): Promise<string> {
     await adoptStoredId();
+    // Held by another client: a request for this id would be a TRANSFER
+    // (taking it from them), so the default is a new agent, the variant.
+    try {
+      if (collides(await json("GET", "/me"))) return variant(key);
+    } catch { /* the broker did not answer: the rules below */ }
     if (explicit || key !== dir) return key;
     if ((await readStore())[project]) return key;
     return `${dir}-${PROPOSE_SUFFIX}`;
@@ -745,6 +778,13 @@ export default function (pi: ExtensionAPI) {
   async function checkRegistered(): Promise<boolean> {
     const me = await json("GET", "/me");
     name = me.agent || key;
+    // Registered, but held by another client: told the same way as "not
+    // registered" — to the human, no hello, no brief, no channel check
+    // (nothing can be read as an agent the broker refuses).
+    if (collides(me)) {
+      notify(collisionText(key, me.refused));
+      return false;
+    }
     if (me.registered) return true;
     // NOT delivered into the session. This is a setup problem for the human,
     // not something to interrupt the agent with — and delivering it would
@@ -1176,7 +1216,12 @@ export default function (pi: ExtensionAPI) {
       checks.push(check("broker", true, null, null, URL_BASE));
       // Another client holds this agent, or this install is too old to send
       // a client key: nothing else will work until that is fixed.
-      checks.push(me.refused
+      // Held by another client or token: the agent can fix that itself, by
+      // offering the user a new agent (the variant) — not the operator.
+      checks.push(collides(me)
+        ? check("client", false, "you", collisionText(key, me.refused),
+          me.refused || null)
+        : me.refused
         ? check("client", false, "operator",
           `the broker refuses to act as this agent: ${me.refused}`)
         : check("client", true));
@@ -1671,7 +1716,10 @@ export default function (pi: ExtensionAPI) {
       "approved. Pass name to ask for a name of your choosing; without it, " +
       "an id that is only this folder's name asks for " +
       `"<folder>-${PROPOSE_SUFFIX}" instead, so each harness in a folder ` +
-      "asks for its own. Once the broker takes a request for another name, " +
+      "asks for its own. If this id belongs to another client, a call " +
+      `with no name asks for a NEW agent, the stem plus "-${PROPOSE_SUFFIX}" ` +
+      `(a2a-claudecode → a2a-${PROPOSE_SUFFIX}); name the id to ask for a ` +
+      "transfer instead. Once the broker takes a request for another name, " +
       "this client goes by that name (kept for this project, as rename_me " +
       "keeps one) and connects under it when it is approved. The operator " +
       "approves or denies the name.",
